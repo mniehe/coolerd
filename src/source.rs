@@ -4,9 +4,11 @@ use {
         convert::TryInto,
         fs,
         io::{BufRead, BufReader, Read},
-        path::Path,
-        process::{Command, ExitStatus, Stdio},
+        path::{Path, PathBuf},
+        process::{Child, Command, ExitStatus, Stdio},
         sync::{Arc, Mutex},
+        thread,
+        time::{Duration, Instant},
     },
     crate::{
         config::Source,
@@ -147,6 +149,95 @@ fn parse_nvidia_output(gpu: &str, stdout: &str) -> Result<u8> {
     Ok(temperature)
 }
 
+/// Longest wait for one nvidia-smi run
+const NVIDIA_SMI_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often [`run_with_timeout`] checks whether the child has exited
+const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Kill a child that may still be running and wait for it, so that it does
+/// not linger as a zombie. Kill fails if the child has already exited, which
+/// is harmless, so only the error from the wait is returned.
+fn kill_and_reap(child: &mut Child) -> std::io::Result<ExitStatus> {
+    let _ = child.kill();
+    child.wait()
+}
+
+/// Run a command with piped stdout and return its exit status and output. If
+/// the command has not exited within `limit`, it is killed and reaped, and
+/// [`Error::CommandTimeout`] is returned.
+///
+/// stdout is read only after the child exits. This suits commands whose
+/// output fits in the pipe buffer, such as nvidia-smi's few bytes; a command
+/// that writes more would block on the full pipe and time out. The read also
+/// waits for any descendant that inherited the pipe, which nvidia-smi leaves
+/// none of.
+fn run_with_timeout(cmd: &mut Command, limit: Duration) -> Result<(ExitStatus, String)> {
+    let program = PathBuf::from(cmd.get_program());
+    let io_error = |e| Error::Io { path: program.clone(), source: e };
+
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(io_error)?;
+    let deadline = Instant::now() + limit;
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {},
+            Err(e) => {
+                let _ = kill_and_reap(&mut child);
+                return Err(io_error(e));
+            }
+        }
+
+        if Instant::now() >= deadline {
+            kill_and_reap(&mut child).map_err(io_error)?;
+            return Err(Error::CommandTimeout {
+                command: program.display().to_string(),
+                seconds: limit.as_secs(),
+            });
+        }
+
+        thread::sleep(CHILD_POLL_INTERVAL);
+    };
+
+    let mut stdout = String::new();
+
+    if let Some(mut pipe) = child.stdout.take() {
+        pipe.read_to_string(&mut stdout).map_err(io_error)?;
+    }
+
+    Ok((status, stdout))
+}
+
+/// Get the temperature of one NVIDIA GPU via nvidia-smi, waiting at most
+/// `limit` for nvidia-smi to exit. `gpu` is a PCI bus id or a GPU UUID.
+fn read_nvidia_with_limit(program: &Path, gpu: &str, limit: Duration) -> Result<u8> {
+    let mut cmd = Command::new(program);
+    cmd.arg("-i")
+        .arg(gpu)
+        .arg("--query-gpu=temperature.gpu")
+        .arg("--format=csv,noheader,nounits");
+
+    let (status, stdout) = run_with_timeout(&mut cmd, limit)?;
+
+    if status.code() != Some(0) {
+        return Err(Error::Command { command: program.to_owned(), status });
+    }
+
+    parse_nvidia_output(gpu, &stdout)
+}
+
+/// Get the temperature of one NVIDIA GPU via nvidia-smi. This function fails
+/// if nvidia-smi exits with a non-zero status, does not exit within
+/// [`NVIDIA_SMI_TIMEOUT`], or does not print a temperature that fits in a
+/// [`u8`].
+fn read_nvidia_source(program: &Path, gpu: &str) -> Result<u8> {
+    read_nvidia_with_limit(program, gpu, NVIDIA_SMI_TIMEOUT)
+}
+
 /// Get the temperature from a plain-text file (typically a sysfs path). The
 /// contents of the file should be a decimal-formatted integer in units of
 /// thousandths degrees Celsius after whitespace is trimmed. If the temperature,
@@ -252,10 +343,14 @@ mod tests {
         std::{
             env,
             fs,
-            os::unix::process::ExitStatusExt,
+            os::unix::{fs::PermissionsExt, process::ExitStatusExt},
             path::{Path, PathBuf},
             process::{self, ExitStatus},
-            sync::atomic::{AtomicUsize, Ordering},
+            sync::{
+                atomic::{AtomicUsize, Ordering},
+                Mutex,
+            },
+            time::{Duration, Instant},
         },
         serde_json::json,
         super::{
@@ -263,6 +358,7 @@ mod tests {
             parse_hdparm_output,
             parse_nvidia_output,
             parse_smart_output,
+            read_nvidia_with_limit,
             smart_reading,
         },
         crate::error::Error,
@@ -464,5 +560,66 @@ mod tests {
         let result = parse_nvidia_output(GPU, "300\n");
 
         assert!(matches!(result, Err(Error::ReadingExceedsBounds)), "{:?}", result);
+    }
+
+    const NVIDIA_TEST_LIMIT: Duration = Duration::from_millis(300);
+
+    // Serialises the tests that write and run a script. A fork in another
+    // test thread can inherit the script's write descriptor for a moment, and
+    // exec of the script then fails with ETXTBSY.
+    static SCRIPT_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Run `body` as a fake nvidia-smi script in `dir`
+    fn nvidia_script_reading(dir: &TempDir, body: &str) -> (PathBuf, Result<u8, Error>) {
+        let _guard = SCRIPT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let script = dir.write("nvidia-smi", &format!("#!/bin/sh\n{}\n", body));
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let result = read_nvidia_with_limit(&script, GPU, NVIDIA_TEST_LIMIT);
+        (script, result)
+    }
+
+    #[test]
+    fn nvidia_script_output_gives_reading() {
+        let dir = TempDir::new();
+        let body = format!(
+            "[ \"$*\" = \"-i {} --query-gpu=temperature.gpu --format=csv,noheader,nounits\" ] || exit 3\necho 71",
+            GPU);
+        let (_, result) = nvidia_script_reading(&dir, &body);
+
+        assert_eq!(result.unwrap(), 71);
+    }
+
+    #[test]
+    fn nvidia_script_failure_is_command_error() {
+        let dir = TempDir::new();
+        let (script, result) = nvidia_script_reading(&dir, "exit 9");
+
+        assert!(matches!(&result,
+            Err(Error::Command { command, status })
+                if *command == script && status.code() == Some(9)),
+            "{:?}", result);
+    }
+
+    #[test]
+    fn nvidia_script_timeout_kills_child() {
+        let dir = TempDir::new();
+        let pid_file = dir.0.join("pid");
+        // exec keeps the shell's pid, so the recorded pid is the sleeping process
+        let body = format!("echo $$ > '{}'\nexec sleep 30", pid_file.display());
+
+        let start = Instant::now();
+        let (script, result) = nvidia_script_reading(&dir, &body);
+        let elapsed = start.elapsed();
+
+        assert!(matches!(&result,
+            Err(Error::CommandTimeout { command, seconds: 0 })
+                if Path::new(command) == script),
+            "{:?}", result);
+        assert!(elapsed < NVIDIA_TEST_LIMIT * 10, "returned after {:?}", elapsed);
+
+        // A zombie still has a /proc entry, so this also proves the child was reaped
+        let pid = fs::read_to_string(&pid_file).unwrap();
+        assert!(!Path::new("/proc").join(pid.trim()).exists(), "pid {} still exists", pid.trim());
     }
 }
