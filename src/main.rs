@@ -28,7 +28,7 @@ use {
     },
 
     config::{Config, load_config, SessionType, Zone},
-    curve::{aggregate, duty_for_temp},
+    curve::ZoneState,
     error::{Error, Result},
     ipmi::{FanMode, Ipmi},
     source::get_source_readings,
@@ -223,30 +223,43 @@ impl MainApp {
         info!("[{}] Starting loop for IPMI zones {:?}",
               session.name, zone_config.ipmi_zones);
 
+        let mut state = ZoneState::new(&zone_config);
+
         loop {
             let s = session.clone();
             let z = zone_config.clone();
+            let st = &mut state;
 
             task::block_in_place(move || {
-                Self::update_duty_cycle(s, z.as_ref())
+                Self::update_duty_cycle(s, z.as_ref(), st)
             })?;
 
             sleep(zone_config.interval.to_duration()).await;
         }
     }
 
-    /// Update fan PWM duty cycle based on the CPU temperature
-    fn update_duty_cycle(session: Arc<IpmiSession>, zone_config: &Zone) -> Result<()> {
-        let temp = Self::get_temp(session.ipmi.clone(), zone_config)?;
-        let dcycle_new = duty_for_temp(&zone_config.steps, temp);
+    /// Update fan PWM duty cycle from the zone's source readings and curves
+    fn update_duty_cycle(
+        session: Arc<IpmiSession>,
+        zone_config: &Zone,
+        state: &mut ZoneState,
+    ) -> Result<()> {
+        let ipmi = session.ipmi.clone();
+        let readings = retry_with_index(zone_config.retry_iter(), move |i| {
+            trace!("Querying sources for zones {:?} (attempt {}/{})",
+                   zone_config.ipmi_zones, i, zone_config.retries.0 + 1);
+            get_source_readings(ipmi.clone(), &zone_config.sources)
+        })?;
+        let update = state.next_duty(zone_config, &readings);
+        let dcycle_new = update.duty;
 
         let mut ipmi_lock = session.ipmi.lock().unwrap();
 
         for z in &zone_config.ipmi_zones {
             let dcycle_cur = ipmi_lock.get_duty_cycle(*z)?;
 
-            debug!("[{}] Zone {}: zone_temp={}C, dcycle_cur={}%, dcycle_new={}%",
-                   session.name, z, temp, dcycle_cur, dcycle_new);
+            debug!("[{}] Zone {}: curve_temps={:?}C, dcycle_cur={}%, dcycle_new={}%",
+                   session.name, z, update.curve_temps, dcycle_cur, dcycle_new);
 
             if dcycle_new != dcycle_cur {
                 ipmi_lock.set_duty_cycle(*z, dcycle_new)?;
@@ -254,18 +267,6 @@ impl MainApp {
         }
 
         Ok(())
-    }
-
-    /// Get temperature sensor value in degrees Celsius using the zone's
-    /// data aggregation method.
-    fn get_temp(ipmi: Arc<Mutex<Ipmi>>, zone_config: &Zone) -> Result<u8> {
-        let readings = retry_with_index(zone_config.retry_iter(), move |i| {
-            trace!("Querying sources for zones {:?} (attempt {}/{})",
-                   zone_config.ipmi_zones, i, zone_config.retries.0 + 1);
-            get_source_readings(ipmi.clone(), &zone_config.sources)
-        })?;
-
-        Ok(aggregate(&readings, &zone_config.aggregation))
     }
 }
 
