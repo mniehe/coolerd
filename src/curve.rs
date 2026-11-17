@@ -58,16 +58,15 @@ pub enum Rounding {
 }
 
 /// Combine readings, either temperatures or duties, into one value. The
-/// average divides by the number of readings it used.
-pub fn aggregate(readings: &[u8], aggregation: &Aggregation, rounding: Rounding) -> u8 {
+/// average divides by the number of readings it used. Returns `None` when no
+/// reading is selected.
+pub fn aggregate(readings: &[u8], aggregation: &Aggregation, rounding: Rounding) -> Option<u8> {
     let mut readings = readings.to_vec();
     readings.sort_by_key(|r| Reverse(*r));
 
-    // Callers never pass an empty slice: ZoneState only aggregates groups
-    // that hold at least one value
     match aggregation {
         Aggregation::Maximum => {
-            readings.first().copied().unwrap()
+            readings.first().copied()
         }
         Aggregation::Average { top } => {
             let n = top.unwrap_or(readings.len()).min(readings.len());
@@ -84,8 +83,8 @@ pub fn aggregate(readings: &[u8], aggregation: &Aggregation, rounding: Rounding)
                 Rounding::Up => sum + count.saturating_sub(1),
             };
 
-            // A mean of u8 values fits in a u8; an empty slice gives 0
-            dividend.checked_div(count).unwrap_or(0) as u8
+            // A mean of u8 values fits in a u8; no reading gives no mean
+            dividend.checked_div(count).map(|mean| mean as u8)
         }
     }
 }
@@ -159,8 +158,8 @@ impl ZoneState {
         let mut curve_temps = Vec::new();
         let mut duties = Vec::new();
 
-        if !zone_readings.is_empty() {
-            let reading = aggregate(&zone_readings, &zone.aggregation, Rounding::Down);
+        // No reading reaches the zone curve when every source has `steps`
+        if let Some(reading) = aggregate(&zone_readings, &zone.aggregation, Rounding::Down) {
             let temp = self.zone_curve.update(reading, zone.hysteresis);
             curve_temps.push(temp);
             // Validation leaves the zone steps absent only when no reading
@@ -172,15 +171,10 @@ impl ZoneState {
         curve_temps.append(&mut source_temps);
         duties.append(&mut source_duties);
 
-        // Each reading lands in the zone curve or in its own curve, and the
-        // reading count equals the source count, so `duties` is empty only for
-        // a zone without sources, which validation rejects. The check keeps an
-        // empty slice away from `aggregate` all the same.
-        let duty = if duties.is_empty() {
-            FULL_DUTY
-        } else {
-            aggregate(&duties, &zone.duty_aggregation, Rounding::Up)
-        };
+        // No curve gives a duty only for a zone without sources, which
+        // validation rejects; the fans then run at full speed
+        let duty = aggregate(&duties, &zone.duty_aggregation, Rounding::Up)
+            .unwrap_or(FULL_DUTY);
 
         ZoneUpdate { duty, curve_temps }
     }
@@ -487,15 +481,15 @@ mod tests {
 
     #[test]
     fn maximum_takes_highest_reading() {
-        assert_eq!(aggregate(&[50, 70, 60], &Aggregation::Maximum, Rounding::Down), 70);
-        assert_eq!(aggregate(&[50, 70, 60], &Aggregation::Maximum, Rounding::Up), 70);
+        assert_eq!(aggregate(&[50, 70, 60], &Aggregation::Maximum, Rounding::Down), Some(70));
+        assert_eq!(aggregate(&[50, 70, 60], &Aggregation::Maximum, Rounding::Up), Some(70));
     }
 
     #[test]
     fn average_with_top_takes_highest_readings() {
         let aggregation = Aggregation::Average { top: Some(2) };
 
-        assert_eq!(aggregate(&[50, 70, 60], &aggregation, Rounding::Down), 65);
+        assert_eq!(aggregate(&[50, 70, 60], &aggregation, Rounding::Down), Some(65));
     }
 
     #[test]
@@ -503,29 +497,40 @@ mod tests {
         let aggregation = Aggregation::Average { top: None };
 
         // Mean 56.67 truncates to 56; the median would be 60
-        assert_eq!(aggregate(&[20, 90, 60], &aggregation, Rounding::Down), 56);
+        assert_eq!(aggregate(&[20, 90, 60], &aggregation, Rounding::Down), Some(56));
     }
 
     #[test]
     fn average_rounding_up_takes_the_next_integer() {
         let aggregation = Aggregation::Average { top: None };
 
-        assert_eq!(aggregate(&[20, 90, 60], &aggregation, Rounding::Up), 57);
-        assert_eq!(aggregate(&[99, 100], &aggregation, Rounding::Up), 100);
+        assert_eq!(aggregate(&[20, 90, 60], &aggregation, Rounding::Up), Some(57));
+        assert_eq!(aggregate(&[99, 100], &aggregation, Rounding::Up), Some(100));
     }
 
     #[test]
     fn average_rounding_up_keeps_an_integer_mean() {
         let aggregation = Aggregation::Average { top: None };
 
-        assert_eq!(aggregate(&[50, 70, 60], &aggregation, Rounding::Up), 60);
-        assert_eq!(aggregate(&[255, 255], &aggregation, Rounding::Up), 255);
+        assert_eq!(aggregate(&[50, 70, 60], &aggregation, Rounding::Up), Some(60));
+        assert_eq!(aggregate(&[255, 255], &aggregation, Rounding::Up), Some(255));
+    }
+
+    #[test]
+    fn empty_readings_give_no_value() {
+        for aggregation in [Aggregation::Average { top: None }, Aggregation::Average { top: Some(2) }, Aggregation::Maximum] {
+            for rounding in [Rounding::Down, Rounding::Up] {
+                let value = aggregate(&[], &aggregation, rounding);
+
+                assert_eq!(value, None, "{:?}", aggregation);
+            }
+        }
     }
 
     #[test]
     fn average_with_top_above_count_divides_by_readings_used() {
         let aggregation = Aggregation::Average { top: Some(3) };
 
-        assert_eq!(aggregate(&[80, 80], &aggregation, Rounding::Down), 80);
+        assert_eq!(aggregate(&[80, 80], &aggregation, Rounding::Down), Some(80));
     }
 }
