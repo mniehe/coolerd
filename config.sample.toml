@@ -25,13 +25,20 @@ ipmi_zones = [0, 1]
 # default interval is 1 second.
 interval = 1
 
-# Number of retries to query temperature sources in each update. Only a source
-# that fails is read again, and all sources of the zone share these retries, so
-# a source that uses them up leaves none for the sources after it. A source
-# that still fails after the last retry is handled by its `on_failure` (see the
-# sources below); by default, the program exits. Each attempt of an nvidia
-# source can take up to 5 seconds. The default is 2 retries (3 attempts in
-# total).
+# Number of retries to query temperature sources in each update. The sources
+# that are not `ipmi` are read first, in the order below, and the ipmi sources
+# last, in one IPMI query. Only a source that fails is read again; earlier
+# versions read every source again. All sources of the zone share these
+# retries, so a source that uses them up leaves none for the sources read after
+# it. A source that failed in the previous update gets one attempt and no
+# retries until it reads again. A source that still fails after the last retry
+# is handled by its `on_failure` (see the sources below); by default, the
+# program exits. The default is 2 retries (3 attempts in total).
+#
+# This bounds the number of waits in an update, not its duration. smartctl and
+# hdparm are stopped after 30 seconds and nvidia-smi after 5 seconds. If a
+# stopped program does not exit, the same command is not started again until
+# the old process is gone; until then its source fails at once.
 #retries = 2
 
 # Number of milliseconds to wait before retrying when querying a temperature
@@ -57,7 +64,8 @@ sources = [
   #
   #   smartctl -j -A -n standby <block_dev>
   #
-  # and requires smartmontools >= 7.0 to be installed.
+  # and requires smartmontools >= 7.0 to be installed. If smartctl does not
+  # exit within 30 seconds, it is killed and the reading fails.
   # { type = "smart", block_dev = "/dev/disk/by-id/ata-ST6000VN001-2BB186_ZR12WE0S" },
   # { type = "smart", block_dev = "/dev/disk/by-id/ata-ST6000VN0033-2EE110_ZAD8N3FM" },
   # { type = "smart", block_dev = "/dev/disk/by-id/ata-ST6000VN0033-2EE110_ZAD8R2G3" },
@@ -65,7 +73,8 @@ sources = [
 
   # "hdparm -H" source. This is specific to some Hitachi/HGST/WD drives and
   # allows the HDD temperature to be queried even when the drive is spun down.
-  # This requires hdparm to be installed.
+  # This requires hdparm to be installed. If hdparm does not exit within 30
+  # seconds, it is killed and the reading fails.
   # { type = "hdparm", block_dev = "/dev/disk/by-id/..." },
 
   # NVIDIA GPU source. This internally runs:
@@ -103,7 +112,7 @@ sources = [
   #   that produces much heat, such as a GPU.
   #
   # A zone in which no source has a reading runs at 100%. A failing source is
-  # still tried in every update.
+  # still tried once in every update.
   # { type = "nvidia", gpu = "00000000:81:00.0", steps = [{ temp = 60, dcycle = 40 }, { temp = 90, dcycle = 100 }], on_failure = { type = "dcycle", dcycle = 80 } },
 ]
 

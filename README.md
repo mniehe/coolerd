@@ -111,7 +111,13 @@ See [`config.sample.toml`](config.sample.toml) for every key.
 When a source fails
 -------------------
 
-A zone reads each source once per update. A source that fails is read again after `retry_delay_ms`, up to `retries` times; a source that read well is not read again. All sources of a zone share these retries in each update, so a source that uses them up leaves none for the sources after it, and an update waits no longer than `retries` times `retry_delay_ms`. Each attempt of an `nvidia` source can take up to 5 seconds before nvidia-smi is killed, so a hung driver adds up to 5 seconds per attempt. All `ipmi` sources of a zone are read in one IPMI query, and each sensor in it can fail on its own.
+A zone reads each source once per update. It reads the sources that are not `ipmi` first, in the order of `sources`, and then all `ipmi` sources in one IPMI query, so that the sensor readings are fresh when the zone sets its duty cycle. Each sensor in that query can fail on its own.
+
+A source that fails is read again after `retry_delay_ms`, up to `retries` times; a source that read well is not read again. Earlier versions read every source of the zone again when one source failed. All sources of a zone share these retries in each update, so a source that uses them up leaves none for the sources read after it. `retries` bounds the number of waits in an update, not its duration, because each attempt also takes as long as the source needs to answer.
+
+A source that failed in the previous update gets one attempt in each update and no retries, until it reads again. A source that keeps failing therefore leaves the retries to the other sources and adds one attempt to each update.
+
+A program that does not answer in time is stopped: smartctl and hdparm after 30 seconds, nvidia-smi after 5 seconds. Earlier versions waited for smartctl and hdparm without a limit. A stopped program can fail to exit, as nvidia-smi can in a hung driver. The same command is then not started again until the old process is gone, and until then its source fails at once.
 
 When a source still fails after the last retry, its `on_failure` decides what the zone does:
 
@@ -119,7 +125,7 @@ When a source still fails after the last retry, its `on_failure` decides what th
 * `{ type = "ignore" }`: the zone leaves the source out. Its reading does not enter the zone temperature, and its own curve gives no duty cycle. The other sources keep driving the fans.
 * `{ type = "dcycle", dcycle = N }`: the zone leaves the source out as with `ignore`, and runs at N% or more until the source reads again. The other curves can still raise the fans above N%.
 
-A zone in which no source has a reading runs at 100%, whatever the modes. The program logs one error when a source starts to fail and one message when it reads again. A source that fails in every update is still tried in every update, with its retries. While it fails, its curve keeps its last temperature, so `hysteresis` applies from there when it reads again.
+A zone in which no source has a reading runs at 100%, whatever the modes. The program logs one error when a source starts to fail and one message when it reads again. A source that fails in every update is still tried once in every update. While it fails, its curve keeps its last temperature, so `hysteresis` applies from there when it reads again.
 
 `ignore` has a risk: a hot device that cannot be read no longer raises the fans. Use `ignore` only for a source whose heat another source also measures, such as a second sensor on the same CPU. For a device that produces much heat, such as a GPU, use `dcycle` with a duty cycle that keeps the device cool under full load.
 
