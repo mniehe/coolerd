@@ -134,24 +134,63 @@ pub struct SourceConfig {
 
 /// Serde cannot combine `flatten` with `deny_unknown_fields`, so `steps` is
 /// taken out of the table by hand and the rest goes to [`Source`], which still
-/// rejects an unknown key or type.
+/// rejects an unknown key or type. A sequence, the positional form that
+/// [`Source`] accepts, goes to it unchanged and has no `steps`.
 impl<'de> Deserialize<'de> for SourceConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let mut table = toml::value::Table::deserialize(deserializer)?;
+        struct SourceConfigVisitor;
 
-        let steps = match table.remove("steps") {
-            Some(value) => Some(Vec::<Step>::deserialize(value)
-                .map_err(|e| de::Error::custom(format!("steps: {}", e)))?),
-            None => None,
-        };
+        impl<'de> Visitor<'de> for SourceConfigVisitor {
+            type Value = SourceConfig;
 
-        let kind = Source::deserialize(toml::Value::Table(table))
-            .map_err(de::Error::custom)?;
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a source table")
+            }
 
-        Ok(Self { kind, steps })
+            fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let kind = Source::deserialize(SeqAccessDeserializer::new(seq))?;
+
+                Ok(SourceConfig { kind, steps: None })
+            }
+
+            // The table is collected by hand, so a repeated key is rejected
+            // here; collecting into a map would keep the last value
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut table = toml::value::Table::new();
+                let mut steps = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    if (key == "steps" && steps.is_some()) || table.contains_key(&key) {
+                        return Err(de::Error::custom(format!("duplicate field `{}`", key)));
+                    }
+
+                    let value = map.next_value::<toml::Value>()?;
+
+                    if key == "steps" {
+                        steps = Some(Vec::<Step>::deserialize(value)
+                            .map_err(|e| de::Error::custom(format!("steps: {}", e)))?);
+                    } else {
+                        table.insert(key, value);
+                    }
+                }
+
+                let kind = Source::deserialize(toml::Value::Table(table))
+                    .map_err(de::Error::custom)?;
+
+                Ok(SourceConfig { kind, steps })
+            }
+        }
+
+        deserializer.deserialize_any(SourceConfigVisitor)
     }
 }
 
@@ -800,6 +839,42 @@ mod tests {
     fn rejects_unknown_source_type_with_steps() {
         let sources = format!(r#"[{{ type = "thermometer", path = "/sys/temp", steps = {} }}]"#, GPU_STEPS);
         let message = parse_error(&zone_toml(&[("sources", &sources)]));
+
+        assert!(message.contains("unknown variant `thermometer`"), "{}", message);
+    }
+
+    #[test]
+    fn rejects_repeated_key_in_source() {
+        let sources = r#"[{ type = "file", path = "one", path = "two" }]"#;
+        let message = parse_error(&zone_toml(&[("sources", sources)]));
+
+        assert!(message.contains("duplicate"), "{}", message);
+        assert!(message.contains("path"), "{}", message);
+    }
+
+    #[test]
+    fn rejects_repeated_steps_in_source() {
+        let sources = format!(r#"[{{ type = "file", path = "/sys/temp", steps = {}, steps = {} }}]"#, GPU_STEPS, GPU_STEPS);
+        let message = parse_error(&zone_toml(&[("sources", &sources)]));
+
+        assert!(message.contains("duplicate"), "{}", message);
+        assert!(message.contains("steps"), "{}", message);
+    }
+
+    #[test]
+    fn accepts_positional_sources() {
+        let sources = r#"[["file", "/dev/null"], ["ipmi", "CPU Temp"]]"#;
+        let config = parse(&zone_toml(&[("sources", sources)])).unwrap();
+        let sources = &config.zones[0].sources;
+
+        assert!(matches!(&sources[0].kind, Source::File { path } if path == "/dev/null"));
+        assert!(matches!(&sources[1].kind, Source::Ipmi { sensor } if sensor == "CPU Temp"));
+        assert!(sources.iter().all(|s| s.steps.is_none()));
+    }
+
+    #[test]
+    fn rejects_positional_source_of_unknown_type() {
+        let message = parse_error(&zone_toml(&[("sources", r#"[["thermometer", "/sys/temp"]]"#)]));
 
         assert!(message.contains("unknown variant `thermometer`"), "{}", message);
     }
