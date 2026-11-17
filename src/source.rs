@@ -3,13 +3,18 @@ use {
         collections::{HashMap, HashSet},
         convert::TryInto,
         fs,
-        io::{BufRead, BufReader, Read},
+        io::{self, BufRead, BufReader, Read},
         path::{Path, PathBuf},
-        process::{Child, Command, ExitStatus, Stdio},
-        sync::{Arc, Mutex},
+        process::{Child, ChildStdout, Command, ExitStatus, Stdio},
+        sync::{
+            mpsc::{self, Receiver, RecvTimeoutError},
+            Arc,
+            Mutex,
+        },
         thread,
         time::{Duration, Instant},
     },
+    log::warn,
     crate::{
         config::Source,
         error::{Error, Result},
@@ -158,61 +163,139 @@ const NVIDIA_SMI_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often [`run_with_timeout`] checks whether the child has exited
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// Kill a child that may still be running and wait for it, so that it does
-/// not linger as a zombie. Kill fails if the child has already exited, which
-/// is harmless, so only the error from the wait is returned.
-fn kill_and_reap(child: &mut Child) -> std::io::Result<ExitStatus> {
-    let _ = child.kill();
-    child.wait()
+/// Longest wait for a killed child to be reaped
+const KILL_GRACE: Duration = Duration::from_millis(500);
+
+/// Most bytes of a command's output that [`run_with_timeout`] reads
+const OUTPUT_CAP: u64 = 4096;
+
+/// Wait at most `grace` for `child` to exit and reap it. Returns `None` if the
+/// child has not exited by then.
+fn wait_bounded(child: &mut Child, grace: Duration) -> Option<ExitStatus> {
+    let deadline = Instant::now() + grace;
+
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some(status);
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return None;
+        }
+
+        thread::sleep(CHILD_POLL_INTERVAL.min(deadline - now));
+    }
 }
 
-/// Run a command with piped stdout and return its exit status and output. If
-/// the command has not exited within `limit`, it is killed and reaped, and
-/// [`Error::CommandTimeout`] is returned.
-///
-/// stdout is read only after the child exits. This suits commands whose
-/// output fits in the pipe buffer, such as nvidia-smi's few bytes; a command
-/// that writes more would block on the full pipe and time out. The read also
-/// waits for any descendant that inherited the pipe, which nvidia-smi leaves
-/// none of.
+/// Kill `child` and reap it within [`KILL_GRACE`]. A killed process can stay
+/// in uninterruptible sleep, as nvidia-smi does in a hung driver, so a child
+/// that outlives the grace is handed to a detached thread to reap and the
+/// caller never waits on it.
+fn stop_child(mut child: Child, program: &Path) {
+    // Kill fails if the child has already exited, which is harmless
+    let _ = child.kill();
+
+    if wait_bounded(&mut child, KILL_GRACE).is_some() {
+        return;
+    }
+
+    warn!("{:?} did not exit within {:?} of being killed and may be stuck; reaping it in the background",
+        program, KILL_GRACE);
+
+    let reaper = thread::Builder::new().spawn(move || {
+        let _ = child.wait();
+    });
+
+    if let Err(e) = reaper {
+        warn!("Failed to start a thread to reap {:?}: {}", program, e);
+    }
+}
+
+/// Read at most [`OUTPUT_CAP`] bytes of `pipe` on a detached thread and send
+/// the result on the returned channel. The thread blocks for as long as any
+/// process holds the pipe open, which can outlast the child, so the caller
+/// waits on the channel with a deadline.
+fn spawn_output_reader(pipe: ChildStdout) -> io::Result<Receiver<io::Result<String>>> {
+    let (sender, receiver) = mpsc::channel();
+
+    thread::Builder::new().spawn(move || {
+        let mut output = String::new();
+        let result = pipe.take(OUTPUT_CAP).read_to_string(&mut output).map(|_| output);
+        // The receiver is gone once the caller has timed out
+        let _ = sender.send(result);
+    })?;
+
+    Ok(receiver)
+}
+
+/// Run a command with piped stdout and return its exit status and at most
+/// [`OUTPUT_CAP`] bytes of its output. If the command has not exited and
+/// closed its output within `limit`, [`Error::CommandTimeout`] is returned;
+/// a child still running then is killed. The call returns within about
+/// `limit` plus [`KILL_GRACE`] in every case.
 fn run_with_timeout(cmd: &mut Command, limit: Duration) -> Result<(ExitStatus, String)> {
     let program = PathBuf::from(cmd.get_program());
     let io_error = |e| Error::Io { path: program.clone(), source: e };
+    let timeout = || Error::CommandTimeout {
+        command: program.display().to_string(),
+        seconds: limit.as_secs(),
+    };
+    let deadline = Instant::now() + limit;
 
     let mut child = cmd
         .stdout(Stdio::piped())
         .spawn()
         .map_err(io_error)?;
-    let deadline = Instant::now() + limit;
 
-    let status = loop {
+    let reader = child.stdout.take()
+        .ok_or_else(|| io::Error::other("stdout is not piped"))
+        .and_then(spawn_output_reader);
+    let output = match reader {
+        Ok(receiver) => receiver,
+        Err(e) => {
+            stop_child(child, &program);
+            return Err(io_error(e));
+        }
+    };
+
+    loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status,
+            Ok(Some(status)) => {
+                let stdout = receive_output(&output, deadline)
+                    .ok_or_else(timeout)?
+                    .map_err(io_error)?;
+                return Ok((status, stdout));
+            }
             Ok(None) => {},
             Err(e) => {
-                let _ = kill_and_reap(&mut child);
+                stop_child(child, &program);
                 return Err(io_error(e));
             }
         }
 
-        if Instant::now() >= deadline {
-            kill_and_reap(&mut child).map_err(io_error)?;
-            return Err(Error::CommandTimeout {
-                command: program.display().to_string(),
-                seconds: limit.as_secs(),
-            });
+        let now = Instant::now();
+        if now >= deadline {
+            stop_child(child, &program);
+            return Err(timeout());
         }
 
-        thread::sleep(CHILD_POLL_INTERVAL);
-    };
-
-    let mut stdout = String::new();
-
-    if let Some(mut pipe) = child.stdout.take() {
-        pipe.read_to_string(&mut stdout).map_err(io_error)?;
+        thread::sleep(CHILD_POLL_INTERVAL.min(deadline - now));
     }
+}
 
-    Ok((status, stdout))
+/// Wait until `deadline` for the output reader's result. Returns `None` if
+/// the deadline passes first, which happens when a descendant of the child
+/// still holds the pipe open.
+fn receive_output(output: &Receiver<io::Result<String>>, deadline: Instant)
+    -> Option<io::Result<String>>
+{
+    match output.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(result) => Some(result),
+        Err(RecvTimeoutError::Timeout) => None,
+        Err(RecvTimeoutError::Disconnected) =>
+            Some(Err(io::Error::other("output reader stopped without a result"))),
+    }
 }
 
 /// Get the temperature of one NVIDIA GPU via nvidia-smi, waiting at most
@@ -349,21 +432,25 @@ mod tests {
             fs,
             os::unix::{fs::PermissionsExt, process::ExitStatusExt},
             path::{Path, PathBuf},
-            process::{self, ExitStatus},
+            process::{self, Child, Command, ExitStatus, Stdio},
             sync::{
                 atomic::{AtomicUsize, Ordering},
                 Mutex,
+                MutexGuard,
             },
+            thread,
             time::{Duration, Instant},
         },
         serde_json::json,
         super::{
+            KILL_GRACE,
             parse_file_source,
             parse_hdparm_output,
             parse_nvidia_output,
             parse_smart_output,
             read_nvidia_with_limit,
             smart_reading,
+            wait_bounded,
         },
         crate::error::Error,
     };
@@ -590,21 +677,150 @@ mod tests {
         assert!(matches!(result, Err(Error::ReadingExceedsBounds)), "{:?}", result);
     }
 
-    const NVIDIA_TEST_LIMIT: Duration = Duration::from_millis(300);
+    /// Limit for a script run that must finish, far above any scheduling delay
+    const FINISH_LIMIT: Duration = Duration::from_secs(10);
 
-    // Serialises the tests that write and run a script. A fork in another
-    // test thread can inherit the script's write descriptor for a moment, and
-    // exec of the script then fails with ETXTBSY.
+    /// Limit for a script run that must time out. It is long enough for the
+    /// script to write its pid file before the limit passes.
+    const TIMEOUT_LIMIT: Duration = Duration::from_secs(1);
+
+    /// Grace for the tests of `wait_bounded` on a child that does not exit
+    const SHORT_GRACE: Duration = Duration::from_millis(200);
+
+    /// Longest a test waits for a script's file or a child's state to appear
+    const APPEAR_WAIT: Duration = Duration::from_secs(5);
+
+    /// Time a bounded call may take beyond its bound on a loaded host
+    const RETURN_SLACK: Duration = Duration::from_secs(2);
+
+    // Serialises the tests that spawn a process. A fork in another test
+    // thread can inherit a script's write descriptor for a moment, and exec
+    // of the script then fails with ETXTBSY.
     static SCRIPT_LOCK: Mutex<()> = Mutex::new(());
 
+    fn script_lock() -> MutexGuard<'static, ()> {
+        SCRIPT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Poll `ready` until it gives a value or [`APPEAR_WAIT`] passes
+    fn poll_until<T>(mut ready: impl FnMut() -> Option<T>) -> Option<T> {
+        let deadline = Instant::now() + APPEAR_WAIT;
+
+        loop {
+            if let Some(value) = ready() {
+                return Some(value);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Wait for a script to write a pid to `path` and return it
+    fn wait_for_pid(path: &Path) -> Option<String> {
+        poll_until(|| {
+            let contents = fs::read_to_string(path).ok()?;
+            let pid = contents.trim();
+            (!pid.is_empty()).then(|| pid.to_owned())
+        })
+    }
+
+    /// Whether `pid` has exited and waits to be reaped
+    fn is_zombie(pid: u32) -> bool {
+        let Ok(stat) = fs::read_to_string(format!("/proc/{}/stat", pid)) else {
+            return false;
+        };
+        // The state follows the command name, which is in parentheses
+        stat.rsplit_once(')').is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+    }
+
+    /// Kills the process whose pid a script wrote to a file, when dropped
+    struct KillOnDrop(PathBuf);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let Some(pid) = wait_for_pid(&self.0) else {
+                return;
+            };
+            let _guard = script_lock();
+            let _ = Command::new("sh")
+                .args(["-c", "kill -9 \"$1\"", "sh", &pid])
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+
+    /// Spawn a child that runs until killed
+    fn spawn_sleeper() -> Child {
+        Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn wait_bounded_gives_up_on_live_child() {
+        let _guard = script_lock();
+        let mut child = spawn_sleeper();
+
+        let start = Instant::now();
+        let status = wait_bounded(&mut child, SHORT_GRACE);
+        let elapsed = start.elapsed();
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(status.is_none(), "{:?}", status);
+        assert!(elapsed >= SHORT_GRACE, "returned after {:?}", elapsed);
+        assert!(elapsed < SHORT_GRACE + RETURN_SLACK, "returned after {:?}", elapsed);
+    }
+
+    #[test]
+    fn wait_bounded_returns_exited_child_at_once() {
+        let _guard = script_lock();
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 4"])
+            .spawn()
+            .unwrap();
+        assert!(poll_until(|| is_zombie(child.id()).then_some(())).is_some(),
+            "child {} did not exit", child.id());
+
+        let grace = Duration::from_secs(10);
+        let start = Instant::now();
+        let status = wait_bounded(&mut child, grace);
+        let elapsed = start.elapsed();
+
+        assert_eq!(status.and_then(|s| s.code()), Some(4));
+        assert!(elapsed < grace / 2, "returned after {:?}", elapsed);
+    }
+
+    /// A fake nvidia-smi script and the outcome of reading it
+    struct ScriptRun {
+        script: PathBuf,
+        result: Result<u8, Error>,
+        /// Time of the read alone, without the wait for [`SCRIPT_LOCK`]
+        elapsed: Duration,
+    }
+
     /// Run `body` as a fake nvidia-smi script in `dir`
-    fn nvidia_script_reading(dir: &TempDir, body: &str) -> (PathBuf, Result<u8, Error>) {
-        let _guard = SCRIPT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    fn nvidia_script_reading(dir: &TempDir, body: &str, limit: Duration) -> ScriptRun {
+        let _guard = script_lock();
         let script = dir.write("nvidia-smi", &format!("#!/bin/sh\n{}\n", body));
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let result = read_nvidia_with_limit(&script, GPU, NVIDIA_TEST_LIMIT);
-        (script, result)
+        let start = Instant::now();
+        let result = read_nvidia_with_limit(&script, GPU, limit);
+        ScriptRun { script, result, elapsed: start.elapsed() }
+    }
+
+    fn assert_timed_out(run: &ScriptRun) {
+        assert!(matches!(&run.result,
+            Err(Error::CommandTimeout { command, .. }) if Path::new(command) == run.script),
+            "{:?}", run.result);
     }
 
     #[test]
@@ -613,20 +829,34 @@ mod tests {
         let body = format!(
             "[ \"$*\" = \"-i {} --query-gpu=temperature.gpu --format=csv,noheader,nounits\" ] || exit 3\necho 71",
             GPU);
-        let (_, result) = nvidia_script_reading(&dir, &body);
+        let run = nvidia_script_reading(&dir, &body, FINISH_LIMIT);
 
-        assert_eq!(result.unwrap(), 71);
+        assert_eq!(run.result.unwrap(), 71);
     }
 
     #[test]
     fn nvidia_script_failure_is_command_error() {
         let dir = TempDir::new();
-        let (script, result) = nvidia_script_reading(&dir, "exit 9");
+        let run = nvidia_script_reading(&dir, "exit 9", FINISH_LIMIT);
 
-        assert!(matches!(&result,
+        assert!(matches!(&run.result,
             Err(Error::Command { command, status })
-                if *command == script && status.code() == Some(9)),
-            "{:?}", result);
+                if *command == run.script && status.code() == Some(9)),
+            "{:?}", run.result);
+    }
+
+    #[test]
+    fn nvidia_script_descendant_holding_output_times_out() {
+        let dir = TempDir::new();
+        let pid_file = dir.0.join("pid");
+        let _stray = KillOnDrop(pid_file.clone());
+        // The script exits at once, but the background sleep keeps its stdout open
+        let body = format!("sleep 30 &\necho $! > '{}'\necho 71", pid_file.display());
+
+        let run = nvidia_script_reading(&dir, &body, TIMEOUT_LIMIT);
+
+        assert_timed_out(&run);
+        assert!(run.elapsed < TIMEOUT_LIMIT + RETURN_SLACK, "returned after {:?}", run.elapsed);
     }
 
     #[test]
@@ -636,18 +866,14 @@ mod tests {
         // exec keeps the shell's pid, so the recorded pid is the sleeping process
         let body = format!("echo $$ > '{}'\nexec sleep 30", pid_file.display());
 
-        let start = Instant::now();
-        let (script, result) = nvidia_script_reading(&dir, &body);
-        let elapsed = start.elapsed();
+        let run = nvidia_script_reading(&dir, &body, TIMEOUT_LIMIT);
 
-        assert!(matches!(&result,
-            Err(Error::CommandTimeout { command, seconds: 0 })
-                if Path::new(command) == script),
-            "{:?}", result);
-        assert!(elapsed < NVIDIA_TEST_LIMIT * 10, "returned after {:?}", elapsed);
+        assert_timed_out(&run);
+        assert!(run.elapsed < TIMEOUT_LIMIT + KILL_GRACE + RETURN_SLACK,
+            "returned after {:?}", run.elapsed);
 
         // A zombie still has a /proc entry, so this also proves the child was reaped
-        let pid = fs::read_to_string(&pid_file).unwrap();
-        assert!(!Path::new("/proc").join(pid.trim()).exists(), "pid {} still exists", pid.trim());
+        let pid = wait_for_pid(&pid_file).expect("the script wrote no pid");
+        assert!(!Path::new("/proc").join(&pid).exists(), "pid {} still exists", pid);
     }
 }
