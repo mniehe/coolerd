@@ -470,6 +470,14 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
 
         for (j, source) in zone_config.sources.iter().enumerate() {
             if let Some(steps) = &source.steps {
+                // An empty curve gives 100%, which an average would dilute
+                if steps.is_empty() {
+                    return Err(Error::ConfigValidation {
+                        path: path.to_owned(),
+                        reason: format!("zones[{}].sources[{}].steps: must be non-empty; remove the key to use the zone's steps", i, j),
+                    });
+                }
+
                 check_steps(steps, &format!("zones[{}].sources[{}].steps", i, j))
                     .map_err(|reason| Error::ConfigValidation { path: path.to_owned(), reason })?;
             }
@@ -808,6 +816,20 @@ mod tests {
 
         assert_eq!(validation_reason(&source_steps_toml(steps)),
             "zones[0].sources[1].steps[1].dcycle: values are not increasing");
+    }
+
+    #[test]
+    fn rejects_empty_source_steps() {
+        assert_eq!(validation_reason(&source_steps_toml("[]")),
+            "zones[0].sources[1].steps: must be non-empty; remove the key to use the zone's steps");
+    }
+
+    #[test]
+    fn rejects_empty_source_steps_when_every_source_has_steps() {
+        let sources = format!(r#"[{{ type = "nvidia", gpu = "{}", steps = {} }}, {{ type = "file", path = "/sys/temp", steps = [] }}]"#, GPU, GPU_STEPS);
+
+        assert_eq!(validation_reason(&zone_toml(&[("sources", &sources)])),
+            "zones[0].sources[1].steps: must be non-empty; remove the key to use the zone's steps");
     }
 
     #[test]

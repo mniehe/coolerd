@@ -80,9 +80,10 @@ sources = [
   # { type = "nvidia", gpu = "GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" },
 
   # Any source can carry its own `steps`, with the same rules as the zone's
-  # `steps` below. Such a source maps its temperature through its own curve
-  # and does not feed the zone temperature. This suits a GPU, which runs
-  # hotter than a CPU and needs a curve of its own.
+  # `steps` below, except that the list must be non-empty. Such a source maps
+  # its temperature through its own curve and does not feed the zone
+  # temperature. This suits a GPU, which runs hotter than a CPU and needs a
+  # curve of its own.
   # { type = "nvidia", gpu = "00000000:81:00.0", steps = [{ temp = 60, dcycle = 40 }, { temp = 90, dcycle = 100 }] },
 ]
 
