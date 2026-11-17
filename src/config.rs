@@ -492,11 +492,12 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
 /// Check a curve's steps. `key` names the list in the reason, such as
 /// `zones[0].steps`.
 fn check_steps(steps: &[Step], key: &str) -> Result<(), String> {
-    for window in steps.windows(2) {
+    // The reason names the second step of the pair that breaks the order
+    for (j, window) in steps.windows(2).enumerate() {
         if window[0].temp >= window[1].temp {
-            return Err(format!("{}[*].temp: values are not strictly increasing", key));
+            return Err(format!("{}[{}].temp: values are not strictly increasing", key, j + 1));
         } else if window[0].dcycle > window[1].dcycle {
-            return Err(format!("{}[*].dcycle: values are not increasing", key));
+            return Err(format!("{}[{}].dcycle: values are not increasing", key, j + 1));
         }
     }
 
@@ -690,7 +691,7 @@ mod tests {
         let steps = "[{ temp = 40, dcycle = 40 }, { temp = 40, dcycle = 50 }]";
 
         assert_eq!(validation_reason(&zone_toml(&[("steps", steps)])),
-            "zones[0].steps[*].temp: values are not strictly increasing");
+            "zones[0].steps[1].temp: values are not strictly increasing");
     }
 
     #[test]
@@ -698,7 +699,7 @@ mod tests {
         let steps = "[{ temp = 40, dcycle = 50 }, { temp = 70, dcycle = 40 }]";
 
         assert_eq!(validation_reason(&zone_toml(&[("steps", steps)])),
-            "zones[0].steps[*].dcycle: values are not increasing");
+            "zones[0].steps[1].dcycle: values are not increasing");
     }
 
     #[test]
@@ -715,7 +716,7 @@ mod tests {
         let steps = "[{ temp = 40, dcycle = 101 }, { temp = 40, dcycle = 40 }]";
 
         assert_eq!(validation_reason(&zone_toml(&[("steps", steps)])),
-            "zones[0].steps[*].temp: values are not strictly increasing");
+            "zones[0].steps[1].temp: values are not strictly increasing");
     }
 
     fn parse_error(contents: &str) -> String {
@@ -798,7 +799,7 @@ mod tests {
         let steps = "[{ temp = 60, dcycle = 40 }, { temp = 60, dcycle = 50 }]";
 
         assert_eq!(validation_reason(&source_steps_toml(steps)),
-            "zones[0].sources[1].steps[*].temp: values are not strictly increasing");
+            "zones[0].sources[1].steps[1].temp: values are not strictly increasing");
     }
 
     #[test]
@@ -806,7 +807,23 @@ mod tests {
         let steps = "[{ temp = 60, dcycle = 50 }, { temp = 90, dcycle = 40 }]";
 
         assert_eq!(validation_reason(&source_steps_toml(steps)),
-            "zones[0].sources[1].steps[*].dcycle: values are not increasing");
+            "zones[0].sources[1].steps[1].dcycle: values are not increasing");
+    }
+
+    #[test]
+    fn names_second_step_of_failing_temp_pair() {
+        let steps = "[{ temp = 40, dcycle = 40 }, { temp = 50, dcycle = 50 }, { temp = 50, dcycle = 60 }]";
+
+        assert_eq!(validation_reason(&zone_toml(&[("steps", steps)])),
+            "zones[0].steps[2].temp: values are not strictly increasing");
+    }
+
+    #[test]
+    fn names_second_step_of_failing_dcycle_pair() {
+        let steps = "[{ temp = 60, dcycle = 40 }, { temp = 70, dcycle = 50 }, { temp = 90, dcycle = 45 }]";
+
+        assert_eq!(validation_reason(&source_steps_toml(steps)),
+            "zones[0].sources[1].steps[2].dcycle: values are not increasing");
     }
 
     #[test]
@@ -824,7 +841,7 @@ mod tests {
         let zone_steps = "[{ temp = 40, dcycle = 50 }, { temp = 70, dcycle = 40 }]";
 
         assert_eq!(validation_reason(&zone_toml(&[("sources", &sources), ("steps", zone_steps)])),
-            "zones[0].steps[*].dcycle: values are not increasing");
+            "zones[0].steps[1].dcycle: values are not increasing");
     }
 
     #[test]
