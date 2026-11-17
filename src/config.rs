@@ -124,18 +124,43 @@ pub enum Source {
     },
 }
 
+/// What a zone does when a source has failed every attempt of a poll
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "lowercase", tag = "type")]
+pub enum OnFailure {
+    /// Stop the daemon, which sets every zone to 100%
+    // Serde ignores extra keys on a unit variant of a tagged enum; an empty
+    // struct variant rejects them
+    Exit {},
+    /// Leave the source out until it reads again
+    Ignore {},
+    /// Leave the source out and keep the zone at `dcycle` or above
+    Dcycle {
+        dcycle: u8,
+    },
+}
+
+// `#[default]` needs a unit variant
+impl Default for OnFailure {
+    fn default() -> Self {
+        Self::Exit {}
+    }
+}
+
 /// A source with an optional curve of its own. A source with `steps` maps its
 /// reading through them; a source without feeds the zone's curve.
 #[derive(Clone, Debug)]
 pub struct SourceConfig {
     pub kind: Source,
     pub steps: Option<Vec<Step>>,
+    pub on_failure: OnFailure,
 }
 
-/// Serde cannot combine `flatten` with `deny_unknown_fields`, so `steps` is
-/// taken out of the table by hand and the rest goes to [`Source`], which still
-/// rejects an unknown key or type. A sequence, the positional form that
-/// [`Source`] accepts, goes to it unchanged and has no `steps`.
+/// Serde cannot combine `flatten` with `deny_unknown_fields`, so `steps` and
+/// `on_failure` are taken out of the table by hand and the rest goes to
+/// [`Source`], which still rejects an unknown key or type. A sequence, the
+/// positional form that [`Source`] accepts, goes to it unchanged and has no
+/// `steps` and the default `on_failure`.
 impl<'de> Deserialize<'de> for SourceConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -156,7 +181,7 @@ impl<'de> Deserialize<'de> for SourceConfig {
             {
                 let kind = Source::deserialize(SeqAccessDeserializer::new(seq))?;
 
-                Ok(SourceConfig { kind, steps: None })
+                Ok(SourceConfig { kind, steps: None, on_failure: OnFailure::default() })
             }
 
             // The table is collected by hand, so a repeated key is rejected
@@ -167,26 +192,40 @@ impl<'de> Deserialize<'de> for SourceConfig {
             {
                 let mut table = toml::value::Table::new();
                 let mut steps = None;
+                let mut on_failure = None;
 
                 while let Some(key) = map.next_key::<String>()? {
-                    if (key == "steps" && steps.is_some()) || table.contains_key(&key) {
+                    let repeated = match key.as_str() {
+                        "steps" => steps.is_some(),
+                        "on_failure" => on_failure.is_some(),
+                        _ => table.contains_key(&key),
+                    };
+
+                    if repeated {
                         return Err(de::Error::custom(format!("duplicate field `{}`", key)));
                     }
 
                     let value = map.next_value::<toml::Value>()?;
 
-                    if key == "steps" {
-                        steps = Some(Vec::<Step>::deserialize(value)
-                            .map_err(|e| de::Error::custom(format!("steps: {}", e)))?);
-                    } else {
-                        table.insert(key, value);
+                    match key.as_str() {
+                        "steps" => {
+                            steps = Some(Vec::<Step>::deserialize(value)
+                                .map_err(|e| de::Error::custom(format!("steps: {}", e)))?);
+                        }
+                        "on_failure" => {
+                            on_failure = Some(OnFailure::deserialize(value)
+                                .map_err(|e| de::Error::custom(format!("on_failure: {}", e)))?);
+                        }
+                        _ => {
+                            table.insert(key, value);
+                        }
                     }
                 }
 
                 let kind = Source::deserialize(toml::Value::Table(table))
                     .map_err(de::Error::custom)?;
 
-                Ok(SourceConfig { kind, steps })
+                Ok(SourceConfig { kind, steps, on_failure: on_failure.unwrap_or_default() })
             }
         }
 
@@ -437,6 +476,15 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
         }
 
         for (j, source) in zone_config.sources.iter().enumerate() {
+            if let OnFailure::Dcycle { dcycle } = source.on_failure {
+                if dcycle > 100 {
+                    return Err(Error::ConfigValidation {
+                        path: path.to_owned(),
+                        reason: format!("zones[{}].sources[{}].on_failure[type=dcycle].dcycle: invalid percentage: {}", i, j, dcycle),
+                    });
+                }
+            }
+
             if let Source::Nvidia { gpu } = &source.kind {
                 if !is_gpu_uuid(gpu) && !is_pci_bus_id(gpu) {
                     return Err(Error::ConfigValidation {
@@ -536,7 +584,7 @@ fn check_steps(steps: &[Step], key: &str) -> Result<(), String> {
 mod tests {
     use {
         std::path::Path,
-        super::{Aggregation, Config, LogLevel, parse_config, SessionType, Source},
+        super::{Aggregation, Config, LogLevel, OnFailure, parse_config, SessionType, Source},
         crate::error::{Error, Result},
     };
 
@@ -938,6 +986,104 @@ mod tests {
         let message = parse_error(&source_steps_toml("5"));
 
         assert!(message.contains("steps: invalid type"), "{}", message);
+    }
+
+    /// Build a zone whose only source is a file source with `on_failure`
+    fn on_failure_toml(on_failure: &str) -> String {
+        let sources = format!(r#"[{{ type = "file", path = "/sys/temp", on_failure = {} }}]"#, on_failure);
+        zone_toml(&[("sources", &sources)])
+    }
+
+    fn loaded_on_failure(on_failure: &str) -> OnFailure {
+        let config = parse(&on_failure_toml(on_failure)).unwrap();
+
+        config.zones[0].sources[0].on_failure.clone()
+    }
+
+    #[test]
+    fn accepts_on_failure_exit() {
+        assert_eq!(loaded_on_failure(r#"{ type = "exit" }"#), OnFailure::Exit {});
+    }
+
+    #[test]
+    fn accepts_on_failure_ignore() {
+        assert_eq!(loaded_on_failure(r#"{ type = "ignore" }"#), OnFailure::Ignore {});
+    }
+
+    #[test]
+    fn accepts_on_failure_dcycle() {
+        assert_eq!(loaded_on_failure(r#"{ type = "dcycle", dcycle = 80 }"#), OnFailure::Dcycle { dcycle: 80 });
+    }
+
+    #[test]
+    fn accepts_on_failure_dcycle_of_full_duty() {
+        assert_eq!(loaded_on_failure(r#"{ type = "dcycle", dcycle = 100 }"#), OnFailure::Dcycle { dcycle: 100 });
+    }
+
+    #[test]
+    fn on_failure_defaults_to_exit() {
+        let config = parse(&zone_toml(&[])).unwrap();
+
+        assert_eq!(config.zones[0].sources[0].on_failure, OnFailure::Exit {});
+    }
+
+    #[test]
+    fn positional_source_on_failure_defaults_to_exit() {
+        let config = parse(&zone_toml(&[("sources", r#"[["file", "/dev/null"]]"#)])).unwrap();
+
+        assert_eq!(config.zones[0].sources[0].on_failure, OnFailure::Exit {});
+    }
+
+    #[test]
+    fn accepts_on_failure_beside_source_steps() {
+        let sources = format!(r#"[{{ type = "nvidia", gpu = "{}", steps = {}, on_failure = {{ type = "ignore" }} }}]"#, GPU, GPU_STEPS);
+        let config = parse(&zone_toml(&[("sources", &sources)])).unwrap();
+        let source = &config.zones[0].sources[0];
+
+        assert!(matches!(&source.kind, Source::Nvidia { gpu } if gpu == GPU));
+        assert_eq!(source.steps.as_ref().unwrap().len(), 2);
+        assert_eq!(source.on_failure, OnFailure::Ignore {});
+    }
+
+    #[test]
+    fn rejects_on_failure_dcycle_above_100() {
+        assert_eq!(validation_reason(&on_failure_toml(r#"{ type = "dcycle", dcycle = 101 }"#)),
+            "zones[0].sources[0].on_failure[type=dcycle].dcycle: invalid percentage: 101");
+    }
+
+    #[test]
+    fn rejects_unknown_on_failure_type() {
+        let message = parse_error(&on_failure_toml(r#"{ type = "slow" }"#));
+
+        assert!(message.contains("on_failure: unknown variant `slow`"), "{}", message);
+    }
+
+    #[test]
+    fn rejects_on_failure_dcycle_without_dcycle() {
+        let message = parse_error(&on_failure_toml(r#"{ type = "dcycle" }"#));
+
+        assert!(message.contains("on_failure: missing field `dcycle`"), "{}", message);
+    }
+
+    #[test]
+    fn rejects_extra_key_on_each_on_failure_type() {
+        for on_failure in [
+            r#"{ type = "exit", dcycle = 80 }"#,
+            r#"{ type = "ignore", dcycle = 80 }"#,
+            r#"{ type = "dcycle", dcycle = 80, floor = 1 }"#,
+        ] {
+            let message = parse_error(&on_failure_toml(on_failure));
+
+            assert!(message.contains("on_failure: unknown field"), "{}: {}", on_failure, message);
+        }
+    }
+
+    #[test]
+    fn rejects_repeated_on_failure_in_source() {
+        let sources = r#"[{ type = "file", path = "/sys/temp", on_failure = { type = "exit" }, on_failure = { type = "ignore" } }]"#;
+        let message = parse_error(&zone_toml(&[("sources", sources)]));
+
+        assert!(message.contains("duplicate field `on_failure`"), "{}", message);
     }
 
     #[test]

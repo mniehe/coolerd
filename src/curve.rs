@@ -193,6 +193,7 @@ mod tests {
         crate::config::{
             Aggregation,
             Interval,
+            OnFailure,
             Retries,
             RetryDelayMs,
             SessionName,
@@ -215,12 +216,16 @@ mod tests {
 
     /// A source that feeds the zone curve
     fn plain() -> SourceConfig {
-        SourceConfig { kind: Source::File { path: "/sys/temp".to_owned() }, steps: None }
+        SourceConfig {
+            kind: Source::File { path: "/sys/temp".to_owned() },
+            steps: None,
+            on_failure: OnFailure::default(),
+        }
     }
 
     /// A source with a curve of its own
     fn curved(steps: &[Step]) -> SourceConfig {
-        SourceConfig { kind: Source::File { path: "/sys/temp".to_owned() }, steps: Some(steps.to_vec()) }
+        SourceConfig { steps: Some(steps.to_vec()), ..plain() }
     }
 
     fn zone(steps: &[Step], sources: Vec<SourceConfig>) -> Zone {
