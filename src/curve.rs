@@ -488,8 +488,30 @@ mod tests {
             vec![Temp(50), Temp(78)],
         ]);
 
-        // A fall of 2 from the 80 C held before the failure is held
+        // While the GPU fails, CPU 50 C alone gives 54
+        assert_eq!(updates[1].duty, 54);
+        // A fall of 2 from the 80 C held before the failure is held, and 80 C
+        // on the GPU curve gives 80
         assert_eq!(updates[2].curve_temps, [50, 80]);
+        assert_eq!(updates[2].duty, 80);
+    }
+
+    #[test]
+    fn zone_curve_keeps_its_held_temperature_while_every_plain_source_fails() {
+        let mut zone = zone(&HOLD_STEPS, vec![failing(plain(), OnFailure::Ignore {}), curved(&GPU_STEPS)]);
+        zone.hysteresis = 5;
+        let updates = updates(&zone, &[
+            vec![Temp(60), Temp(70)],
+            vec![failed(), Temp(70)],
+            vec![Temp(58), Temp(70)],
+        ]);
+
+        // Only the GPU curve gives a duty while the zone curve has no reading
+        assert_eq!(updates[1].curve_temps, [70]);
+        // A fall of 2 from the 60 C held before the failure is held: 60 C on
+        // the zone curve gives 70, above the GPU curve's 60
+        assert_eq!(updates[2].curve_temps, [60, 70]);
+        assert_eq!(updates[2].duty, 70);
     }
 
     #[test]

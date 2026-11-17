@@ -1076,6 +1076,31 @@ mod tests {
             "zones[0].sources[0].on_failure[type=dcycle].dcycle: invalid percentage: 101");
     }
 
+    /// Sources whose last entry has an `on_failure` dcycle of 101, after
+    /// `good` sources without one
+    fn bad_dcycle_last_of(good: usize) -> String {
+        let mut sources = vec![r#"{ type = "file", path = "/sys/temp" }"#; good];
+        sources.push(r#"{ type = "file", path = "/sys/temp", on_failure = { type = "dcycle", dcycle = 101 } }"#);
+
+        format!("[{}]", sources.join(", "))
+    }
+
+    #[test]
+    fn on_failure_dcycle_error_names_the_source_index() {
+        let contents = zone_toml(&[("sources", &bad_dcycle_last_of(1))]);
+
+        assert_eq!(validation_reason(&contents),
+            "zones[0].sources[1].on_failure[type=dcycle].dcycle: invalid percentage: 101");
+    }
+
+    #[test]
+    fn on_failure_dcycle_error_names_the_zone_index() {
+        let contents = zone_toml(&[]) + &zone_toml(&[("sources", &bad_dcycle_last_of(2))]);
+
+        assert_eq!(validation_reason(&contents),
+            "zones[1].sources[2].on_failure[type=dcycle].dcycle: invalid percentage: 101");
+    }
+
     #[test]
     fn rejects_unknown_on_failure_type() {
         let message = parse_error(&on_failure_toml(r#"{ type = "slow" }"#));
