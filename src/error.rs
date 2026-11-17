@@ -89,13 +89,4 @@ pub enum Error {
     LoopPanicked(#[source] JoinError),
 }
 
-impl From<retry::Error<Self>> for Error {
-    fn from(value: retry::Error<Self>) -> Self {
-        Self::RetriesFailed {
-            attempts: value.tries,
-            source: Box::new(value.error),
-        }
-    }
-}
-
 pub type Result<T, E = Error> = result::Result<T, E>;

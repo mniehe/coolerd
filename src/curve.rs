@@ -1,6 +1,6 @@
 use {
     std::cmp::Reverse,
-    crate::config::{Aggregation, Step, Zone},
+    crate::config::{Aggregation, OnFailure, Step, Zone},
 };
 
 /// Map a temperature to a duty cycle through the zone's steps
@@ -109,45 +109,118 @@ impl HeldTemp {
     }
 }
 
+/// The outcome of reading one source in one poll
+#[derive(Clone, Debug, PartialEq)]
+pub enum SourceReading {
+    Temp(u8),
+    /// The source failed every attempt; the string is the error text
+    Failed(String),
+}
+
+/// A change in whether a source fails, named by the source's index
+#[derive(Debug, PartialEq)]
+pub enum Transition {
+    Failed { source: usize, error: String },
+    Recovered { source: usize },
+}
+
 pub struct ZoneUpdate {
     /// The duty cycle to set for the zone
     pub duty: u8,
     /// The temperature each curve mapped: the zone curve first when it is
     /// used, then the curve of each source with `steps`, in source order
     pub curve_temps: Vec<u8>,
+    /// The sources that started or stopped failing in this poll
+    pub transitions: Vec<Transition>,
 }
 
-/// The held temperatures of a zone's curves between polls
+/// What a zone keeps of one source between polls
+struct SourceState {
+    /// Only a source with `steps` uses its curve
+    curve: HeldTemp,
+    failed: bool,
+}
+
+impl SourceState {
+    /// Record whether the source at `index` failed in this poll and return
+    /// the change, if there is one
+    fn transition(&mut self, index: usize, reading: &SourceReading) -> Option<Transition> {
+        let failed = matches!(reading, SourceReading::Failed(_));
+
+        if failed == self.failed {
+            return None;
+        }
+
+        self.failed = failed;
+
+        Some(match reading {
+            SourceReading::Failed(error) => Transition::Failed { source: index, error: error.clone() },
+            SourceReading::Temp(_) => Transition::Recovered { source: index },
+        })
+    }
+}
+
+/// The lowest duty the zone may run at while a source with `on_failure` fails
+fn failure_floor(on_failure: &OnFailure) -> u8 {
+    match on_failure {
+        OnFailure::Ignore {} => 0,
+        OnFailure::Dcycle { dcycle } => *dcycle,
+        // An `exit` source stops the daemon instead of giving a failed
+        // reading; should one arrive, the fans run at full speed
+        OnFailure::Exit {} => FULL_DUTY,
+    }
+}
+
+/// The held temperatures of a zone's curves and the failed sources between
+/// polls
 pub struct ZoneState {
     zone_curve: HeldTemp,
-    /// One per source; only sources with `steps` use theirs
-    source_curves: Vec<HeldTemp>,
+    /// One per source, in source order
+    sources: Vec<SourceState>,
 }
 
 impl ZoneState {
     pub fn new(zone: &Zone) -> Self {
         Self {
             zone_curve: HeldTemp(None),
-            source_curves: zone.sources.iter().map(|_| HeldTemp(None)).collect(),
+            sources: zone.sources.iter()
+                .map(|_| SourceState { curve: HeldTemp(None), failed: false })
+                .collect(),
         }
     }
 
     /// Compute the zone duty from one reading per source, in source order.
     /// Sources without `steps` are aggregated into the zone curve; each source
-    /// with `steps` maps its reading through its own curve.
-    pub fn next_duty(&mut self, zone: &Zone, readings: &[u8]) -> ZoneUpdate {
-        if readings.len() != zone.sources.len() || readings.len() != self.source_curves.len() {
-            return ZoneUpdate { duty: FULL_DUTY, curve_temps: Vec::new() };
+    /// with `steps` maps its reading through its own curve. A failed source
+    /// takes part in neither, its curve holds its temperature, and its
+    /// `on_failure` sets the lowest duty the zone may run at.
+    pub fn next_duty(&mut self, zone: &Zone, readings: &[SourceReading]) -> ZoneUpdate {
+        if readings.len() != zone.sources.len() || readings.len() != self.sources.len() {
+            return ZoneUpdate { duty: FULL_DUTY, curve_temps: Vec::new(), transitions: Vec::new() };
         }
 
         let mut zone_readings = Vec::new();
         let mut source_temps = Vec::new();
         let mut source_duties = Vec::new();
+        let mut transitions = Vec::new();
+        let mut floor = 0;
 
-        for ((source, held), &reading) in zone.sources.iter().zip(&mut self.source_curves).zip(readings) {
+        let sources = zone.sources.iter().zip(&mut self.sources).zip(readings);
+
+        for (index, ((source, state), reading)) in sources.enumerate() {
+            transitions.extend(state.transition(index, reading));
+
+            let reading = match reading {
+                SourceReading::Temp(temp) => *temp,
+                SourceReading::Failed(_) => {
+                    floor = floor.max(failure_floor(&source.on_failure));
+                    continue;
+                }
+            };
+
             match &source.steps {
                 Some(steps) => {
-                    let temp = held.update(reading, zone.hysteresis);
+                    let temp = state.curve.update(reading, zone.hysteresis);
                     source_temps.push(temp);
                     source_duties.push(duty_for_temp(steps, temp));
                 }
@@ -158,7 +231,8 @@ impl ZoneState {
         let mut curve_temps = Vec::new();
         let mut duties = Vec::new();
 
-        // No reading reaches the zone curve when every source has `steps`
+        // No reading reaches the zone curve when every source without `steps`
+        // failed or every source has `steps`
         if let Some(reading) = aggregate(&zone_readings, &zone.aggregation, Rounding::Down) {
             let temp = self.zone_curve.update(reading, zone.hysteresis);
             curve_temps.push(temp);
@@ -171,19 +245,29 @@ impl ZoneState {
         curve_temps.append(&mut source_temps);
         duties.append(&mut source_duties);
 
-        // No curve gives a duty only for a zone without sources, which
-        // validation rejects; the fans then run at full speed
-        let duty = aggregate(&duties, &zone.duty_aggregation, Rounding::Up)
-            .unwrap_or(FULL_DUTY);
+        // A zone with no curve left to give a duty, as when every source
+        // failed, runs at full speed
+        let duty = match aggregate(&duties, &zone.duty_aggregation, Rounding::Up) {
+            Some(duty) => duty.max(floor),
+            None => FULL_DUTY,
+        };
 
-        ZoneUpdate { duty, curve_temps }
+        ZoneUpdate { duty, curve_temps, transitions }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use {
-        super::{aggregate, duty_for_temp, Rounding, ZoneState},
+        super::{
+            aggregate,
+            duty_for_temp,
+            Rounding,
+            SourceReading::{self, Failed, Temp},
+            Transition,
+            ZoneState,
+            ZoneUpdate,
+        },
         crate::config::{
             Aggregation,
             Interval,
@@ -237,11 +321,170 @@ mod tests {
         }
     }
 
+    /// A source that runs the zone at `on_failure` while it fails
+    fn failing(source: SourceConfig, on_failure: OnFailure) -> SourceConfig {
+        SourceConfig { on_failure, ..source }
+    }
+
+    fn temps(values: &[u8]) -> Vec<SourceReading> {
+        values.iter().map(|&t| Temp(t)).collect()
+    }
+
+    fn failed() -> SourceReading {
+        Failed("timed out".to_owned())
+    }
+
     /// Feed one set of readings per poll and collect the duties
     fn duties(zone: &Zone, polls: &[&[u8]]) -> Vec<u8> {
         let mut state = ZoneState::new(zone);
 
-        polls.iter().map(|readings| state.next_duty(zone, readings).duty).collect()
+        polls.iter().map(|readings| state.next_duty(zone, &temps(readings)).duty).collect()
+    }
+
+    /// Feed one set of source readings per poll and collect each update
+    fn updates(zone: &Zone, polls: &[Vec<SourceReading>]) -> Vec<ZoneUpdate> {
+        let mut state = ZoneState::new(zone);
+
+        polls.iter().map(|readings| state.next_duty(zone, readings)).collect()
+    }
+
+    const GPU_FLOOR: OnFailure = OnFailure::Dcycle { dcycle: 80 };
+
+    /// CPU on the zone curve, GPU on its own curve
+    fn cpu_gpu_zone(gpu_on_failure: OnFailure) -> Zone {
+        zone(&ZONE_STEPS, vec![plain(), failing(curved(&GPU_STEPS), gpu_on_failure)])
+    }
+
+    #[test]
+    fn failed_dcycle_source_raises_duty_to_its_floor() {
+        // CPU 50 C alone gives 54
+        let zone = cpu_gpu_zone(GPU_FLOOR);
+
+        assert_eq!(updates(&zone, &[vec![Temp(50), failed()]])[0].duty, 80);
+    }
+
+    #[test]
+    fn failed_ignore_source_is_left_out() {
+        let zone = cpu_gpu_zone(OnFailure::Ignore {});
+        let update = &updates(&zone, &[vec![Temp(50), failed()]])[0];
+
+        assert_eq!(update.duty, 54);
+        assert_eq!(update.curve_temps, [50]);
+    }
+
+    #[test]
+    fn live_duty_above_failed_floor_is_kept() {
+        let zone = cpu_gpu_zone(GPU_FLOOR);
+
+        assert_eq!(updates(&zone, &[vec![Temp(75), failed()]])[0].duty, 100);
+    }
+
+    #[test]
+    fn average_of_live_curves_above_failed_floor_is_kept() {
+        let mut zone = zone(&ZONE_STEPS, vec![
+            curved(&[Step { temp: 0, dcycle: 40 }]),
+            curved(&[Step { temp: 0, dcycle: 60 }]),
+            failing(plain(), OnFailure::Dcycle { dcycle: 30 }),
+        ]);
+        zone.duty_aggregation = Aggregation::Average { top: None };
+
+        assert_eq!(updates(&zone, &[vec![Temp(50), Temp(50), failed()]])[0].duty, 50);
+    }
+
+    #[test]
+    fn failed_source_leaves_zone_temperature() {
+        let mut zone = zone(&ZONE_STEPS, vec![plain(), failing(plain(), OnFailure::Ignore {})]);
+        zone.aggregation = Aggregation::Average { top: None };
+        let update = &updates(&zone, &[vec![Temp(60), failed()]])[0];
+
+        assert_eq!(update.curve_temps, [60]);
+        assert_eq!(update.duty, 72);
+    }
+
+    #[test]
+    fn all_sources_failed_with_ignore_give_full_duty() {
+        let zone = zone(&ZONE_STEPS, vec![
+            failing(plain(), OnFailure::Ignore {}),
+            failing(curved(&GPU_STEPS), OnFailure::Ignore {}),
+        ]);
+        let update = &updates(&zone, &[vec![failed(), failed()]])[0];
+
+        assert_eq!(update.duty, 100);
+        assert!(update.curve_temps.is_empty());
+    }
+
+    #[test]
+    fn all_sources_failed_with_a_floor_give_full_duty() {
+        let zone = zone(&ZONE_STEPS, vec![
+            failing(plain(), OnFailure::Dcycle { dcycle: 30 }),
+            failing(curved(&GPU_STEPS), OnFailure::Ignore {}),
+        ]);
+
+        assert_eq!(updates(&zone, &[vec![failed(), failed()]])[0].duty, 100);
+    }
+
+    #[test]
+    fn failed_exit_source_gives_full_duty() {
+        // read_zone_sources returns the error of an `exit` source instead
+        let zone = cpu_gpu_zone(OnFailure::Exit {});
+
+        assert_eq!(updates(&zone, &[vec![Temp(50), failed()]])[0].duty, 100);
+    }
+
+    #[test]
+    fn run_of_failures_gives_one_failed_transition() {
+        let zone = cpu_gpu_zone(GPU_FLOOR);
+        let updates = updates(&zone, &[
+            vec![Temp(50), Temp(70)],
+            vec![Temp(50), failed()],
+            vec![Temp(50), failed()],
+            vec![Temp(50), failed()],
+        ]);
+        let transitions: Vec<_> = updates.iter().map(|u| &u.transitions).collect();
+
+        assert!(transitions[0].is_empty());
+        assert_eq!(transitions[1], &[Transition::Failed { source: 1, error: "timed out".to_owned() }]);
+        assert!(transitions[2].is_empty());
+        assert!(transitions[3].is_empty());
+    }
+
+    #[test]
+    fn source_failing_on_first_poll_gives_failed_transition() {
+        let zone = cpu_gpu_zone(OnFailure::Ignore {});
+
+        assert_eq!(updates(&zone, &[vec![Temp(50), failed()]])[0].transitions,
+            [Transition::Failed { source: 1, error: "timed out".to_owned() }]);
+    }
+
+    #[test]
+    fn recovered_source_sets_duty_again_with_one_recovery() {
+        let zone = cpu_gpu_zone(GPU_FLOOR);
+        let updates = updates(&zone, &[
+            vec![Temp(50), failed()],
+            vec![Temp(50), Temp(70)],
+            vec![Temp(50), Temp(70)],
+        ]);
+
+        // CPU 50 C gives 54 and GPU 70 C gives 60
+        assert_eq!(updates[0].duty, 80);
+        assert_eq!(updates[1].duty, 60);
+        assert_eq!(updates[1].curve_temps, [50, 70]);
+        assert_eq!(updates[1].transitions, [Transition::Recovered { source: 1 }]);
+        assert!(updates[2].transitions.is_empty());
+    }
+
+    #[test]
+    fn failed_source_keeps_its_held_temperature() {
+        let mut zone = cpu_gpu_zone(OnFailure::Ignore {});
+        zone.hysteresis = 5;
+        let updates = updates(&zone, &[
+            vec![Temp(50), Temp(80)],
+            vec![Temp(50), failed()],
+            vec![Temp(50), Temp(78)],
+        ]);
+
+        // A fall of 2 from the 80 C held before the failure is held
+        assert_eq!(updates[2].curve_temps, [50, 80]);
     }
 
     #[test]
@@ -284,7 +527,7 @@ mod tests {
         // Readings 50 and 51 have the mean 50.5
         let mut zone = zone(&HOLD_STEPS, vec![plain(), plain()]);
         zone.aggregation = Aggregation::Average { top: None };
-        let update = ZoneState::new(&zone).next_duty(&zone, &[50, 51]);
+        let update = ZoneState::new(&zone).next_duty(&zone, &temps(&[50, 51]));
 
         assert_eq!(update.curve_temps, [50]);
         assert_eq!(update.duty, 55);
@@ -301,7 +544,7 @@ mod tests {
     fn zone_curve_is_skipped_when_every_source_has_steps() {
         // An empty zone curve would give 100% if it were used
         let zone = zone(&[], vec![curved(&GPU_STEPS), curved(&GPU_STEPS)]);
-        let update = ZoneState::new(&zone).next_duty(&zone, &[70, 60]);
+        let update = ZoneState::new(&zone).next_duty(&zone, &temps(&[70, 60]));
 
         assert_eq!(update.duty, 60);
         assert_eq!(update.curve_temps, [70, 60]);
@@ -331,7 +574,7 @@ mod tests {
         let constant = [Step { temp: 0, dcycle: 40 }];
         let mut zone = zone(&ZONE_STEPS, vec![plain(), plain(), curved(&constant)]);
         zone.aggregation = Aggregation::Average { top: None };
-        let update = ZoneState::new(&zone).next_duty(&zone, &[50, 70, 90]);
+        let update = ZoneState::new(&zone).next_duty(&zone, &temps(&[50, 70, 90]));
 
         assert_eq!(update.duty, 72);
         assert_eq!(update.curve_temps, [60, 90]);
@@ -340,7 +583,7 @@ mod tests {
     #[test]
     fn curve_temps_list_zone_curve_then_sources_in_order() {
         let zone = zone(&ZONE_STEPS, vec![curved(&GPU_STEPS), plain(), curved(&HOLD_STEPS)]);
-        let update = ZoneState::new(&zone).next_duty(&zone, &[61, 50, 62]);
+        let update = ZoneState::new(&zone).next_duty(&zone, &temps(&[61, 50, 62]));
 
         assert_eq!(update.curve_temps, [50, 61, 62]);
     }
@@ -398,16 +641,16 @@ mod tests {
         let mut zone = zone(&HOLD_STEPS, vec![plain(), curved(&HOLD_STEPS)]);
         zone.hysteresis = 5;
         let mut state = ZoneState::new(&zone);
-        state.next_duty(&zone, &[60, 60]);
+        state.next_duty(&zone, &temps(&[60, 60]));
 
-        assert_eq!(state.next_duty(&zone, &[58, 50]).curve_temps, [60, 50]);
+        assert_eq!(state.next_duty(&zone, &temps(&[58, 50])).curve_temps, [60, 50]);
     }
 
     #[test]
     fn zone_without_source_steps_keeps_its_duty() {
         // A stage 1 zone: no source steps, no hysteresis, default aggregation
         let zone = zone(&ZONE_STEPS, vec![plain(), plain(), plain()]);
-        let update = ZoneState::new(&zone).next_duty(&zone, &[50, 70, 60]);
+        let update = ZoneState::new(&zone).next_duty(&zone, &temps(&[50, 70, 60]));
 
         assert_eq!(update.duty, duty_for_temp(&ZONE_STEPS, 70));
         assert_eq!(update.duty, 90);

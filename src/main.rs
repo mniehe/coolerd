@@ -21,17 +21,16 @@ use {
     },
     clap::Parser,
     log::{debug, error, info, trace},
-    retry::retry_with_index,
     tokio::{
         task::{self, JoinSet},
         time::sleep,
     },
 
     config::{Config, load_config, SessionType, Zone},
-    curve::ZoneState,
+    curve::{Transition, ZoneState},
     error::{Error, Result},
     ipmi::{FanMode, Ipmi},
-    source::get_source_readings,
+    source::{read_source, read_zone_sources},
 };
 
 static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -244,14 +243,14 @@ impl MainApp {
         zone_config: &Zone,
         state: &mut ZoneState,
     ) -> Result<()> {
-        let ipmi = session.ipmi.clone();
-        let readings = retry_with_index(zone_config.retry_iter(), move |i| {
-            trace!("Querying sources for zones {:?} (attempt {}/{})",
-                   zone_config.ipmi_zones, i, zone_config.retries.0 + 1);
-            get_source_readings(ipmi.clone(), &zone_config.sources)
-        })?;
+        trace!("Querying sources for zones {:?}", zone_config.ipmi_zones);
+
+        let mut query_ipmi = || Ok(session.ipmi.lock().unwrap().get_temperature_readings()?);
+        let readings = read_zone_sources(zone_config, &mut query_ipmi, &read_source)?;
         let update = state.next_duty(zone_config, &readings);
         let dcycle_new = update.duty;
+
+        Self::log_transitions(&session.name, zone_config, &update.transitions);
 
         let mut ipmi_lock = session.ipmi.lock().unwrap();
 
@@ -267,6 +266,29 @@ impl MainApp {
         }
 
         Ok(())
+    }
+
+    /// Log a source that starts failing as an error and one that reads again
+    /// as information, once per change
+    fn log_transitions(session_name: &str, zone_config: &Zone, transitions: &[Transition]) {
+        let describe = |index: usize| {
+            zone_config.sources.get(index).map_or_else(
+                || format!("#{}", index),
+                |s| format!("{:?} (on_failure {:?})", s.kind, s.on_failure))
+        };
+
+        for transition in transitions {
+            match transition {
+                Transition::Failed { source, error } => {
+                    error!("[{}] Zones {:?}: source {} failed: {}",
+                           session_name, zone_config.ipmi_zones, describe(*source), error);
+                }
+                Transition::Recovered { source } => {
+                    info!("[{}] Zones {:?}: source {} reads again",
+                          session_name, zone_config.ipmi_zones, describe(*source));
+                }
+            }
+        }
     }
 }
 
