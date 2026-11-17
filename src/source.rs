@@ -45,6 +45,11 @@ fn parse_smart_source<T: AsRef<Path>>(block_dev: T) -> Result<u8> {
     let root: serde_json::Value = result
         .map_err(|e| Error::SmartParse { block_dev: block_dev.to_owned(), source: e })?;
 
+    parse_smart_output(block_dev, &root)
+}
+
+/// Extract `temperature.current` from smartctl's JSON output
+fn parse_smart_output(block_dev: &Path, root: &serde_json::Value) -> Result<u8> {
     let temperature = root
         .get("temperature")
         .and_then(|v| v.get("current"))
@@ -209,4 +214,134 @@ pub fn get_source_readings(ipmi: Arc<Mutex<Ipmi>>, sources: &[Source])
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        std::{
+            env,
+            fs,
+            path::{Path, PathBuf},
+            process,
+            sync::atomic::{AtomicUsize, Ordering},
+        },
+        serde_json::json,
+        super::{parse_file_source, parse_hdparm_output, parse_smart_output},
+        crate::error::Error,
+    };
+
+    const BLOCK_DEV: &str = "/dev/sda";
+
+    /// Directory under the system temp dir that is removed when dropped
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+            let name = format!("ipmi-fan-control-test-{}-{}",
+                process::id(), COUNTER.fetch_add(1, Ordering::SeqCst));
+            let path = env::temp_dir().join(name);
+            fs::create_dir(&path).unwrap();
+
+            Self(path)
+        }
+
+        fn write(&self, name: &str, contents: &str) -> PathBuf {
+            let path = self.0.join(name);
+            fs::write(&path, contents).unwrap();
+            path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn file_reading(contents: &str) -> Result<u8, Error> {
+        let dir = TempDir::new();
+        let path = dir.write("temp", contents);
+        parse_file_source(path)
+    }
+
+    fn hdparm_reading(output: &str) -> Result<u8, Error> {
+        parse_hdparm_output(Path::new(BLOCK_DEV), &mut output.as_bytes())
+    }
+
+    #[test]
+    fn smart_current_temperature() {
+        let root = json!({ "temperature": { "current": 41 } });
+
+        assert_eq!(parse_smart_output(Path::new(BLOCK_DEV), &root).unwrap(), 41);
+    }
+
+    #[test]
+    fn smart_without_temperature_has_no_reading() {
+        let root = json!({ "smart_status": { "passed": true } });
+        let result = parse_smart_output(Path::new(BLOCK_DEV), &root);
+
+        assert!(matches!(result, Err(Error::SmartNoReading(p)) if p == Path::new(BLOCK_DEV)));
+    }
+
+    #[test]
+    fn smart_temperature_above_u8_exceeds_bounds() {
+        let root = json!({ "temperature": { "current": 256 } });
+        let result = parse_smart_output(Path::new(BLOCK_DEV), &root);
+
+        assert!(matches!(result, Err(Error::ReadingExceedsBounds)));
+    }
+
+    #[test]
+    fn hdparm_temperature_line() {
+        let output = "\n/dev/sda:\n drive temperature (celsius) is:  33\n drive temperature in range:  yes\n";
+
+        assert_eq!(hdparm_reading(output).unwrap(), 33);
+    }
+
+    #[test]
+    fn hdparm_negative_temperature_exceeds_bounds() {
+        let output = "\n/dev/sda:\n drive temperature (celsius) is:  -5\n";
+
+        assert!(matches!(hdparm_reading(output), Err(Error::ReadingExceedsBounds)));
+    }
+
+    #[test]
+    fn hdparm_bad_sense_data() {
+        let output = "\n/dev/sda:\nSG_IO: bad/missing sense data, sb[]:  70 00 05 00\n";
+
+        assert!(matches!(hdparm_reading(output),
+            Err(Error::HdparmBadData(p)) if p == Path::new(BLOCK_DEV)));
+    }
+
+    #[test]
+    fn hdparm_without_temperature_has_no_data() {
+        let output = "\n/dev/sda:\n";
+
+        assert!(matches!(hdparm_reading(output),
+            Err(Error::HdparmNoData(p)) if p == Path::new(BLOCK_DEV)));
+    }
+
+    #[test]
+    fn file_millidegrees() {
+        assert_eq!(file_reading("42000\n").unwrap(), 42);
+    }
+
+    #[test]
+    fn file_non_numeric_fails_to_parse() {
+        assert!(matches!(file_reading("hot\n"),
+            Err(Error::SensorValueParse { value, .. }) if value == "hot"));
+    }
+
+    #[test]
+    fn file_highest_u8_temperature() {
+        assert_eq!(file_reading("255999").unwrap(), 255);
+    }
+
+    #[test]
+    fn file_temperature_above_u8_exceeds_bounds() {
+        assert!(matches!(file_reading("256000"), Err(Error::ReadingExceedsBounds)));
+    }
 }
