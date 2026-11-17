@@ -20,27 +20,35 @@ use {
     },
 };
 
-/// Get the temperature of a hard drive via smartctl. This function fails if
-/// smartctl does not return temperature data (eg. if a drive is in standby) or
-/// if the reported temperature does not fit in a [`u8`].
-fn parse_smart_source<T: AsRef<Path>>(block_dev: T) -> Result<u8> {
-    let block_dev = block_dev.as_ref();
+/// Longest wait for one smartctl or hdparm run. Waking a spun-down disk can
+/// take many seconds.
+const DISK_TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 
-    let mut proc = Command::new("smartctl")
-        .arg("-j")
+/// Most bytes of smartctl or hdparm output read. smartctl's JSON attribute
+/// table is often longer than [`NVIDIA_OUTPUT_CAP`].
+const DISK_TOOL_OUTPUT_CAP: u64 = 1024 * 1024;
+
+/// Get the temperature of a hard drive via smartctl. This function fails if
+/// smartctl does not return temperature data (eg. if a drive is in standby),
+/// does not exit within [`DISK_TOOL_TIMEOUT`], or if the reported temperature
+/// does not fit in a [`u8`].
+fn parse_smart_source<T: AsRef<Path>>(block_dev: T) -> Result<u8> {
+    read_smart_with_limit(Path::new("smartctl"), block_dev.as_ref(), DISK_TOOL_TIMEOUT)
+}
+
+/// Get the temperature of a hard drive via `program`, a smartctl, waiting at
+/// most `limit` for it to exit
+fn read_smart_with_limit(program: &Path, block_dev: &Path, limit: Duration) -> Result<u8> {
+    let mut cmd = Command::new(program);
+    cmd.arg("-j")
         .arg("-A")
         .arg("-n")
         .arg("standby")
-        .arg(block_dev)
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| Error::Io { path: "(smartctl)".into(), source: e })?;
+        .arg(block_dev);
 
-    let result = serde_json::from_reader(proc.stdout.take().unwrap());
-    let status = proc.wait()
-        .map_err(|e| Error::Io { path: "(smartctl)".into(), source: e })?;
+    let (status, stdout) = run_with_timeout(&mut cmd, RunLimits { time: limit, output: DISK_TOOL_OUTPUT_CAP })?;
 
-    smart_reading(status, block_dev, result)
+    smart_reading(status, block_dev, serde_json::from_str(&stdout))
 }
 
 /// Turn smartctl's exit status and its parsed JSON output into a reading. A
@@ -109,23 +117,23 @@ fn parse_hdparm_output(block_dev: &Path, stdout: &mut dyn Read) -> Result<u8> {
 
 /// Get the temperature of a Hitachi/HGST/WD drive via hdparm. This function
 /// fails if hdparm does not print the temperature line, hdparm prints the bad
-/// sense data line, or if the reported temperature does not fit in a [`u8`].
+/// sense data line, hdparm does not exit within [`DISK_TOOL_TIMEOUT`], or if
+/// the reported temperature does not fit in a [`u8`].
 fn parse_hdparm_source<T: AsRef<Path>>(block_dev: T) -> Result<u8> {
-    let block_dev = block_dev.as_ref();
+    read_hdparm_with_limit(Path::new("hdparm"), block_dev.as_ref(), DISK_TOOL_TIMEOUT)
+}
 
-    let mut proc = Command::new("hdparm")
-        .arg("-H")
-        .arg(block_dev)
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| Error::Io { path: "(hdparm)".into(), source: e })?;
+/// Get the temperature of a drive via `program`, an hdparm, waiting at most
+/// `limit` for it to exit
+fn read_hdparm_with_limit(program: &Path, block_dev: &Path, limit: Duration) -> Result<u8> {
+    let mut cmd = Command::new(program);
+    cmd.arg("-H").arg(block_dev);
 
-    let result = parse_hdparm_output(block_dev, &mut proc.stdout.take().unwrap());
-    let status = proc.wait()
-        .map_err(|e| Error::Io { path: "(hdparm)".into(), source: e })?;
+    let (status, stdout) = run_with_timeout(&mut cmd, RunLimits { time: limit, output: DISK_TOOL_OUTPUT_CAP })?;
+    let result = parse_hdparm_output(block_dev, &mut stdout.as_bytes());
 
     if status.code() != Some(0) {
-        return Err(Error::Command { command: "hdparm".into(), status });
+        return Err(Error::Command { command: program.to_owned(), status });
     }
 
     result
@@ -163,8 +171,17 @@ const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Longest wait for a killed child to be reaped
 const KILL_GRACE: Duration = Duration::from_millis(500);
 
-/// Most bytes of a command's output that [`run_with_timeout`] reads
-const OUTPUT_CAP: u64 = 4096;
+/// Most bytes of nvidia-smi output read
+const NVIDIA_OUTPUT_CAP: u64 = 4096;
+
+/// The bounds on one run of a command by [`run_with_timeout`]
+#[derive(Clone, Copy)]
+struct RunLimits {
+    /// Longest wait for the command to exit and close its output
+    time: Duration,
+    /// Most bytes of output read; longer output is an error
+    output: u64,
+}
 
 /// Wait at most `grace` for `child` to exit and reap it. Returns `None` if the
 /// child has not exited by then.
@@ -210,41 +227,42 @@ fn stop_child(mut child: Child, program: &Path) {
 }
 
 /// Read `pipe` on a detached thread and send the result on the returned
-/// channel. Output longer than [`OUTPUT_CAP`] bytes is an error. The thread
-/// blocks for as long as any process holds the pipe open, which can outlast
-/// the child, so the caller waits on the channel with a deadline.
-fn spawn_output_reader(pipe: ChildStdout) -> io::Result<Receiver<io::Result<String>>> {
+/// channel. Output longer than `cap` bytes is an error. The thread blocks for
+/// as long as any process holds the pipe open, which can outlast the child,
+/// so the caller waits on the channel with a deadline.
+fn spawn_output_reader(pipe: ChildStdout, cap: u64) -> io::Result<Receiver<io::Result<String>>> {
     let (sender, receiver) = mpsc::channel();
 
     thread::Builder::new().spawn(move || {
         // The receiver is gone once the caller has timed out
-        let _ = sender.send(read_capped(pipe));
+        let _ = sender.send(read_capped(pipe, cap));
     })?;
 
     Ok(receiver)
 }
 
-/// Read all of `pipe`, failing once it yields more than [`OUTPUT_CAP`] bytes.
-/// One byte past the cap is read so that a cut output, whose prefix may still
-/// parse, is never returned.
-fn read_capped(pipe: impl Read) -> io::Result<String> {
+/// Read all of `pipe`, failing once it yields more than `cap` bytes. One byte
+/// past the cap is read so that a cut output, whose prefix may still parse,
+/// is never returned.
+fn read_capped(pipe: impl Read, cap: u64) -> io::Result<String> {
     let mut output = Vec::new();
-    pipe.take(OUTPUT_CAP + 1).read_to_end(&mut output)?;
+    pipe.take(cap.saturating_add(1)).read_to_end(&mut output)?;
 
-    if output.len() as u64 > OUTPUT_CAP {
+    if output.len() as u64 > cap {
         return Err(io::Error::new(io::ErrorKind::InvalidData,
-            format!("output is longer than {} bytes", OUTPUT_CAP)));
+            format!("output is longer than {} bytes", cap)));
     }
 
     String::from_utf8(output).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// Run a command with piped stdout and return its exit status and its output,
-/// which must be at most [`OUTPUT_CAP`] bytes. If the command has not exited
-/// and closed its output within `limit`, [`Error::CommandTimeout`] is
+/// which must be at most `limits.output` bytes. If the command has not exited
+/// and closed its output within `limits.time`, [`Error::CommandTimeout`] is
 /// returned; a child still running then is killed. The call returns within
-/// about `limit` plus [`KILL_GRACE`] in every case.
-fn run_with_timeout(cmd: &mut Command, limit: Duration) -> Result<(ExitStatus, String)> {
+/// about `limits.time` plus [`KILL_GRACE`] in every case.
+fn run_with_timeout(cmd: &mut Command, limits: RunLimits) -> Result<(ExitStatus, String)> {
+    let limit = limits.time;
     let program = PathBuf::from(cmd.get_program());
     let io_error = |e| Error::Io { path: program.clone(), source: e };
     let timeout = || Error::CommandTimeout {
@@ -263,7 +281,7 @@ fn run_with_timeout(cmd: &mut Command, limit: Duration) -> Result<(ExitStatus, S
 
     let reader = child.stdout.take()
         .ok_or_else(|| io::Error::other("stdout is not piped"))
-        .and_then(spawn_output_reader);
+        .and_then(|pipe| spawn_output_reader(pipe, limits.output));
     let output = match reader {
         Ok(receiver) => receiver,
         Err(e) => {
@@ -320,7 +338,7 @@ fn read_nvidia_with_limit(program: &Path, gpu: &str, limit: Duration) -> Result<
         .arg("--query-gpu=temperature.gpu")
         .arg("--format=csv,noheader,nounits");
 
-    let (status, stdout) = run_with_timeout(&mut cmd, limit)?;
+    let (status, stdout) = run_with_timeout(&mut cmd, RunLimits { time: limit, output: NVIDIA_OUTPUT_CAP })?;
 
     if status.code() != Some(0) {
         return Err(Error::Command { command: program.to_owned(), status });
@@ -640,13 +658,16 @@ mod tests {
         serde_json::json,
         super::{
             KILL_GRACE,
-            OUTPUT_CAP,
+            NVIDIA_OUTPUT_CAP,
+            RunLimits,
             ipmi_sensor_temp,
             parse_file_source,
             parse_hdparm_output,
             parse_nvidia_output,
             parse_smart_output,
+            read_hdparm_with_limit,
             read_nvidia_with_limit,
+            read_smart_with_limit,
             read_zone_sources,
             run_with_timeout,
             smart_reading,
@@ -1034,15 +1055,112 @@ mod tests {
         elapsed: Duration,
     }
 
-    /// Run `body` as a fake nvidia-smi script in `dir`
-    fn nvidia_script_reading(dir: &TempDir, body: &str, limit: Duration) -> ScriptRun {
-        let _guard = script_lock();
-        let script = dir.write("nvidia-smi", &format!("#!/bin/sh\n{}\n", body));
+    /// Write `body` as an executable script `name` in `dir`
+    fn write_script(dir: &TempDir, name: &str, body: &str) -> PathBuf {
+        let script = dir.write(name, &format!("#!/bin/sh\n{}\n", body));
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// Run `body` as a fake program `name` in `dir` and read it with `read`
+    fn script_reading(dir: &TempDir, name: &str, body: &str, read: impl FnOnce(&Path) -> Result<u8, Error>)
+        -> ScriptRun
+    {
+        let _guard = script_lock();
+        let script = write_script(dir, name, body);
 
         let start = Instant::now();
-        let result = read_nvidia_with_limit(&script, GPU, limit);
+        let result = read(&script);
         ScriptRun { script, result, elapsed: start.elapsed() }
+    }
+
+    /// Run `body` as a fake nvidia-smi script in `dir`
+    fn nvidia_script_reading(dir: &TempDir, body: &str, limit: Duration) -> ScriptRun {
+        script_reading(dir, "nvidia-smi", body, |script| read_nvidia_with_limit(script, GPU, limit))
+    }
+
+    /// Run `body` as a fake smartctl script in `dir`
+    fn smart_script_reading(dir: &TempDir, body: &str, limit: Duration) -> ScriptRun {
+        script_reading(dir, "smartctl", body, |script| read_smart_with_limit(script, Path::new(BLOCK_DEV), limit))
+    }
+
+    /// Run `body` as a fake hdparm script in `dir`
+    fn hdparm_script_reading(dir: &TempDir, body: &str, limit: Duration) -> ScriptRun {
+        script_reading(dir, "hdparm", body, |script| read_hdparm_with_limit(script, Path::new(BLOCK_DEV), limit))
+    }
+
+    /// Assert that a script that recorded its pid in `pid_file` and then slept
+    /// timed out, and that its process is gone
+    fn assert_timed_out_and_killed(run: &ScriptRun, pid_file: &Path) {
+        assert_timed_out(run);
+        assert!(run.elapsed < TIMEOUT_LIMIT + KILL_GRACE + RETURN_SLACK, "returned after {:?}", run.elapsed);
+
+        let pid = wait_for_pid(pid_file).expect("the script wrote no pid before it was killed");
+        assert!(wait_until_gone(&pid), "pid {} still exists", pid);
+    }
+
+    /// Body of a script that records its pid in `pid_file` and sleeps until
+    /// killed. exec keeps the shell's pid, so the pid is the sleeping process.
+    fn sleeping_body(pid_file: &Path) -> String {
+        format!("echo $$ > '{}'\nexec sleep 30", pid_file.display())
+    }
+
+    #[test]
+    fn smart_script_output_gives_reading() {
+        let dir = TempDir::new();
+        let body = format!("[ \"$*\" = \"-j -A -n standby {}\" ] || exit 3\necho '{}'", BLOCK_DEV, SMART_OUTPUT);
+        let run = smart_script_reading(&dir, &body, FINISH_LIMIT);
+
+        assert_eq!(run.result.unwrap(), 41);
+    }
+
+    #[test]
+    fn smart_script_output_longer_than_nvidia_cap_gives_reading() {
+        let dir = TempDir::new();
+        // smartctl's full attribute table is often longer than 4096 bytes
+        let body = r#"printf '{ "pad": "%08000d", "temperature": { "current": 41 } }\n' 0"#;
+        let run = smart_script_reading(&dir, body, FINISH_LIMIT);
+
+        assert_eq!(run.result.unwrap(), 41);
+    }
+
+    #[test]
+    fn smart_script_timeout_kills_child() {
+        let dir = TempDir::new();
+        let pid_file = dir.0.join("pid");
+        let run = smart_script_reading(&dir, &sleeping_body(&pid_file), TIMEOUT_LIMIT);
+
+        assert_timed_out_and_killed(&run, &pid_file);
+    }
+
+    #[test]
+    fn hdparm_script_output_gives_reading() {
+        let dir = TempDir::new();
+        let body = format!(
+            "[ \"$*\" = \"-H {}\" ] || exit 3\nprintf '\\n{}:\\n drive temperature (celsius) is:  33\\n'",
+            BLOCK_DEV, BLOCK_DEV);
+        let run = hdparm_script_reading(&dir, &body, FINISH_LIMIT);
+
+        assert_eq!(run.result.unwrap(), 33);
+    }
+
+    #[test]
+    fn hdparm_script_failure_is_command_error() {
+        let dir = TempDir::new();
+        let run = hdparm_script_reading(&dir, "exit 9", FINISH_LIMIT);
+
+        assert!(matches!(&run.result,
+            Err(Error::Command { command, status }) if *command == run.script && status.code() == Some(9)),
+            "{:?}", run.result);
+    }
+
+    #[test]
+    fn hdparm_script_timeout_kills_child() {
+        let dir = TempDir::new();
+        let pid_file = dir.0.join("pid");
+        let run = hdparm_script_reading(&dir, &sleeping_body(&pid_file), TIMEOUT_LIMIT);
+
+        assert_timed_out_and_killed(&run, &pid_file);
     }
 
     fn assert_timed_out(run: &ScriptRun) {
@@ -1067,7 +1185,7 @@ mod tests {
             Err(Error::Io { path, source })
                 if *path == run.script
                     && source.kind() == io::ErrorKind::InvalidData
-                    && source.to_string().contains(&OUTPUT_CAP.to_string())),
+                    && source.to_string().contains(&NVIDIA_OUTPUT_CAP.to_string())),
             "{:?}", run.result);
     }
 
@@ -1100,7 +1218,7 @@ mod tests {
     #[test]
     fn unrepresentable_limit_is_error() {
         let _guard = script_lock();
-        let result = run_with_timeout(&mut Command::new("true"), Duration::MAX);
+        let result = run_with_timeout(&mut Command::new("true"), RunLimits { time: Duration::MAX, output: NVIDIA_OUTPUT_CAP });
 
         assert!(matches!(&result,
             Err(Error::Io { path, source })
