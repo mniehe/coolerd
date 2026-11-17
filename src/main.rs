@@ -18,7 +18,6 @@ use {
             atomic::{AtomicBool, Ordering},
             Mutex,
         },
-        u8,
     },
     clap::Parser,
     log::{debug, error, info, trace},
@@ -185,7 +184,7 @@ impl MainApp {
                             if e.is_cancelled() {
                                 Ok(())
                             } else {
-                                Err(e).map_err(Error::LoopPanicked)
+                                Err(Error::LoopPanicked(e))
                             }
                         },
                         // zone_loop's actual error return value

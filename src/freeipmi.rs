@@ -632,11 +632,11 @@ impl Drop for LimSession {
 
         if !self.config.username.is_null() {
             // [Unsafe] Allocated by CString::new() and never changed
-            unsafe { CString::from_raw(self.config.username) };
+            drop(unsafe { CString::from_raw(self.config.username) });
         }
         if !self.config.password.is_null() {
             // [Unsafe] Allocated by CString::new() and never changed
-            unsafe { CString::from_raw(self.config.password) };
+            drop(unsafe { CString::from_raw(self.config.password) });
         }
     }
 }

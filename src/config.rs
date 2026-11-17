@@ -22,20 +22,15 @@ use {
     crate::error::{Error, Result},
 };
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LogLevel {
     Error,
     Warn,
+    #[default]
     Info,
     Debug,
     Trace,
-}
-
-impl Default for LogLevel {
-    fn default() -> Self {
-        Self::Info
-    }
 }
 
 impl fmt::Display for LogLevel {
@@ -125,19 +120,14 @@ pub enum Source {
     },
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "lowercase", tag = "type")]
 pub enum Aggregation {
+    #[default]
     Maximum,
     Average {
         top: Option<usize>,
     },
-}
-
-impl Default for Aggregation {
-    fn default() -> Self {
-        Self::Maximum
-    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -174,21 +164,16 @@ impl fmt::Debug for Password {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "lowercase", tag = "type")]
 pub enum SessionType {
+    #[default]
     Local,
     Remote {
         hostname: String,
         username: String,
         password: Password,
     },
-}
-
-impl Default for SessionType {
-    fn default() -> Self {
-        Self::Local
-    }
 }
 
 #[derive(Clone, Copy, Debug, Parser, ValueEnum)]
@@ -291,7 +276,7 @@ pub fn load_config(path: &Path) -> Result<Config> {
 
     // Create default session
     config.sessions.0.entry(SessionName::default().0)
-        .or_insert_with(SessionTypeCompat::default);
+        .or_default();
 
     if config.zones.is_empty() {
         return Err(Error::ConfigValidation {
