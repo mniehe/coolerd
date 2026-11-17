@@ -1,5 +1,6 @@
 mod bindings;
 mod config;
+mod curve;
 mod error;
 mod freeipmi;
 mod source;
@@ -7,7 +8,6 @@ mod ipmi;
 
 use {
     std::{
-        cmp::Reverse,
         collections::HashMap,
         env,
         io,
@@ -27,7 +27,8 @@ use {
         time::sleep,
     },
 
-    config::{Aggregation, Config, load_config, SessionType, Step, Zone},
+    config::{Config, load_config, SessionType, Zone},
+    curve::{aggregate, duty_for_temp},
     error::{Error, Result},
     ipmi::{FanMode, Ipmi},
     source::get_source_readings,
@@ -237,48 +238,7 @@ impl MainApp {
     /// Update fan PWM duty cycle based on the CPU temperature
     fn update_duty_cycle(session: Arc<IpmiSession>, zone_config: &Zone) -> Result<()> {
         let temp = Self::get_temp(session.ipmi.clone(), zone_config)?;
-
-        let result = zone_config.steps.binary_search_by(|s| s.temp.cmp(&temp));
-        // Index of first step >= the current temperature (if exists)
-        let above_index = match result {
-            Ok(i) => Some(i),
-            Err(i) if i == zone_config.steps.len() => None,
-            Err(i) => Some(i),
-        };
-        // Index of first step < the current temperature (if exists)
-        let below_index = match above_index {
-            Some(0) => None,
-            Some(i) => Some(i - 1),
-            None => None,
-        };
-        // If step above doesn't exist, use last step's dcycle or 100%
-        let above_step = match above_index {
-            Some(i) => zone_config.steps[i],
-            None => {
-                let dcycle = zone_config.steps.last()
-                    .map_or(100, |s| s.dcycle);
-
-                Step {
-                    temp,
-                    dcycle,
-                }
-            }
-        };
-        // If step below doesn't exist, use same step as step above
-        let below_step = match below_index {
-            Some(i) => zone_config.steps[i],
-            None => above_step,
-        };
-
-        let dcycle_new = if below_step.temp == above_step.temp {
-            below_step.dcycle
-        } else {
-            // Linearly scale the dcycle
-            (u32::from(temp - below_step.temp)
-                * u32::from(above_step.dcycle - below_step.dcycle)
-                / u32::from(above_step.temp - below_step.temp)
-                + u32::from(below_step.dcycle)) as u8
-        };
+        let dcycle_new = duty_for_temp(&zone_config.steps, temp);
 
         let mut ipmi_lock = session.ipmi.lock().unwrap();
 
@@ -299,31 +259,13 @@ impl MainApp {
     /// Get temperature sensor value in degrees Celsius using the zone's
     /// data aggregation method.
     fn get_temp(ipmi: Arc<Mutex<Ipmi>>, zone_config: &Zone) -> Result<u8> {
-        let mut readings = retry_with_index(zone_config.retry_iter(), move |i| {
+        let readings = retry_with_index(zone_config.retry_iter(), move |i| {
             trace!("Querying sources for zones {:?} (attempt {}/{})",
                    zone_config.ipmi_zones, i, zone_config.retries.0 + 1);
             get_source_readings(ipmi.clone(), &zone_config.sources)
         })?;
-        readings.sort_by_key(|r| Reverse(*r));
 
-        // The source list is guaranteed to never be empty so if no error
-        // occurs, there will always be an equal number of readings
-        match zone_config.aggregation {
-            Aggregation::Maximum => {
-                Ok(readings.first().copied().unwrap())
-            }
-            Aggregation::Average { top } => {
-                let n = top.unwrap_or(readings.len());
-
-                let sum = readings
-                    .into_iter()
-                    .take(n)
-                    .map(u32::from)
-                    .sum::<u32>();
-
-                Ok((sum as f32 / n as f32) as u8)
-            }
-        }
+        Ok(aggregate(&readings, &zone_config.aggregation))
     }
 }
 
