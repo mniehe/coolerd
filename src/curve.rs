@@ -48,9 +48,18 @@ pub fn duty_for_temp(steps: &[Step], temp: u8) -> u8 {
     }
 }
 
+/// How an average that falls between two integers is made one
+#[derive(Clone, Copy)]
+pub enum Rounding {
+    /// Toward zero, for temperatures
+    Down,
+    /// Away from zero, for duties, so the fans never run slower than the mean
+    Up,
+}
+
 /// Combine readings, either temperatures or duties, into one value. The
 /// average divides by the number of readings it used.
-pub fn aggregate(readings: &[u8], aggregation: &Aggregation) -> u8 {
+pub fn aggregate(readings: &[u8], aggregation: &Aggregation, rounding: Rounding) -> u8 {
     let mut readings = readings.to_vec();
     readings.sort_by_key(|r| Reverse(*r));
 
@@ -66,10 +75,17 @@ pub fn aggregate(readings: &[u8], aggregation: &Aggregation) -> u8 {
             let sum = readings
                 .into_iter()
                 .take(n)
-                .map(u32::from)
-                .sum::<u32>();
+                .map(u64::from)
+                .sum::<u64>();
+            let count = n as u64;
 
-            (sum as f32 / n as f32) as u8
+            let dividend = match rounding {
+                Rounding::Down => sum,
+                Rounding::Up => sum + count.saturating_sub(1),
+            };
+
+            // A mean of u8 values fits in a u8; an empty slice gives 0
+            dividend.checked_div(count).unwrap_or(0) as u8
         }
     }
 }
@@ -144,7 +160,7 @@ impl ZoneState {
         let mut duties = Vec::new();
 
         if !zone_readings.is_empty() {
-            let reading = aggregate(&zone_readings, &zone.aggregation);
+            let reading = aggregate(&zone_readings, &zone.aggregation, Rounding::Down);
             let temp = self.zone_curve.update(reading, zone.hysteresis);
             curve_temps.push(temp);
             duties.push(duty_for_temp(&zone.steps, temp));
@@ -153,11 +169,14 @@ impl ZoneState {
         curve_temps.append(&mut source_temps);
         duties.append(&mut source_duties);
 
-        // Validation requires at least one source, so a duty always exists
+        // Each reading lands in the zone curve or in its own curve, and the
+        // reading count equals the source count, so `duties` is empty only for
+        // a zone without sources, which validation rejects. The check keeps an
+        // empty slice away from `aggregate` all the same.
         let duty = if duties.is_empty() {
             FULL_DUTY
         } else {
-            aggregate(&duties, &zone.duty_aggregation)
+            aggregate(&duties, &zone.duty_aggregation, Rounding::Up)
         };
 
         ZoneUpdate { duty, curve_temps }
@@ -167,7 +186,7 @@ impl ZoneState {
 #[cfg(test)]
 mod tests {
     use {
-        super::{aggregate, duty_for_temp, ZoneState},
+        super::{aggregate, duty_for_temp, Rounding, ZoneState},
         crate::config::{
             Aggregation,
             Interval,
@@ -237,6 +256,36 @@ mod tests {
         zone.duty_aggregation = Aggregation::Average { top: None };
 
         assert_eq!(duties(&zone, &[&[50, 70]]), [57]);
+    }
+
+    #[test]
+    fn average_duty_aggregation_rounds_up() {
+        // Duties 99 and 100 have the mean 99.5
+        let mut zone = zone(&[Step { temp: 0, dcycle: 99 }], vec![plain(), curved(&[Step { temp: 0, dcycle: 100 }])]);
+        zone.duty_aggregation = Aggregation::Average { top: None };
+
+        assert_eq!(duties(&zone, &[&[50, 50]]), [100]);
+    }
+
+    #[test]
+    fn average_duty_aggregation_counts_each_curve_once() {
+        // Two sources share the zone curve, which gives 100; the third source's
+        // curve gives 21. The two curve duties have the mean 60.5.
+        let mut zone = zone(&ZONE_STEPS, vec![plain(), plain(), curved(&[Step { temp: 0, dcycle: 21 }])]);
+        zone.duty_aggregation = Aggregation::Average { top: None };
+
+        assert_eq!(duties(&zone, &[&[80, 50, 50]]), [61]);
+    }
+
+    #[test]
+    fn average_zone_temperature_truncates() {
+        // Readings 50 and 51 have the mean 50.5
+        let mut zone = zone(&HOLD_STEPS, vec![plain(), plain()]);
+        zone.aggregation = Aggregation::Average { top: None };
+        let update = ZoneState::new(&zone).next_duty(&zone, &[50, 51]);
+
+        assert_eq!(update.curve_temps, [50]);
+        assert_eq!(update.duty, 55);
     }
 
     #[test]
@@ -413,14 +462,15 @@ mod tests {
 
     #[test]
     fn maximum_takes_highest_reading() {
-        assert_eq!(aggregate(&[50, 70, 60], &Aggregation::Maximum), 70);
+        assert_eq!(aggregate(&[50, 70, 60], &Aggregation::Maximum, Rounding::Down), 70);
+        assert_eq!(aggregate(&[50, 70, 60], &Aggregation::Maximum, Rounding::Up), 70);
     }
 
     #[test]
     fn average_with_top_takes_highest_readings() {
         let aggregation = Aggregation::Average { top: Some(2) };
 
-        assert_eq!(aggregate(&[50, 70, 60], &aggregation), 65);
+        assert_eq!(aggregate(&[50, 70, 60], &aggregation, Rounding::Down), 65);
     }
 
     #[test]
@@ -428,13 +478,29 @@ mod tests {
         let aggregation = Aggregation::Average { top: None };
 
         // Mean 56.67 truncates to 56; the median would be 60
-        assert_eq!(aggregate(&[20, 90, 60], &aggregation), 56);
+        assert_eq!(aggregate(&[20, 90, 60], &aggregation, Rounding::Down), 56);
+    }
+
+    #[test]
+    fn average_rounding_up_takes_the_next_integer() {
+        let aggregation = Aggregation::Average { top: None };
+
+        assert_eq!(aggregate(&[20, 90, 60], &aggregation, Rounding::Up), 57);
+        assert_eq!(aggregate(&[99, 100], &aggregation, Rounding::Up), 100);
+    }
+
+    #[test]
+    fn average_rounding_up_keeps_an_integer_mean() {
+        let aggregation = Aggregation::Average { top: None };
+
+        assert_eq!(aggregate(&[50, 70, 60], &aggregation, Rounding::Up), 60);
+        assert_eq!(aggregate(&[255, 255], &aggregation, Rounding::Up), 255);
     }
 
     #[test]
     fn average_with_top_above_count_divides_by_readings_used() {
         let aggregation = Aggregation::Average { top: Some(3) };
 
-        assert_eq!(aggregate(&[80, 80], &aggregation), 80);
+        assert_eq!(aggregate(&[80, 80], &aggregation, Rounding::Down), 80);
     }
 }
