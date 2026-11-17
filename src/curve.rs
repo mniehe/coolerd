@@ -163,7 +163,10 @@ impl ZoneState {
             let reading = aggregate(&zone_readings, &zone.aggregation, Rounding::Down);
             let temp = self.zone_curve.update(reading, zone.hysteresis);
             curve_temps.push(temp);
-            duties.push(duty_for_temp(&zone.steps, temp));
+            // Validation leaves the zone steps absent only when no reading
+            // reaches the zone curve; an absent curve maps to 100% all the same
+            let steps = zone.steps.as_deref().unwrap_or(&[]);
+            duties.push(duty_for_temp(steps, temp));
         }
 
         curve_temps.append(&mut source_temps);
@@ -229,7 +232,7 @@ mod tests {
             ipmi_zones: vec![0],
             sources,
             aggregation: Aggregation::Maximum,
-            steps: steps.to_vec(),
+            steps: Some(steps.to_vec()),
             duty_aggregation: Aggregation::Maximum,
             hysteresis: 0,
         }
@@ -303,6 +306,23 @@ mod tests {
 
         assert_eq!(update.duty, 60);
         assert_eq!(update.curve_temps, [70, 60]);
+    }
+
+    #[test]
+    fn absent_zone_steps_leave_source_curves_in_charge() {
+        let mut zone = zone(&[], vec![curved(&GPU_STEPS), curved(&GPU_STEPS)]);
+        zone.steps = None;
+
+        assert_eq!(duties(&zone, &[&[70, 60]]), [60]);
+    }
+
+    #[test]
+    fn absent_zone_steps_give_full_duty_if_a_reading_reaches_them() {
+        // Validation rejects this zone; the curve still fails toward 100%
+        let mut zone = zone(&[], vec![plain()]);
+        zone.steps = None;
+
+        assert_eq!(duties(&zone, &[&[30]]), [100]);
     }
 
     #[test]

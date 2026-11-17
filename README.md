@@ -84,7 +84,7 @@ sudo ./target/release/ipmi-fan-control --config config.toml
 Fan curves
 ----------
 
-Each zone sets one duty cycle from one or more curves. The sources without their own `steps` are combined by `aggregation` into the zone temperature, which the zone's `steps` map to a duty cycle. A source with its own `steps` skips the zone temperature and maps its reading through its own curve. The zone then combines the duty cycles of all its curves by `duty_aggregation`: `maximum` (the default) or `average`.
+Each zone sets one duty cycle from one or more curves. The sources without their own `steps` are combined by `aggregation` into the zone temperature, which the zone's `steps` map to a duty cycle. A source with its own `steps` skips the zone temperature and maps its reading through its own curve. When every source has its own `steps`, the zone has no temperature: the zone's `steps` and `aggregation` are ignored, and the zone's `steps` may be omitted. The zone then combines the duty cycles of all its curves by `duty_aggregation`: `maximum` (the default) or `average`.
 
 `hysteresis` holds each curve's temperature through small falls. A curve follows a rise at once, but follows a fall only once it reaches `hysteresis` degrees. The default is 0, which follows every reading.
 

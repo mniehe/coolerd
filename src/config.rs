@@ -219,7 +219,10 @@ pub struct Zone {
     pub sources: Vec<SourceConfig>,
     #[serde(default)]
     pub aggregation: Aggregation,
-    pub steps: Vec<Step>,
+    /// The zone curve. Validation lets it be absent only when every source
+    /// has `steps`, so the zone curve is never used.
+    #[serde(default)]
+    pub steps: Option<Vec<Step>>,
     /// How the duties of the zone's curves combine into one
     #[serde(default)]
     pub duty_aggregation: Aggregation,
@@ -465,8 +468,10 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
             });
         }
 
-        check_steps(&zone_config.steps, &format!("zones[{}].steps", i))
-            .map_err(|reason| Error::ConfigValidation { path: path.to_owned(), reason })?;
+        if let Some(steps) = &zone_config.steps {
+            check_steps(steps, &format!("zones[{}].steps", i))
+                .map_err(|reason| Error::ConfigValidation { path: path.to_owned(), reason })?;
+        }
 
         for (j, source) in zone_config.sources.iter().enumerate() {
             if let Some(steps) = &source.steps {
@@ -486,7 +491,16 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
         let any_with_steps = zone_config.sources.iter().any(|s| s.steps.is_some());
         let any_without_steps = zone_config.sources.iter().any(|s| s.steps.is_none());
 
-        if any_with_steps && any_without_steps && zone_config.steps.is_empty() {
+        if any_without_steps && zone_config.steps.is_none() {
+            return Err(Error::ConfigValidation {
+                path: path.to_owned(),
+                reason: format!("zones[{}].steps: must be set when a source has no steps", i),
+            });
+        }
+
+        let empty_zone_steps = matches!(&zone_config.steps, Some(steps) if steps.is_empty());
+
+        if any_with_steps && any_without_steps && empty_zone_steps {
             return Err(Error::ConfigValidation {
                 path: path.to_owned(),
                 reason: format!("zones[{}].steps: must be non-empty when a source has no steps", i),
@@ -636,15 +650,16 @@ mod tests {
         let steps = "[{ temp = 40, dcycle = 40 }, { temp = 60, dcycle = 40 }, { temp = 80, dcycle = 100 }]";
         let config = parse(&zone_toml(&[("steps", steps)])).unwrap();
 
-        assert_eq!(config.zones[0].steps.len(), 3);
-        assert_eq!(config.zones[0].steps[2].dcycle, 100);
+        let zone_steps = config.zones[0].steps.as_ref().unwrap();
+        assert_eq!(zone_steps.len(), 3);
+        assert_eq!(zone_steps[2].dcycle, 100);
     }
 
     #[test]
     fn accepts_empty_steps() {
         let config = parse(&zone_toml(&[("steps", "[]")])).unwrap();
 
-        assert!(config.zones[0].steps.is_empty());
+        assert!(config.zones[0].steps.as_ref().unwrap().is_empty());
     }
 
     // Pins today's result: `top` may exceed the number of sources
@@ -933,12 +948,47 @@ mod tests {
             "zones[0].steps: must be non-empty when a source has no steps");
     }
 
+    /// Drop the line that sets `key` from a config built by `zone_toml`
+    fn omit_key(contents: &str, key: &str) -> String {
+        let prefix = format!("{} = ", key);
+
+        contents.lines()
+            .filter(|line| !line.starts_with(&prefix))
+            .map(|line| format!("{}\n", line))
+            .collect()
+    }
+
+    #[test]
+    fn accepts_omitted_zone_steps_when_every_source_has_steps() {
+        let sources = format!(r#"[{{ type = "nvidia", gpu = "{}", steps = {} }}, {{ type = "file", path = "/sys/temp", steps = {} }}]"#, GPU, GPU_STEPS, GPU_STEPS);
+        let contents = omit_key(&zone_toml(&[("sources", &sources)]), "steps");
+        let config = parse(&contents).unwrap();
+
+        assert!(config.zones[0].sources.iter().all(|s| s.steps.is_some()));
+    }
+
+    #[test]
+    fn rejects_omitted_zone_steps_when_no_source_has_steps() {
+        let contents = omit_key(&zone_toml(&[]), "steps");
+
+        assert_eq!(validation_reason(&contents),
+            "zones[0].steps: must be set when a source has no steps");
+    }
+
+    #[test]
+    fn rejects_omitted_zone_steps_when_a_source_has_no_steps() {
+        let contents = omit_key(&source_steps_toml(GPU_STEPS), "steps");
+
+        assert_eq!(validation_reason(&contents),
+            "zones[0].steps: must be set when a source has no steps");
+    }
+
     #[test]
     fn accepts_empty_zone_steps_when_every_source_has_steps() {
         let sources = format!(r#"[{{ type = "nvidia", gpu = "{}", steps = {} }}]"#, GPU, GPU_STEPS);
         let config = parse(&zone_toml(&[("sources", &sources), ("steps", "[]")])).unwrap();
 
-        assert!(config.zones[0].steps.is_empty());
+        assert!(config.zones[0].steps.as_ref().unwrap().is_empty());
     }
 
     #[test]

@@ -118,8 +118,9 @@ sources = [
 # and `dcycle` must be increasing.
 #
 # These steps map the zone temperature. When every source has its own `steps`,
-# the zone has no temperature and this list may be empty. When some sources
-# have `steps` and others do not, this list must be non-empty.
+# the zone has no temperature, so this list and `aggregation` are ignored and
+# this list may be omitted. Otherwise this list is required, and when some
+# sources have `steps` and others do not, it must be non-empty.
 steps = [
   { temp = 40, dcycle = 40 },
   { temp = 70, dcycle = 70 }
