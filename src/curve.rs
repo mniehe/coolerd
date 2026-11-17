@@ -98,6 +98,17 @@ mod tests {
 
     #[test]
     fn holds_last_step_above_range() {
+        // The last duty differs from the 100% that an empty curve gives
+        let steps = [
+            Step { temp: 45, dcycle: 45 },
+            Step { temp: 75, dcycle: 85 },
+        ];
+
+        assert_eq!(duty_for_temp(&steps, 90), 85);
+    }
+
+    #[test]
+    fn holds_full_duty_last_step_above_range() {
         assert_eq!(duty_for_temp(&STEPS, 90), 100);
     }
 
@@ -137,7 +148,8 @@ mod tests {
     fn average_without_top_takes_all_readings() {
         let aggregation = Aggregation::Average { top: None };
 
-        assert_eq!(aggregate(&[50, 70, 60], &aggregation), 60);
+        // Mean 56.67 truncates to 56; the median would be 60
+        assert_eq!(aggregate(&[20, 90, 60], &aggregation), 56);
     }
 
     // Pins today's result: the sum of the readings present is divided by
