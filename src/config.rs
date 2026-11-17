@@ -438,6 +438,32 @@ mod tests {
     }
 
     #[test]
+    fn accepts_flat_segment_and_full_duty() {
+        let steps = "[{ temp = 40, dcycle = 40 }, { temp = 60, dcycle = 40 }, { temp = 80, dcycle = 100 }]";
+        let config = parse(&zone_toml(&[("steps", steps)])).unwrap();
+
+        assert_eq!(config.zones[0].steps.len(), 3);
+        assert_eq!(config.zones[0].steps[2].dcycle, 100);
+    }
+
+    #[test]
+    fn accepts_empty_steps() {
+        let config = parse(&zone_toml(&[("steps", "[]")])).unwrap();
+
+        assert!(config.zones[0].steps.is_empty());
+    }
+
+    // Pins today's result: `top` may exceed the number of sources
+    #[test]
+    fn accepts_average_top_above_source_count() {
+        let aggregation = r#"{ type = "average", top = 3 }"#;
+        let config = parse(&zone_toml(&[("aggregation", aggregation)])).unwrap();
+
+        assert_eq!(config.zones[0].sources.len(), 1);
+        assert!(matches!(config.zones[0].aggregation, Aggregation::Average { top: Some(3) }));
+    }
+
+    #[test]
     fn rejects_empty_zones() {
         assert_eq!(validation_reason("zones = []\n"), "zones: must be non-empty");
     }
@@ -496,6 +522,15 @@ mod tests {
 
         assert_eq!(validation_reason(&zone_toml(&[("steps", steps)])),
             "zones[0].steps[1].dcycle: invalid percentage: 101");
+    }
+
+    #[test]
+    fn reports_temp_error_before_dcycle_errors() {
+        // Breaks the temp order, the dcycle order and the dcycle limit at once
+        let steps = "[{ temp = 40, dcycle = 101 }, { temp = 40, dcycle = 40 }]";
+
+        assert_eq!(validation_reason(&zone_toml(&[("steps", steps)])),
+            "zones[0].steps[*].temp: values are not strictly increasing");
     }
 
     fn parse_error(contents: &str) -> String {
