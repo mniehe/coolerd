@@ -16,7 +16,7 @@ use {
     },
     log::warn,
     crate::{
-        config::Source,
+        config::{Source, SourceConfig},
         error::{Error, Result},
         freeipmi::{SensorUnits, SensorValue},
         ipmi::Ipmi,
@@ -412,13 +412,13 @@ fn parse_ipmi_sources(ipmi: Arc<Mutex<Ipmi>>, sensors: &HashSet<String>)
 
 /// Get temperature readings for the given sources. The returned values are in
 /// the same order as given.
-pub fn get_source_readings(ipmi: Arc<Mutex<Ipmi>>, sources: &[Source])
+pub fn get_source_readings(ipmi: Arc<Mutex<Ipmi>>, sources: &[SourceConfig])
     -> Result<Vec<u8>>
 {
     // Get IPMI sensor readings in one go for better performance.
     let ipmi_sensors = sources.iter()
         .filter_map(|s| {
-            match s {
+            match &s.kind {
                 Source::Ipmi { sensor } => Some(sensor.clone()),
                 _ => None,
             }
@@ -429,7 +429,7 @@ pub fn get_source_readings(ipmi: Arc<Mutex<Ipmi>>, sources: &[Source])
 
     sources.iter()
         .map(|s| {
-            match s {
+            match &s.kind {
                 Source::Ipmi { sensor } => Ok(ipmi_results[sensor.as_str()]),
                 Source::File { path } => parse_file_source(path),
                 Source::Smart { block_dev } => parse_smart_source(block_dev),

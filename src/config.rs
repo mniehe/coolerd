@@ -124,6 +124,37 @@ pub enum Source {
     },
 }
 
+/// A source with an optional curve of its own. A source with `steps` maps its
+/// reading through them; a source without feeds the zone's curve.
+#[derive(Clone, Debug)]
+pub struct SourceConfig {
+    pub kind: Source,
+    pub steps: Option<Vec<Step>>,
+}
+
+/// Serde cannot combine `flatten` with `deny_unknown_fields`, so `steps` is
+/// taken out of the table by hand and the rest goes to [`Source`], which still
+/// rejects an unknown key or type.
+impl<'de> Deserialize<'de> for SourceConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let mut table = toml::value::Table::deserialize(deserializer)?;
+
+        let steps = match table.remove("steps") {
+            Some(value) => Some(Vec::<Step>::deserialize(value)
+                .map_err(|e| de::Error::custom(format!("steps: {}", e)))?),
+            None => None,
+        };
+
+        let kind = Source::deserialize(toml::Value::Table(table))
+            .map_err(de::Error::custom)?;
+
+        Ok(Self { kind, steps })
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "lowercase", tag = "type")]
 pub enum Aggregation {
@@ -146,10 +177,16 @@ pub struct Zone {
     #[serde(default)]
     pub retry_delay_ms: RetryDelayMs,
     pub ipmi_zones: Vec<u8>,
-    pub sources: Vec<Source>,
+    pub sources: Vec<SourceConfig>,
     #[serde(default)]
     pub aggregation: Aggregation,
     pub steps: Vec<Step>,
+    /// How the duties of the zone's curves combine into one
+    #[serde(default)]
+    pub duty_aggregation: Aggregation,
+    /// Degrees a curve's temperature must fall before its duty follows
+    #[serde(default)]
+    pub hysteresis: u8,
 }
 
 impl Zone {
@@ -358,7 +395,7 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
         }
 
         for (j, source) in zone_config.sources.iter().enumerate() {
-            if let Source::Nvidia { gpu } = source {
+            if let Source::Nvidia { gpu } = &source.kind {
                 if !is_gpu_uuid(gpu) && !is_pci_bus_id(gpu) {
                     return Err(Error::ConfigValidation {
                         path: path.to_owned(),
@@ -382,31 +419,55 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
             });
         }
 
-        for window in zone_config.steps.windows(2) {
-            if window[0].temp >= window[1].temp {
-                return Err(Error::ConfigValidation {
-                    path: path.to_owned(),
-                    reason: format!("zones[{}].steps[*].temp: values are not strictly increasing", i),
-                });
-            } else if window[0].dcycle > window[1].dcycle {
-                return Err(Error::ConfigValidation {
-                    path: path.to_owned(),
-                    reason: format!("zones[{}].steps[*].dcycle: values are not increasing", i),
-                });
+        if matches!(zone_config.duty_aggregation, Aggregation::Average { top: Some(0) }) {
+            return Err(Error::ConfigValidation {
+                path: path.to_owned(),
+                reason: format!("zones[{}].duty_aggregation[type=average].top: must be greater than 0", i),
+            });
+        }
+
+        check_steps(&zone_config.steps, &format!("zones[{}].steps", i))
+            .map_err(|reason| Error::ConfigValidation { path: path.to_owned(), reason })?;
+
+        for (j, source) in zone_config.sources.iter().enumerate() {
+            if let Some(steps) = &source.steps {
+                check_steps(steps, &format!("zones[{}].sources[{}].steps", i, j))
+                    .map_err(|reason| Error::ConfigValidation { path: path.to_owned(), reason })?;
             }
         }
 
-        for (j, &step) in zone_config.steps.iter().enumerate() {
-            if step.dcycle > 100 {
-                return Err(Error::ConfigValidation {
-                    path: path.to_owned(),
-                    reason: format!("zones[{}].steps[{}].dcycle: invalid percentage: {}", i, j, step.dcycle),
-                });
-            }
+        let any_with_steps = zone_config.sources.iter().any(|s| s.steps.is_some());
+        let any_without_steps = zone_config.sources.iter().any(|s| s.steps.is_none());
+
+        if any_with_steps && any_without_steps && zone_config.steps.is_empty() {
+            return Err(Error::ConfigValidation {
+                path: path.to_owned(),
+                reason: format!("zones[{}].steps: must be non-empty when a source has no steps", i),
+            });
         }
     }
 
     Ok(config)
+}
+
+/// Check a curve's steps. `key` names the list in the reason, such as
+/// `zones[0].steps`.
+fn check_steps(steps: &[Step], key: &str) -> Result<(), String> {
+    for window in steps.windows(2) {
+        if window[0].temp >= window[1].temp {
+            return Err(format!("{}[*].temp: values are not strictly increasing", key));
+        } else if window[0].dcycle > window[1].dcycle {
+            return Err(format!("{}[*].dcycle: values are not increasing", key));
+        }
+    }
+
+    for (j, &step) in steps.iter().enumerate() {
+        if step.dcycle > 100 {
+            return Err(format!("{}[{}].dcycle: invalid percentage: {}", key, j, step.dcycle));
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -613,6 +674,139 @@ mod tests {
         assert!(message.contains("unknown variant `thermometer`"), "{}", message);
     }
 
+    /// Build a zone whose second source is an nvidia source with its own
+    /// `steps`
+    fn source_steps_toml(steps: &str) -> String {
+        let sources = format!(r#"[{{ type = "ipmi", sensor = "CPU Temp" }}, {{ type = "nvidia", gpu = "{}", steps = {} }}]"#, GPU, steps);
+        zone_toml(&[("sources", &sources)])
+    }
+
+    const GPU: &str = "00000000:81:00.0";
+    const GPU_STEPS: &str = "[{ temp = 60, dcycle = 40 }, { temp = 90, dcycle = 100 }]";
+
+    #[test]
+    fn accepts_source_steps() {
+        let config = parse(&source_steps_toml(GPU_STEPS)).unwrap();
+        let sources = &config.zones[0].sources;
+
+        assert!(sources[0].steps.is_none());
+        assert!(matches!(&sources[1].kind, Source::Nvidia { gpu } if gpu == GPU));
+
+        let steps = sources[1].steps.as_ref().unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!((steps[1].temp, steps[1].dcycle), (90, 100));
+    }
+
+    #[test]
+    fn accepts_hysteresis() {
+        let config = parse(&zone_toml(&[("hysteresis", "5")])).unwrap();
+
+        assert_eq!(config.zones[0].hysteresis, 5);
+    }
+
+    #[test]
+    fn hysteresis_defaults_to_zero() {
+        let config = parse(&zone_toml(&[])).unwrap();
+
+        assert_eq!(config.zones[0].hysteresis, 0);
+    }
+
+    #[test]
+    fn accepts_average_duty_aggregation() {
+        let aggregation = r#"{ type = "average", top = 2 }"#;
+        let config = parse(&zone_toml(&[("duty_aggregation", aggregation)])).unwrap();
+
+        assert!(matches!(config.zones[0].duty_aggregation, Aggregation::Average { top: Some(2) }));
+    }
+
+    #[test]
+    fn duty_aggregation_defaults_to_maximum() {
+        let config = parse(&zone_toml(&[])).unwrap();
+
+        assert!(matches!(config.zones[0].duty_aggregation, Aggregation::Maximum));
+    }
+
+    #[test]
+    fn rejects_source_steps_non_increasing_temp() {
+        let steps = "[{ temp = 60, dcycle = 40 }, { temp = 60, dcycle = 50 }]";
+
+        assert_eq!(validation_reason(&source_steps_toml(steps)),
+            "zones[0].sources[1].steps[*].temp: values are not strictly increasing");
+    }
+
+    #[test]
+    fn rejects_source_steps_decreasing_dcycle() {
+        let steps = "[{ temp = 60, dcycle = 50 }, { temp = 90, dcycle = 40 }]";
+
+        assert_eq!(validation_reason(&source_steps_toml(steps)),
+            "zones[0].sources[1].steps[*].dcycle: values are not increasing");
+    }
+
+    #[test]
+    fn rejects_source_steps_dcycle_above_100() {
+        let steps = "[{ temp = 60, dcycle = 40 }, { temp = 90, dcycle = 101 }]";
+
+        assert_eq!(validation_reason(&source_steps_toml(steps)),
+            "zones[0].sources[1].steps[1].dcycle: invalid percentage: 101");
+    }
+
+    #[test]
+    fn reports_zone_step_error_before_source_step_error() {
+        let source_steps = "[{ temp = 60, dcycle = 40 }, { temp = 60, dcycle = 50 }]";
+        let sources = format!(r#"[{{ type = "nvidia", gpu = "{}", steps = {} }}, {{ type = "ipmi", sensor = "CPU Temp" }}]"#, GPU, source_steps);
+        let zone_steps = "[{ temp = 40, dcycle = 50 }, { temp = 70, dcycle = 40 }]";
+
+        assert_eq!(validation_reason(&zone_toml(&[("sources", &sources), ("steps", zone_steps)])),
+            "zones[0].steps[*].dcycle: values are not increasing");
+    }
+
+    #[test]
+    fn rejects_unknown_key_beside_source_steps() {
+        let sources = format!(r#"[{{ type = "file", path = "/sys/temp", steps = {}, scale = 1 }}]"#, GPU_STEPS);
+        let message = parse_error(&zone_toml(&[("sources", &sources)]));
+
+        assert!(message.contains("unknown field `scale`"), "{}", message);
+    }
+
+    #[test]
+    fn rejects_unknown_source_type_with_steps() {
+        let sources = format!(r#"[{{ type = "thermometer", path = "/sys/temp", steps = {} }}]"#, GPU_STEPS);
+        let message = parse_error(&zone_toml(&[("sources", &sources)]));
+
+        assert!(message.contains("unknown variant `thermometer`"), "{}", message);
+    }
+
+    #[test]
+    fn rejects_source_steps_of_wrong_type() {
+        let message = parse_error(&source_steps_toml("5"));
+
+        assert!(message.contains("steps: invalid type"), "{}", message);
+    }
+
+    #[test]
+    fn rejects_mixed_sources_without_zone_steps() {
+        let sources = format!(r#"[{{ type = "ipmi", sensor = "CPU Temp" }}, {{ type = "nvidia", gpu = "{}", steps = {} }}]"#, GPU, GPU_STEPS);
+
+        assert_eq!(validation_reason(&zone_toml(&[("sources", &sources), ("steps", "[]")])),
+            "zones[0].steps: must be non-empty when a source has no steps");
+    }
+
+    #[test]
+    fn accepts_empty_zone_steps_when_every_source_has_steps() {
+        let sources = format!(r#"[{{ type = "nvidia", gpu = "{}", steps = {} }}]"#, GPU, GPU_STEPS);
+        let config = parse(&zone_toml(&[("sources", &sources), ("steps", "[]")])).unwrap();
+
+        assert!(config.zones[0].steps.is_empty());
+    }
+
+    #[test]
+    fn rejects_duty_aggregation_top_zero() {
+        let aggregation = r#"{ type = "average", top = 0 }"#;
+
+        assert_eq!(validation_reason(&zone_toml(&[("duty_aggregation", aggregation)])),
+            "zones[0].duty_aggregation[type=average].top: must be greater than 0");
+    }
+
     /// Build a zone whose second source is an nvidia source with `gpu`
     fn nvidia_zone_toml(gpu: &str) -> String {
         // Debug quoting escapes `\n` and `"` the way a TOML basic string does
@@ -623,7 +817,7 @@ mod tests {
     fn assert_nvidia_gpu_loads(gpu: &str) {
         let config = parse(&nvidia_zone_toml(gpu)).unwrap();
 
-        match &config.zones[0].sources[1] {
+        match &config.zones[0].sources[1].kind {
             Source::Nvidia { gpu: loaded } => assert_eq!(loaded, gpu),
             other => panic!("expected an nvidia source, got {:?}", other),
         }
