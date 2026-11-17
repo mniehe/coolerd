@@ -378,11 +378,13 @@ mod tests {
             }
         }
 
-        let body: String = fields.iter()
-            .map(|(k, v)| format!("{} = {}\n", k, v))
-            .collect();
+        let mut toml = "[[zones]]\n".to_owned();
 
-        format!("[[zones]]\n{}", body)
+        for (key, value) in fields {
+            toml.push_str(&format!("{} = {}\n", key, value));
+        }
+
+        toml
     }
 
     fn parse(contents: &str) -> Result<Config> {
