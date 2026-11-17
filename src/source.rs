@@ -212,28 +212,41 @@ fn stop_child(mut child: Child, program: &Path) {
     }
 }
 
-/// Read at most [`OUTPUT_CAP`] bytes of `pipe` on a detached thread and send
-/// the result on the returned channel. The thread blocks for as long as any
-/// process holds the pipe open, which can outlast the child, so the caller
-/// waits on the channel with a deadline.
+/// Read `pipe` on a detached thread and send the result on the returned
+/// channel. Output longer than [`OUTPUT_CAP`] bytes is an error. The thread
+/// blocks for as long as any process holds the pipe open, which can outlast
+/// the child, so the caller waits on the channel with a deadline.
 fn spawn_output_reader(pipe: ChildStdout) -> io::Result<Receiver<io::Result<String>>> {
     let (sender, receiver) = mpsc::channel();
 
     thread::Builder::new().spawn(move || {
-        let mut output = String::new();
-        let result = pipe.take(OUTPUT_CAP).read_to_string(&mut output).map(|_| output);
         // The receiver is gone once the caller has timed out
-        let _ = sender.send(result);
+        let _ = sender.send(read_capped(pipe));
     })?;
 
     Ok(receiver)
 }
 
-/// Run a command with piped stdout and return its exit status and at most
-/// [`OUTPUT_CAP`] bytes of its output. If the command has not exited and
-/// closed its output within `limit`, [`Error::CommandTimeout`] is returned;
-/// a child still running then is killed. The call returns within about
-/// `limit` plus [`KILL_GRACE`] in every case.
+/// Read all of `pipe`, failing once it yields more than [`OUTPUT_CAP`] bytes.
+/// One byte past the cap is read so that a cut output, whose prefix may still
+/// parse, is never returned.
+fn read_capped(pipe: impl Read) -> io::Result<String> {
+    let mut output = Vec::new();
+    pipe.take(OUTPUT_CAP + 1).read_to_end(&mut output)?;
+
+    if output.len() as u64 > OUTPUT_CAP {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            format!("output is longer than {} bytes", OUTPUT_CAP)));
+    }
+
+    String::from_utf8(output).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Run a command with piped stdout and return its exit status and its output,
+/// which must be at most [`OUTPUT_CAP`] bytes. If the command has not exited
+/// and closed its output within `limit`, [`Error::CommandTimeout`] is
+/// returned; a child still running then is killed. The call returns within
+/// about `limit` plus [`KILL_GRACE`] in every case.
 fn run_with_timeout(cmd: &mut Command, limit: Duration) -> Result<(ExitStatus, String)> {
     let program = PathBuf::from(cmd.get_program());
     let io_error = |e| Error::Io { path: program.clone(), source: e };
@@ -241,7 +254,10 @@ fn run_with_timeout(cmd: &mut Command, limit: Duration) -> Result<(ExitStatus, S
         command: program.display().to_string(),
         seconds: limit.as_secs(),
     };
-    let deadline = Instant::now() + limit;
+    let deadline = Instant::now()
+        .checked_add(limit)
+        .ok_or_else(|| io_error(io::Error::new(io::ErrorKind::InvalidInput,
+            format!("time limit {:?} is too long", limit))))?;
 
     let mut child = cmd
         .stdout(Stdio::piped())
@@ -430,6 +446,7 @@ mod tests {
         std::{
             env,
             fs,
+            io,
             os::unix::{fs::PermissionsExt, process::ExitStatusExt},
             path::{Path, PathBuf},
             process::{self, Child, Command, ExitStatus, Stdio},
@@ -444,11 +461,13 @@ mod tests {
         serde_json::json,
         super::{
             KILL_GRACE,
+            OUTPUT_CAP,
             parse_file_source,
             parse_hdparm_output,
             parse_nvidia_output,
             parse_smart_output,
             read_nvidia_with_limit,
+            run_with_timeout,
             smart_reading,
             wait_bounded,
         },
@@ -832,6 +851,52 @@ mod tests {
         let run = nvidia_script_reading(&dir, &body, FINISH_LIMIT);
 
         assert_eq!(run.result.unwrap(), 71);
+    }
+
+    fn assert_output_over_cap(run: &ScriptRun) {
+        assert!(matches!(&run.result,
+            Err(Error::Io { path, source })
+                if *path == run.script
+                    && source.kind() == io::ErrorKind::InvalidData
+                    && source.to_string().contains(&OUTPUT_CAP.to_string())),
+            "{:?}", run.result);
+    }
+
+    #[test]
+    fn nvidia_script_digits_past_output_cap_are_error() {
+        let dir = TempDir::new();
+        // 4096 zero-padded digits ending in 1, then a 7: the full record is 17
+        let run = nvidia_script_reading(&dir, "printf '%04096d7\\n' 1", FINISH_LIMIT);
+
+        assert_output_over_cap(&run);
+    }
+
+    #[test]
+    fn nvidia_script_record_after_output_cap_is_error() {
+        let dir = TempDir::new();
+        // The first record ends exactly at the cap and a second one follows
+        let run = nvidia_script_reading(&dir, "printf '%04095d\\n72\\n' 71", FINISH_LIMIT);
+
+        assert_output_over_cap(&run);
+    }
+
+    #[test]
+    fn nvidia_script_output_of_exactly_cap_gives_reading() {
+        let dir = TempDir::new();
+        let run = nvidia_script_reading(&dir, "printf '%04095d\\n' 71", FINISH_LIMIT);
+
+        assert_eq!(run.result.unwrap(), 71);
+    }
+
+    #[test]
+    fn unrepresentable_limit_is_error() {
+        let _guard = script_lock();
+        let result = run_with_timeout(&mut Command::new("true"), Duration::MAX);
+
+        assert!(matches!(&result,
+            Err(Error::Io { path, source })
+                if path == Path::new("true") && source.kind() == io::ErrorKind::InvalidInput),
+            "{:?}", result);
     }
 
     #[test]
