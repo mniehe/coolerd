@@ -5,7 +5,7 @@ use {
         fs,
         io::{BufRead, BufReader, Read},
         path::Path,
-        process::{Command, Stdio},
+        process::{Command, ExitStatus, Stdio},
         sync::{Arc, Mutex},
     },
     crate::{
@@ -36,13 +36,23 @@ fn parse_smart_source<T: AsRef<Path>>(block_dev: T) -> Result<u8> {
     let status = proc.wait()
         .map_err(|e| Error::Io { path: "(smartctl)".into(), source: e })?;
 
+    smart_reading(status, block_dev, result)
+}
+
+/// Turn smartctl's exit status and its parsed JSON output into a reading. A
+/// failing exit status takes precedence over a JSON parse error.
+fn smart_reading(
+    status: ExitStatus,
+    block_dev: &Path,
+    result: serde_json::Result<serde_json::Value>,
+) -> Result<u8> {
     match status.code() {
         // smartctl will return status code 2 when a drive is in standby
         Some(0) | Some(2) => {},
         _ => return Err(Error::Command { command: "smartctl".into(), status }),
     }
 
-    let root: serde_json::Value = result
+    let root = result
         .map_err(|e| Error::SmartParse { block_dev: block_dev.to_owned(), source: e })?;
 
     parse_smart_output(block_dev, &root)
@@ -222,16 +232,29 @@ mod tests {
         std::{
             env,
             fs,
+            os::unix::process::ExitStatusExt,
             path::{Path, PathBuf},
-            process,
+            process::{self, ExitStatus},
             sync::atomic::{AtomicUsize, Ordering},
         },
         serde_json::json,
-        super::{parse_file_source, parse_hdparm_output, parse_smart_output},
+        super::{parse_file_source, parse_hdparm_output, parse_smart_output, smart_reading},
         crate::error::Error,
     };
 
     const BLOCK_DEV: &str = "/dev/sda";
+    const SMART_OUTPUT: &str = r#"{ "temperature": { "current": 41 } }"#;
+    const MALFORMED_SMART_OUTPUT: &str = r#"{ "temperature": "#;
+
+    /// Exit status of a process that exited with `code`
+    fn exit_status(code: i32) -> ExitStatus {
+        // A raw wait status holds the exit code in its second byte
+        ExitStatus::from_raw(code << 8)
+    }
+
+    fn smart_status_reading(code: i32, output: &str) -> Result<u8, Error> {
+        smart_reading(exit_status(code), Path::new(BLOCK_DEV), serde_json::from_str(output))
+    }
 
     /// Directory under the system temp dir that is removed when dropped
     struct TempDir(PathBuf);
@@ -292,6 +315,35 @@ mod tests {
         let result = parse_smart_output(Path::new(BLOCK_DEV), &root);
 
         assert!(matches!(result, Err(Error::ReadingExceedsBounds)));
+    }
+
+    #[test]
+    fn smart_failed_status_wins_over_malformed_json() {
+        let result = smart_status_reading(1, MALFORMED_SMART_OUTPUT);
+
+        assert!(matches!(&result,
+            Err(Error::Command { command, status })
+                if command == Path::new("smartctl") && status.code() == Some(1)),
+            "{:?}", result);
+    }
+
+    #[test]
+    fn smart_standby_status_with_malformed_json_fails_to_parse() {
+        let result = smart_status_reading(2, MALFORMED_SMART_OUTPUT);
+
+        assert!(matches!(&result,
+            Err(Error::SmartParse { block_dev, .. }) if block_dev == Path::new(BLOCK_DEV)),
+            "{:?}", result);
+    }
+
+    #[test]
+    fn smart_success_status_gives_reading() {
+        assert_eq!(smart_status_reading(0, SMART_OUTPUT).unwrap(), 41);
+    }
+
+    #[test]
+    fn smart_standby_status_with_valid_json_gives_reading() {
+        assert_eq!(smart_status_reading(2, SMART_OUTPUT).unwrap(), 41);
     }
 
     #[test]
