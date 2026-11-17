@@ -745,16 +745,15 @@ mod tests {
         })
     }
 
-    /// Whether `pid` has exited and waits to be reaped
-    fn is_zombie(pid: u32) -> bool {
-        let Ok(stat) = fs::read_to_string(format!("/proc/{}/stat", pid)) else {
-            return false;
-        };
-        // The state follows the command name, which is in parentheses
-        stat.rsplit_once(')').is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+    /// Wait until the process `pid` has no /proc entry. A zombie still has
+    /// one, so this also waits for the process to be reaped.
+    fn wait_until_gone(pid: &str) -> bool {
+        let entry = Path::new("/proc").join(pid);
+        poll_until(|| (!entry.exists()).then_some(())).is_some()
     }
 
-    /// Kills the process whose pid a script wrote to a file, when dropped
+    /// Kills the process whose pid a script wrote to a file, when dropped. A
+    /// script that never wrote the file leaves nothing to kill.
     struct KillOnDrop(PathBuf);
 
     impl Drop for KillOnDrop {
@@ -767,18 +766,33 @@ mod tests {
                 .args(["-c", "kill -9 \"$1\"", "sh", &pid])
                 .stderr(Stdio::null())
                 .status();
+            wait_until_gone(&pid);
+        }
+    }
+
+    /// Owns a child and kills and reaps it when dropped, so a failed
+    /// assertion leaves no process behind
+    struct ChildGuard(Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            // Both calls do nothing to a child that has already been reaped
+            let _ = self.0.kill();
+            let _ = self.0.wait();
         }
     }
 
     /// Spawn a child that runs until killed
-    fn spawn_sleeper() -> Child {
-        Command::new("sleep")
+    fn spawn_sleeper() -> ChildGuard {
+        let child = Command::new("sleep")
             .arg("30")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .unwrap()
+            .unwrap();
+
+        ChildGuard(child)
     }
 
     #[test]
@@ -787,11 +801,8 @@ mod tests {
         let mut child = spawn_sleeper();
 
         let start = Instant::now();
-        let status = wait_bounded(&mut child, SHORT_GRACE);
+        let status = wait_bounded(&mut child.0, SHORT_GRACE);
         let elapsed = start.elapsed();
-
-        let _ = child.kill();
-        let _ = child.wait();
 
         assert!(status.is_none(), "{:?}", status);
         assert!(elapsed >= SHORT_GRACE, "returned after {:?}", elapsed);
@@ -799,18 +810,16 @@ mod tests {
     }
 
     #[test]
-    fn wait_bounded_returns_exited_child_at_once() {
+    fn wait_bounded_returns_once_child_exits() {
         let _guard = script_lock();
-        let mut child = Command::new("sh")
+        let mut child = ChildGuard(Command::new("sh")
             .args(["-c", "exit 4"])
             .spawn()
-            .unwrap();
-        assert!(poll_until(|| is_zombie(child.id()).then_some(())).is_some(),
-            "child {} did not exit", child.id());
+            .unwrap());
 
         let grace = Duration::from_secs(10);
         let start = Instant::now();
-        let status = wait_bounded(&mut child, grace);
+        let status = wait_bounded(&mut child.0, grace);
         let elapsed = start.elapsed();
 
         assert_eq!(status.and_then(|s| s.code()), Some(4));
@@ -937,8 +946,9 @@ mod tests {
         assert!(run.elapsed < TIMEOUT_LIMIT + KILL_GRACE + RETURN_SLACK,
             "returned after {:?}", run.elapsed);
 
-        // A zombie still has a /proc entry, so this also proves the child was reaped
-        let pid = wait_for_pid(&pid_file).expect("the script wrote no pid");
-        assert!(!Path::new("/proc").join(&pid).exists(), "pid {} still exists", pid);
+        // A child that outlived the kill grace is reaped by a detached thread,
+        // so its /proc entry may take a moment longer to go away
+        let pid = wait_for_pid(&pid_file).expect("the script wrote no pid before it was killed");
+        assert!(wait_until_gone(&pid), "pid {} still exists", pid);
     }
 }
