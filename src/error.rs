@@ -78,6 +78,10 @@ pub enum Error {
         command: String,
         seconds: u64,
     },
+    #[error("Not started, because its last run has not exited since it was killed: {command}")]
+    CommandStillRunning {
+        command: String,
+    },
     #[error("Failed all {attempts} attempt(s); last attempt error: {source}")]
     RetriesFailed {
         attempts: u64,

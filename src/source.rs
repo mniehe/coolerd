@@ -1,13 +1,17 @@
 use {
     std::{
-        collections::HashMap,
+        collections::{BTreeSet, HashMap},
         convert::TryInto,
         fs,
         io::{self, BufRead, BufReader, Read},
         iter,
         path::{Path, PathBuf},
         process::{Child, ChildStdout, Command, ExitStatus, Stdio},
-        sync::mpsc::{self, Receiver, RecvTimeoutError},
+        sync::{
+            mpsc::{self, Receiver, RecvTimeoutError},
+            Mutex,
+            MutexGuard,
+        },
         thread,
         time::{Duration, Instant},
     },
@@ -202,11 +206,11 @@ fn wait_bounded(child: &mut Child, grace: Duration) -> Option<ExitStatus> {
     }
 }
 
-/// Kill `child` and reap it within [`KILL_GRACE`]. A killed process can stay
-/// in uninterruptible sleep, as nvidia-smi does in a hung driver, so a child
-/// that outlives the grace is handed to a detached thread to reap and the
-/// caller never waits on it.
-fn stop_child(mut child: Child, program: &Path) {
+/// Kill `child`, a run of `command`, and reap it within [`KILL_GRACE`]. A
+/// killed process can stay in uninterruptible sleep, as nvidia-smi does in a
+/// hung driver, so a child that outlives the grace is handed to a detached
+/// thread to reap and the caller never waits on it.
+fn stop_child(mut child: Child, command: &str) {
     // Kill fails if the child has already exited, which is harmless
     let _ = child.kill();
 
@@ -214,15 +218,63 @@ fn stop_child(mut child: Child, program: &Path) {
         return;
     }
 
-    warn!("{:?} did not exit within {:?} of being killed and may be stuck; reaping it in the background",
-        program, KILL_GRACE);
+    warn!("{} did not exit within {:?} of being killed and may be stuck; reaping it in the background \
+        and not starting it again until it exits", command, KILL_GRACE);
 
+    reap_in_background(child, command.to_owned());
+}
+
+/// The commands, by [`command_identity`], whose last run outlived its kill and
+/// has not been reaped. Such a command is not started again, so a program
+/// that hangs leaves at most one stuck process however often it is read.
+struct StuckCommands(Mutex<BTreeSet<String>>);
+
+impl StuckCommands {
+    fn commands(&self) -> MutexGuard<'_, BTreeSet<String>> {
+        // Each change to the set is one call that cannot panic halfway, so a
+        // poisoned lock still guards a whole set
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn contains(&self, command: &str) -> bool {
+        self.commands().contains(command)
+    }
+
+    fn insert(&self, command: String) {
+        self.commands().insert(command);
+    }
+
+    fn remove(&self, command: &str) {
+        self.commands().remove(command);
+    }
+}
+
+static STUCK_COMMANDS: StuckCommands = StuckCommands(Mutex::new(BTreeSet::new()));
+
+/// Name a command by its program and arguments
+fn command_identity(cmd: &Command) -> String {
+    iter::once(cmd.get_program())
+        .chain(cmd.get_args())
+        .map(|part| format!("{:?}", part))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Reap `child`, a run of `command`, on a detached thread, and mark `command`
+/// as stuck until then
+fn reap_in_background(mut child: Child, command: String) {
+    STUCK_COMMANDS.insert(command.clone());
+
+    let reaper_command = command.clone();
     let reaper = thread::Builder::new().spawn(move || {
         let _ = child.wait();
+        STUCK_COMMANDS.remove(&reaper_command);
     });
 
     if let Err(e) = reaper {
-        warn!("Failed to start a thread to reap {:?}: {}", program, e);
+        // Nothing would ever free the command, so it may run again
+        STUCK_COMMANDS.remove(&command);
+        warn!("Failed to start a thread to reap {}: {}", command, e);
     }
 }
 
@@ -260,8 +312,16 @@ fn read_capped(pipe: impl Read, cap: u64) -> io::Result<String> {
 /// which must be at most `limits.output` bytes. If the command has not exited
 /// and closed its output within `limits.time`, [`Error::CommandTimeout`] is
 /// returned; a child still running then is killed. The call returns within
-/// about `limits.time` plus [`KILL_GRACE`] in every case.
+/// about `limits.time` plus [`KILL_GRACE`] in every case. While an earlier run
+/// of the same program with the same arguments is stuck after its kill, the
+/// command is not started and [`Error::CommandStillRunning`] is returned.
 fn run_with_timeout(cmd: &mut Command, limits: RunLimits) -> Result<(ExitStatus, String)> {
+    let command = command_identity(cmd);
+
+    if STUCK_COMMANDS.contains(&command) {
+        return Err(Error::CommandStillRunning { command });
+    }
+
     let limit = limits.time;
     let program = PathBuf::from(cmd.get_program());
     let io_error = |e| Error::Io { path: program.clone(), source: e };
@@ -285,7 +345,7 @@ fn run_with_timeout(cmd: &mut Command, limits: RunLimits) -> Result<(ExitStatus,
     let output = match reader {
         Ok(receiver) => receiver,
         Err(e) => {
-            stop_child(child, &program);
+            stop_child(child, &command);
             return Err(io_error(e));
         }
     };
@@ -300,14 +360,14 @@ fn run_with_timeout(cmd: &mut Command, limits: RunLimits) -> Result<(ExitStatus,
             }
             Ok(None) => {},
             Err(e) => {
-                stop_child(child, &program);
+                stop_child(child, &command);
                 return Err(io_error(e));
             }
         }
 
         let now = Instant::now();
         if now >= deadline {
-            stop_child(child, &program);
+            stop_child(child, &command);
             return Err(timeout());
         }
 
@@ -640,7 +700,7 @@ mod tests {
     use {
         std::{
             cell::RefCell,
-            collections::HashMap,
+            collections::{BTreeSet, HashMap},
             env,
             fs,
             io,
@@ -660,6 +720,10 @@ mod tests {
             KILL_GRACE,
             NVIDIA_OUTPUT_CAP,
             RunLimits,
+            STUCK_COMMANDS,
+            StuckCommands,
+            command_identity,
+            reap_in_background,
             ipmi_sensor_temp,
             parse_file_source,
             parse_hdparm_output,
@@ -1103,6 +1167,80 @@ mod tests {
     /// killed. exec keeps the shell's pid, so the pid is the sleeping process.
     fn sleeping_body(pid_file: &Path) -> String {
         format!("echo $$ > '{}'\nexec sleep 30", pid_file.display())
+    }
+
+    #[test]
+    fn stuck_command_is_not_started_again_until_reaped() {
+        let dir = TempDir::new();
+        let marker = dir.0.join("ran");
+        let pid_file = dir.0.join("pid");
+        let limits = RunLimits { time: FINISH_LIMIT, output: NVIDIA_OUTPUT_CAP };
+        // Declared before the lock guard, so that a failed assertion releases
+        // the lock before this takes it to kill the stand-in
+        let stray = KillOnDrop(pid_file.clone());
+        let guard = script_lock();
+        let script = write_script(&dir, "tool", &format!("touch '{}'", marker.display()));
+        let command = |arg: &str| {
+            let mut cmd = Command::new(&script);
+            cmd.arg(arg);
+            cmd
+        };
+
+        // SIGKILL cannot be ignored, so a live sleep stands in for a run of
+        // `tool stuck` that outlived its kill
+        let stuck = Command::new("sleep").arg("30").stdout(Stdio::null()).spawn().unwrap();
+        fs::write(&pid_file, stuck.id().to_string()).unwrap();
+        let identity = command_identity(&command("stuck"));
+        reap_in_background(stuck, identity.clone());
+
+        let result = run_with_timeout(&mut command("stuck"), limits);
+
+        assert!(matches!(&result, Err(Error::CommandStillRunning { command }) if *command == identity),
+            "{:?}", result);
+        assert!(!marker.exists(), "the stuck command was started again");
+
+        let (status, _) = run_with_timeout(&mut command("other"), limits).unwrap();
+        assert!(status.success());
+        assert!(marker.exists(), "a command with other arguments did not run");
+        fs::remove_file(&marker).unwrap();
+
+        // Kill the stand-in; the reaper then frees the command
+        drop(guard);
+        drop(stray);
+        assert!(poll_until(|| (!STUCK_COMMANDS.contains(&identity)).then_some(())).is_some(),
+            "the reaped command is still marked as stuck");
+
+        let _guard = script_lock();
+        let (status, _) = run_with_timeout(&mut command("stuck"), limits).unwrap();
+        assert!(status.success());
+        assert!(marker.exists(), "the reaped command did not run again");
+    }
+
+    #[test]
+    fn stuck_commands_survive_a_poisoned_lock() {
+        let stuck = StuckCommands(Mutex::new(BTreeSet::new()));
+        stuck.insert("\"nvidia-smi\"".to_owned());
+
+        thread::scope(|scope| {
+            let poisoner = scope.spawn(|| {
+                let _commands = stuck.commands();
+                panic!("poison the lock");
+            });
+            assert!(poisoner.join().is_err());
+        });
+        assert!(stuck.0.is_poisoned());
+
+        assert!(stuck.contains("\"nvidia-smi\""));
+        stuck.remove("\"nvidia-smi\"");
+        assert!(!stuck.contains("\"nvidia-smi\""));
+    }
+
+    #[test]
+    fn command_identity_names_program_and_arguments() {
+        let mut cmd = Command::new("nvidia-smi");
+        cmd.args(["-i", "0000:81:00.0"]);
+
+        assert_eq!(command_identity(&cmd), r#""nvidia-smi" "-i" "0000:81:00.0""#);
     }
 
     #[test]
