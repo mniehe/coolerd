@@ -4,6 +4,7 @@ use {
         convert::TryInto,
         fs,
         io::{self, BufRead, BufReader, Read},
+        iter,
         path::{Path, PathBuf},
         process::{Child, ChildStdout, Command, ExitStatus, Stdio},
         sync::mpsc::{self, Receiver, RecvTimeoutError},
@@ -412,18 +413,39 @@ fn exhausted(on_failure: &OnFailure, attempts: u64, error: Error) -> Result<Sour
     }
 }
 
+/// Whether the source at `index` failed in the last poll, by the flags
+/// [`read_zone_sources`] was given. A source without a flag gets its retries.
+fn failed_last(flags: &[bool], index: usize) -> bool {
+    flags.get(index).copied().unwrap_or(false)
+}
+
 /// An IPMI source that has no reading yet in this poll
 struct PendingSensor<'a> {
     index: usize,
     sensor: &'a str,
     on_failure: &'a OnFailure,
+    /// A sensor that failed in the last poll causes no retry of its own
+    failed_last: bool,
+}
+
+/// Take the wait before the next query, unless every pending sensor failed in
+/// the last poll
+fn retry_wait<'a>(mut pending: impl Iterator<Item = &'a PendingSensor<'a>>, waits: &mut Waits) -> Option<Duration> {
+    if !pending.any(|p| !p.failed_last) {
+        return None;
+    }
+
+    waits.next()
 }
 
 /// Read every IPMI source of `zone` into `readings`, by index, with one
 /// `query_ipmi` call per attempt. Each attempt after the first takes a wait
 /// from `waits` and covers only the sources that failed the attempt before.
+/// A sensor that failed in the last poll still takes the value of a later
+/// attempt, but no attempt is made for its sake alone.
 fn read_ipmi_sources(
     zone: &Zone,
+    failed_flags: &[bool],
     query_ipmi: &mut dyn FnMut() -> Result<HashMap<String, Option<SensorReading>>>,
     waits: &mut Waits,
     readings: &mut [Option<SourceReading>],
@@ -431,7 +453,12 @@ fn read_ipmi_sources(
     let mut pending: Vec<PendingSensor> = zone.sources.iter()
         .enumerate()
         .filter_map(|(index, source)| match &source.kind {
-            Source::Ipmi { sensor } => Some(PendingSensor { index, sensor, on_failure: &source.on_failure }),
+            Source::Ipmi { sensor } => Some(PendingSensor {
+                index,
+                sensor,
+                on_failure: &source.on_failure,
+                failed_last: failed_last(failed_flags, index),
+            }),
             _ => None,
         })
         .collect();
@@ -443,7 +470,7 @@ fn read_ipmi_sources(
         let sensor_readings = match query_ipmi() {
             Ok(r) => r,
             Err(e) => {
-                let Some(delay) = waits.next() else {
+                let Some(delay) = retry_wait(pending.iter(), waits) else {
                     return exhaust_query(&pending, attempts, e, readings);
                 };
                 trace!("IPMI sensor query failed on attempt {}: {}", attempts, e);
@@ -465,7 +492,7 @@ fn read_ipmi_sources(
             break;
         }
 
-        let Some(delay) = waits.next() else {
+        let Some(delay) = retry_wait(failures.iter().map(|(p, _)| p), waits) else {
             for (p, e) in failures {
                 readings[p.index] = Some(exhausted(p.on_failure, attempts, e)?);
             }
@@ -530,32 +557,44 @@ fn read_with_retries(
     }
 }
 
-/// Read every source of `zone` once, in source order, retrying only a source
-/// that failed. All retries of the call share the zone's `retries` waits of
-/// `retry_delay_ms`, so a call waits no longer than one retried read of the
-/// whole zone did. IPMI sources go first, as one `query_ipmi` call per attempt;
-/// `reader` reads each other source in order.
+/// Read every source of `zone` once, retrying only a source that failed.
+/// `reader` reads each source that is not an IPMI sensor, in source order;
+/// then the IPMI sensors are read last, as one `query_ipmi` call per attempt,
+/// so that their readings are fresh when the duty is computed.
+///
+/// All retries of the call share the zone's `retries` waits of
+/// `retry_delay_ms`. A source marked in `failed_last`, which failed in the
+/// last poll, gets one attempt and takes no wait, so a source that keeps
+/// failing leaves the waits to the others.
 ///
 /// A source that fails when no wait is left gives a failed reading, unless its
-/// `on_failure` is `exit`: then its error is returned at once and no later
-/// source is read.
+/// `on_failure` is `exit`: then its error is returned at once and nothing more
+/// is read or queried.
 pub fn read_zone_sources(
     zone: &Zone,
+    failed_flags: &[bool],
     query_ipmi: &mut dyn FnMut() -> Result<HashMap<String, Option<SensorReading>>>,
     reader: &dyn Fn(&Source) -> Result<u8>,
 ) -> Result<Vec<SourceReading>> {
     let mut waits = zone.retry_iter();
     let mut readings = vec![None; zone.sources.len()];
 
-    read_ipmi_sources(zone, query_ipmi, &mut waits, &mut readings)?;
-
     for (index, source) in zone.sources.iter().enumerate() {
         if matches!(source.kind, Source::Ipmi { .. }) {
             continue;
         }
 
-        readings[index] = Some(read_with_retries(source, reader, &mut waits)?);
+        let mut no_waits = iter::empty();
+        let source_waits: &mut Waits = if failed_last(failed_flags, index) {
+            &mut no_waits
+        } else {
+            &mut waits
+        };
+
+        readings[index] = Some(read_with_retries(source, reader, source_waits)?);
     }
+
+    read_ipmi_sources(zone, failed_flags, query_ipmi, &mut waits, &mut readings)?;
 
     // Every source has a reading by now. A gap would shorten the list, and
     // ZoneState answers a short list with full duty.
@@ -1124,17 +1163,33 @@ mod tests {
     const IGNORE: OnFailure = OnFailure::Ignore {};
     const CPU: &str = "CPU Temp";
 
-    /// A fake reader of file sources. Each path fails a set number of times
-    /// and then reads as its temperature; every call is recorded.
+    /// A fake reader of file sources. Each path gives its outcomes in turn,
+    /// `None` for a failure, and repeats its last outcome; every call is
+    /// recorded.
     struct FakeReader {
-        /// Path, failures before the first good read, temperature
-        paths: Vec<(&'static str, usize, u8)>,
+        paths: Vec<(&'static str, Vec<Option<u8>>)>,
         calls: RefCell<Vec<String>>,
     }
 
     impl FakeReader {
+        /// Each path fails a set number of times and then reads as its
+        /// temperature: path, failures before the first good read, temperature
         fn new(paths: &[(&'static str, usize, u8)]) -> Self {
-            Self { paths: paths.to_vec(), calls: RefCell::new(Vec::new()) }
+            let paths = paths.iter()
+                .map(|&(path, failures, temp)| {
+                    let mut outcomes = vec![None; failures];
+                    outcomes.push(Some(temp));
+                    (path, outcomes)
+                })
+                .collect();
+
+            Self { paths, calls: RefCell::new(Vec::new()) }
+        }
+
+        fn scripted(paths: &[(&'static str, &[Option<u8>])]) -> Self {
+            let paths = paths.iter().map(|&(path, outcomes)| (path, outcomes.to_vec())).collect();
+
+            Self { paths, calls: RefCell::new(Vec::new()) }
         }
 
         fn read(&self, source: &Source) -> Result<u8, Error> {
@@ -1143,16 +1198,13 @@ mod tests {
             };
             self.calls.borrow_mut().push(path.clone());
 
-            let calls = self.calls(path);
-            let &(_, failures, temp) = self.paths.iter()
-                .find(|(p, _, _)| p == path)
+            let call = self.calls(path);
+            let (_, outcomes) = self.paths.iter()
+                .find(|(p, _)| p == path)
                 .expect("a path the test names");
+            let outcome = outcomes.get(call - 1).or(outcomes.last()).copied().flatten();
 
-            if calls <= failures {
-                return Err(Error::SensorNoReading(path.clone()));
-            }
-
-            Ok(temp)
+            outcome.ok_or_else(|| Error::SensorNoReading(path.clone()))
         }
 
         fn calls(&self, path: &str) -> usize {
@@ -1172,19 +1224,198 @@ mod tests {
         Error::Io { path: "(ipmi)".into(), source: io::Error::other("BMC busy") }
     }
 
-    /// Read `zone` with a query that always returns `sensors`, and count the
-    /// queries
+    /// Read `zone`, none of whose sources failed in the last poll, with a
+    /// query that always returns `sensors`, and count the queries
     fn read_with_sensors(zone: &Zone, sensors: &[(&str, Option<SensorReading>)], reader: &FakeReader)
         -> (Result<Vec<SourceReading>, Error>, usize)
     {
+        read_after(zone, &vec![false; zone.sources.len()], sensors, reader)
+    }
+
+    /// Read `zone` as [`read_with_sensors`] does, after a poll in which the
+    /// sources marked in `failed_last` failed
+    fn read_after(
+        zone: &Zone,
+        failed_last: &[bool],
+        sensors: &[(&str, Option<SensorReading>)],
+        reader: &FakeReader,
+    ) -> (Result<Vec<SourceReading>, Error>, usize) {
         let mut queries = 0;
         let mut query = || {
             queries += 1;
             Ok(sensor_map(sensors))
         };
-        let result = read_zone_sources(zone, &mut query, &|s| reader.read(s));
+        let result = read_zone_sources(zone, failed_last, &mut query, &|s| reader.read(s));
 
         (result, queries)
+    }
+
+    /// A query that returns `maps` in turn and repeats the last one, counting
+    /// its calls in `queries`
+    fn changing_query<'a>(maps: &'a [HashMap<String, Option<SensorReading>>], queries: &'a mut usize)
+        -> impl FnMut() -> Result<HashMap<String, Option<SensorReading>>, Error> + 'a
+    {
+        move || {
+            *queries += 1;
+            Ok(maps.get(*queries - 1).or(maps.last()).cloned().unwrap_or_default())
+        }
+    }
+
+    /// Read `zone` as the zone loop does, after the polls `state` has seen
+    fn poll(zone: &Zone, state: &mut ZoneState, reader: &FakeReader) -> Vec<SourceReading> {
+        let failed_last = state.failed_sources();
+        let readings = read_zone_sources(zone, &failed_last, &mut || Ok(HashMap::new()), &|s| reader.read(s))
+            .unwrap();
+        state.next_duty(zone, &readings);
+
+        readings
+    }
+
+    fn failed_text(attempts: u64, path: &str) -> SourceReading {
+        Failed(format!("Failed all {} attempt(s); last attempt error: Sensor reading not available: {}", attempts, path))
+    }
+
+    #[test]
+    fn source_failed_last_poll_is_read_once_and_leaves_the_waits() {
+        let zone = zone(vec![file("gpu", IGNORE), file("disk", OnFailure::Exit {})], 2);
+        let reader = FakeReader::new(&[("gpu", 9, 70), ("disk", 2, 35)]);
+
+        let (result, _) = read_after(&zone, &[true, false], &[], &reader);
+
+        assert_eq!(result.unwrap(), [failed_text(1, "gpu"), Temp(35)]);
+        assert_eq!(reader.calls("gpu"), 1);
+        assert_eq!(reader.calls("disk"), 3);
+    }
+
+    #[test]
+    fn failed_source_gets_its_retries_again_once_it_reads() {
+        let zone = zone(vec![file("gpu", IGNORE)], 2);
+        // Fails a whole poll and once more, reads, then fails twice and reads
+        let reader = FakeReader::scripted(&[("gpu", &[None, None, None, None, Some(70), None, None, Some(72)])]);
+        let mut state = ZoneState::new(&zone);
+
+        assert_eq!(poll(&zone, &mut state, &reader), [failed_text(3, "gpu")]);
+        assert_eq!(reader.calls("gpu"), 3);
+        assert_eq!(poll(&zone, &mut state, &reader), [failed_text(1, "gpu")]);
+        assert_eq!(reader.calls("gpu"), 4);
+        assert_eq!(poll(&zone, &mut state, &reader), [Temp(70)]);
+        assert_eq!(reader.calls("gpu"), 5);
+        assert_eq!(poll(&zone, &mut state, &reader), [Temp(72)]);
+        assert_eq!(reader.calls("gpu"), 8);
+    }
+
+    #[test]
+    fn missing_sensor_failed_last_poll_makes_one_query() {
+        let zone = zone(vec![ipmi("Missing", IGNORE), ipmi(CPU, OnFailure::Exit {})], 2);
+
+        let (result, queries) = read_after(&zone, &[true, false], &[(CPU, celsius(50))], &FakeReader::new(&[]));
+
+        assert!(matches!(&result.as_ref().unwrap()[..],
+            [Failed(e), Temp(50)] if e == "Failed all 1 attempt(s); last attempt error: Sensor not found: Missing"),
+            "{:?}", result);
+        assert_eq!(queries, 1);
+    }
+
+    #[test]
+    fn failed_query_for_sensors_failed_last_poll_is_not_retried() {
+        let zone = zone(vec![ipmi("GPU Temp", IGNORE)], 2);
+        let mut queries = 0;
+        let mut query = || {
+            queries += 1;
+            Err(query_error())
+        };
+
+        let readings = read_zone_sources(&zone, &[true], &mut query, &|_| panic!("no file source")).unwrap();
+
+        assert!(matches!(&readings[..], [Failed(_)]), "{:?}", readings);
+        assert_eq!(queries, 1);
+    }
+
+    #[test]
+    fn sensor_failed_last_poll_takes_value_of_retry_for_another_sensor() {
+        let zone = zone(vec![ipmi("GPU Temp", IGNORE), ipmi(CPU, IGNORE)], 2);
+        let maps = [sensor_map(&[]), sensor_map(&[("GPU Temp", celsius(60)), (CPU, celsius(50))])];
+        let mut queries = 0;
+
+        let readings = read_zone_sources(&zone, &[true, false], &mut changing_query(&maps, &mut queries),
+            &|_| panic!("no file source")).unwrap();
+
+        assert_eq!(readings, [Temp(60), Temp(50)]);
+        assert_eq!(queries, 2);
+    }
+
+    #[test]
+    fn other_sources_are_read_before_the_ipmi_query() {
+        let zone = zone(vec![ipmi(CPU, OnFailure::Exit {}), file("disk", OnFailure::Exit {})], 0);
+        let events = RefCell::new(Vec::new());
+        let mut query = || {
+            events.borrow_mut().push("query");
+            Ok(sensor_map(&[(CPU, celsius(50))]))
+        };
+        let reader = |_: &Source| {
+            events.borrow_mut().push("disk");
+            Ok(35)
+        };
+
+        let readings = read_zone_sources(&zone, &[false, false], &mut query, &reader).unwrap();
+
+        assert_eq!(readings, [Temp(50), Temp(35)]);
+        assert_eq!(events.into_inner(), ["disk", "query"]);
+    }
+
+    #[test]
+    fn exit_source_keeps_its_retries_beside_sensor_failed_last_poll() {
+        let zone = zone(vec![file("gpu", OnFailure::Exit {}), ipmi("Missing", IGNORE)], 2);
+        let reader = FakeReader::new(&[("gpu", 1, 70)]);
+
+        let (result, queries) = read_after(&zone, &[false, true], &[], &reader);
+
+        assert!(matches!(&result.as_ref().unwrap()[..], [Temp(70), Failed(_)]), "{:?}", result);
+        assert_eq!(queries, 1);
+    }
+
+    #[test]
+    fn exhausted_exit_source_makes_no_ipmi_query() {
+        let zone = zone(vec![ipmi(CPU, IGNORE), file("gpu", OnFailure::Exit {})], 1);
+        let reader = FakeReader::new(&[("gpu", 9, 70)]);
+
+        let (result, queries) = read_with_sensors(&zone, &[(CPU, celsius(50))], &reader);
+
+        assert_retries_failed(&result, 2, "Sensor reading not available: gpu");
+        assert_eq!(queries, 0);
+    }
+
+    #[test]
+    fn ipmi_batch_and_other_sources_share_one_retry_budget() {
+        // The disk takes both waits, so the sensor missing from the first map
+        // gets no second query
+        let zone = zone(vec![ipmi(CPU, IGNORE), file("disk", IGNORE)], 2);
+        let reader = FakeReader::new(&[("disk", 2, 35)]);
+        let maps = [sensor_map(&[]), sensor_map(&[(CPU, celsius(50))])];
+        let mut queries = 0;
+
+        let readings = read_zone_sources(&zone, &[false, false], &mut changing_query(&maps, &mut queries),
+            &|s| reader.read(s)).unwrap();
+
+        assert!(matches!(&readings[..], [Failed(_), Temp(35)]), "{:?}", readings);
+        assert_eq!(queries, 1);
+        assert_eq!(reader.calls("disk"), 3);
+    }
+
+    #[test]
+    fn ipmi_retry_keeps_first_values_and_takes_later_value_of_missing_sensor() {
+        let zone = zone(vec![ipmi(CPU, IGNORE), ipmi("GPU Temp", IGNORE)], 2);
+        let maps = [
+            sensor_map(&[(CPU, celsius(50))]),
+            sensor_map(&[(CPU, celsius(60)), ("GPU Temp", celsius(55))]),
+        ];
+        let mut queries = 0;
+
+        let readings = read_zone_sources(&zone, &[false, false], &mut changing_query(&maps, &mut queries),
+            &|_| panic!("no file source")).unwrap();
+
+        assert_eq!(readings, [Temp(50), Temp(55)]);
+        assert_eq!(queries, 2);
     }
 
     fn assert_retries_failed(result: &Result<Vec<SourceReading>, Error>, attempts: u64, message: &str) {
@@ -1219,7 +1450,8 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_exit_ipmi_source_makes_no_later_call() {
+    fn exhausted_exit_ipmi_source_returns_its_error_after_other_sources() {
+        // The IPMI batch comes last, so the disk has been read once by then
         let zone = zone(vec![file("disk", IGNORE), ipmi("GPU Temp", OnFailure::Exit {}), ipmi(CPU, IGNORE)], 2);
         let reader = FakeReader::new(&[("disk", 0, 35)]);
 
@@ -1227,7 +1459,7 @@ mod tests {
 
         assert_retries_failed(&result, 3, "Sensor not found: GPU Temp");
         assert_eq!(queries, 3);
-        assert!(reader.calls.borrow().is_empty());
+        assert_eq!(*reader.calls.borrow(), ["disk"]);
     }
 
     #[test]
@@ -1281,7 +1513,7 @@ mod tests {
             Err(query_error())
         };
 
-        let result = read_zone_sources(&zone, &mut query, &|_| panic!("no file source"));
+        let result = read_zone_sources(&zone, &[false, false], &mut query, &|_| panic!("no file source"));
 
         assert_retries_failed(&result, 3, "\"(ipmi)\": BMC busy");
         assert_eq!(queries, 3);
@@ -1293,7 +1525,7 @@ mod tests {
         let reader = FakeReader::new(&[("disk", 0, 35)]);
         let mut query = || Err(query_error());
 
-        let readings = read_zone_sources(&zone, &mut query, &|s| reader.read(s)).unwrap();
+        let readings = read_zone_sources(&zone, &[false, false, false], &mut query, &|s| reader.read(s)).unwrap();
         let failed = Failed("Failed all 2 attempt(s); last attempt error: \"(ipmi)\": BMC busy".to_owned());
 
         assert_eq!(readings, [failed.clone(), failed, Temp(35)]);
@@ -1311,7 +1543,7 @@ mod tests {
             Ok(sensor_map(&[(CPU, celsius(50))]))
         };
 
-        let readings = read_zone_sources(&zone, &mut query, &|_| panic!("no file source")).unwrap();
+        let readings = read_zone_sources(&zone, &[false], &mut query, &|_| panic!("no file source")).unwrap();
 
         assert_eq!(readings, [Temp(50)]);
         assert_eq!(queries, 2);

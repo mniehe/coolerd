@@ -246,7 +246,8 @@ impl MainApp {
         trace!("Querying sources for zones {:?}", zone_config.ipmi_zones);
 
         let mut query_ipmi = || Ok(session.ipmi.lock().unwrap().get_temperature_readings()?);
-        let readings = read_zone_sources(zone_config, &mut query_ipmi, &read_source)?;
+        let failed_last = state.failed_sources();
+        let readings = read_zone_sources(zone_config, &failed_last, &mut query_ipmi, &read_source)?;
         let update = state.next_duty(zone_config, &readings);
         let dcycle_new = update.duty;
 

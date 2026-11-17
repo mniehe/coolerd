@@ -189,6 +189,11 @@ impl ZoneState {
         }
     }
 
+    /// Whether each source, in source order, failed in the last poll
+    pub fn failed_sources(&self) -> Vec<bool> {
+        self.sources.iter().map(|s| s.failed).collect()
+    }
+
     /// Compute the zone duty from one reading per source, in source order.
     /// Sources without `steps` are aggregated into the zone curve; each source
     /// with `steps` maps its reading through its own curve. A failed source
