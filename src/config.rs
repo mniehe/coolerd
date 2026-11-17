@@ -269,7 +269,13 @@ pub fn load_config(path: &Path) -> Result<Config> {
     let contents = fs::read_to_string(path)
         .map_err(|e| Error::Io { path: path.to_owned(), source: e })?;
 
-    let mut config: Config = toml::from_str(&contents)
+    parse_config(&contents, path)
+}
+
+/// Parse and validate the contents of a config file. The path is only used in
+/// error messages.
+pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
+    let mut config: Config = toml::from_str(contents)
         .map_err(|e| Error::ConfigParse { path: path.to_owned(), source: e })?;
 
     // Validate config
@@ -344,4 +350,172 @@ pub fn load_config(path: &Path) -> Result<Config> {
     }
 
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        std::path::Path,
+        super::{Aggregation, Config, LogLevel, parse_config, SessionType},
+        crate::error::{Error, Result},
+    };
+
+    const CONFIG_PATH: &str = "/etc/ipmi-fan-control.toml";
+
+    /// Build a TOML config with one zone. Each override replaces the default
+    /// value of its key or adds the key.
+    fn zone_toml(overrides: &[(&str, &str)]) -> String {
+        let mut fields = vec![
+            ("ipmi_zones", "[0]"),
+            ("sources", r#"[{ type = "ipmi", sensor = "CPU Temp" }]"#),
+            ("steps", "[{ temp = 40, dcycle = 40 }, { temp = 70, dcycle = 70 }]"),
+        ];
+
+        for &(key, value) in overrides {
+            match fields.iter_mut().find(|(k, _)| *k == key) {
+                Some(field) => field.1 = value,
+                None => fields.push((key, value)),
+            }
+        }
+
+        let body: String = fields.iter()
+            .map(|(k, v)| format!("{} = {}\n", k, v))
+            .collect();
+
+        format!("[[zones]]\n{}", body)
+    }
+
+    fn parse(contents: &str) -> Result<Config> {
+        parse_config(contents, Path::new(CONFIG_PATH))
+    }
+
+    fn validation_reason(contents: &str) -> String {
+        match parse(contents) {
+            Err(Error::ConfigValidation { path, reason }) => {
+                assert_eq!(path, Path::new(CONFIG_PATH));
+                reason
+            }
+            other => panic!("expected a validation error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sample_config_loads() {
+        let config = parse(include_str!("../config.sample.toml")).unwrap();
+
+        assert_eq!(config.zones.len(), 1);
+        assert_eq!(config.zones[0].ipmi_zones, [0, 1]);
+    }
+
+    #[test]
+    fn minimal_config_uses_defaults() {
+        let config = parse(&zone_toml(&[])).unwrap();
+
+        assert!(matches!(config.log_level, LogLevel::Info));
+        assert!(matches!(config.zones[0].aggregation, Aggregation::Maximum));
+        assert_eq!(config.zones[0].session.0, "default");
+        assert_eq!(config.sessions.0.len(), 1);
+        assert!(matches!(config.sessions.0["default"].0, SessionType::Local));
+    }
+
+    #[test]
+    fn ipmitool_session_arguments_parse() {
+        let contents = format!("{}\n[sessions]\n{}\n",
+            zone_toml(&[("session", r#""remote""#)]),
+            r#"remote = ["-I", "lanplus", "-H", "bmc.lan", "-U", "admin", "-P", "secret"]"#);
+        let config = parse(&contents).unwrap();
+
+        match &config.sessions.0["remote"].0 {
+            SessionType::Remote { hostname, username, password } => {
+                assert_eq!(hostname, "bmc.lan");
+                assert_eq!(username, "admin");
+                assert_eq!(password.0, "secret");
+            }
+            other => panic!("expected a remote session, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rejects_empty_zones() {
+        assert_eq!(validation_reason("zones = []\n"), "zones: must be non-empty");
+    }
+
+    #[test]
+    fn rejects_zero_interval() {
+        assert_eq!(validation_reason(&zone_toml(&[("interval", "0")])),
+            "zones[0].interval: must be greater than 0");
+    }
+
+    #[test]
+    fn rejects_empty_ipmi_zones() {
+        assert_eq!(validation_reason(&zone_toml(&[("ipmi_zones", "[]")])),
+            "zones[0].ipmi_zones: must be non-empty");
+    }
+
+    #[test]
+    fn rejects_empty_sources() {
+        assert_eq!(validation_reason(&zone_toml(&[("sources", "[]")])),
+            "zones[0].sources: must be non-empty");
+    }
+
+    #[test]
+    fn rejects_unknown_session() {
+        assert_eq!(validation_reason(&zone_toml(&[("session", r#""missing""#)])),
+            r#"zones[0].session: "missing" does not exist"#);
+    }
+
+    #[test]
+    fn rejects_average_top_zero() {
+        let aggregation = r#"{ type = "average", top = 0 }"#;
+
+        assert_eq!(validation_reason(&zone_toml(&[("aggregation", aggregation)])),
+            "zones[0].aggregation[type=average].top: must be greater than 0");
+    }
+
+    #[test]
+    fn rejects_non_increasing_temp() {
+        let steps = "[{ temp = 40, dcycle = 40 }, { temp = 40, dcycle = 50 }]";
+
+        assert_eq!(validation_reason(&zone_toml(&[("steps", steps)])),
+            "zones[0].steps[*].temp: values are not strictly increasing");
+    }
+
+    #[test]
+    fn rejects_decreasing_dcycle() {
+        let steps = "[{ temp = 40, dcycle = 50 }, { temp = 70, dcycle = 40 }]";
+
+        assert_eq!(validation_reason(&zone_toml(&[("steps", steps)])),
+            "zones[0].steps[*].dcycle: values are not increasing");
+    }
+
+    #[test]
+    fn rejects_dcycle_above_100() {
+        let steps = "[{ temp = 40, dcycle = 40 }, { temp = 70, dcycle = 101 }]";
+
+        assert_eq!(validation_reason(&zone_toml(&[("steps", steps)])),
+            "zones[0].steps[1].dcycle: invalid percentage: 101");
+    }
+
+    fn parse_error(contents: &str) -> String {
+        match parse(contents) {
+            Err(Error::ConfigParse { source, .. }) => source.to_string(),
+            other => panic!("expected a parse error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_key_in_source() {
+        let sources = r#"[{ type = "file", path = "/sys/temp", scale = 1 }]"#;
+        let message = parse_error(&zone_toml(&[("sources", sources)]));
+
+        assert!(message.contains("unknown field `scale`"), "{}", message);
+    }
+
+    #[test]
+    fn rejects_unknown_source_type() {
+        let sources = r#"[{ type = "thermometer", path = "/sys/temp" }]"#;
+        let message = parse_error(&zone_toml(&[("sources", sources)]));
+
+        assert!(message.contains("unknown variant `thermometer`"), "{}", message);
+    }
 }
