@@ -27,6 +27,7 @@ This project depends on:
 * the Rust compiler
 * [optional] smartmontools (for querying HDD/SSD drive temperatures)
 * [optional] hdparm (for querying Hitachi/HGST/WD drive temperatures while spun down)
+* [optional] nvidia-smi from the NVIDIA driver (for querying NVIDIA GPU temperatures). The `nvidia` source selects the card by PCI bus id or UUID; see [`config.sample.toml`](config.sample.toml). On NixOS, supply it through `extraPackages` as shown under [NixOS](#nixos).
 
 These packages can be installed from the system package manager:
 

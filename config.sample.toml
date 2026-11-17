@@ -63,6 +63,21 @@ sources = [
   # allows the HDD temperature to be queried even when the drive is spun down.
   # This requires hdparm to be installed.
   # { type = "hdparm", block_dev = "/dev/disk/by-id/..." },
+
+  # NVIDIA GPU source. This internally runs:
+  #
+  #   nvidia-smi -i <gpu> --query-gpu=temperature.gpu --format=csv,noheader,nounits
+  #
+  # and requires nvidia-smi from the installed NVIDIA driver. If nvidia-smi
+  # does not exit within 5 seconds, it is killed and the reading fails.
+  #
+  # Select the card by its PCI bus id or its UUID. A GPU index such as `0` is
+  # rejected, because the index order can change between boots. To list the
+  # bus ids and UUIDs, run:
+  #
+  #   nvidia-smi --query-gpu=pci.bus_id,uuid --format=csv
+  # { type = "nvidia", gpu = "00000000:81:00.0" },
+  # { type = "nvidia", gpu = "GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" },
 ]
 
 # Method of aggregating the temperatures from all of the sources. By default,
