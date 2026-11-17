@@ -952,10 +952,11 @@ mod tests {
     fn omit_key(contents: &str, key: &str) -> String {
         let prefix = format!("{} = ", key);
 
-        contents.lines()
+        let lines: Vec<&str> = contents.lines()
             .filter(|line| !line.starts_with(&prefix))
-            .map(|line| format!("{}\n", line))
-            .collect()
+            .collect();
+
+        lines.join("\n") + "\n"
     }
 
     #[test]
