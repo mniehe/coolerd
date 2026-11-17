@@ -123,9 +123,10 @@ here. Behaviour is proved by tests of pure functions.
 - A source that runs an external program keeps the spawn apart from the
   parsing of its output, as `parse_hdparm_output` does, so a test can cover
   the parsing without the binary.
-- A change to the config format updates `config.sample.toml`, `README.md` and
-  the `settings` example in `nix/module.nix` in the same change, because the
-  sample is the only reference users have.
+- A change to the config format updates `config.sample.toml` and `README.md`
+  in the same change, because the sample is the only reference users have. It
+  also updates the `settings` example in `nix/module.nix` when it alters a key
+  or a value that the example shows.
 - A program the daemon spawns must be on the unit's PATH. Add it to
   `runtimeDeps` in `nix/module.nix` and to the dependency list in `README.md`.
 - Raw IPMI bytes are named constants in `src/ipmi.rs`. A new one carries a
