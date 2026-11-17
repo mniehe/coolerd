@@ -130,17 +130,20 @@ fn parse_hdparm_source<T: AsRef<Path>>(block_dev: T) -> Result<u8> {
 }
 
 /// Parse the output of `nvidia-smi --query-gpu=temperature.gpu
-/// --format=csv,noheader,nounits` for one GPU. The output must be a single
-/// line holding an integer in degrees Celsius.
+/// --format=csv,noheader,nounits` for one GPU. The output must be one record
+/// of ASCII digits, the temperature in degrees Celsius, followed by at most
+/// one line ending.
 fn parse_nvidia_output(gpu: &str, stdout: &str) -> Result<u8> {
     let bad_data = || Error::NvidiaBadData { gpu: gpu.to_owned(), output: stdout.to_owned() };
-    let trimmed = stdout.trim();
+    let record = stdout.strip_suffix("\r\n")
+        .or_else(|| stdout.strip_suffix('\n'))
+        .unwrap_or(stdout);
 
-    if trimmed.lines().count() != 1 {
+    if record.is_empty() || !record.bytes().all(|b| b.is_ascii_digit()) {
         return Err(bad_data());
     }
 
-    let temperature = trimmed
+    let temperature = record
         .parse::<u32>()
         .map_err(|_| bad_data())?
         .try_into()
@@ -554,6 +557,30 @@ mod tests {
         let message = parse_nvidia_output(GPU, "[N/A]\n").unwrap_err().to_string();
 
         assert_eq!(message, r#"nvidia-smi reported bad data for GPU: 00000000:81:00.0: "[N/A]""#);
+    }
+
+    #[test]
+    fn nvidia_record_with_or_without_one_line_ending_gives_reading() {
+        for stdout in ["67", "67\n", "67\r\n"] {
+            assert_eq!(parse_nvidia_output(GPU, stdout).unwrap(), 67, "{:?}", stdout);
+        }
+    }
+
+    #[test]
+    fn nvidia_blank_lines_are_bad_data() {
+        assert_nvidia_bad_data("\n67\n");
+        assert_nvidia_bad_data("67\n\n");
+    }
+
+    #[test]
+    fn nvidia_sign_is_bad_data() {
+        assert_nvidia_bad_data("+0\n");
+    }
+
+    #[test]
+    fn nvidia_spaces_around_record_are_bad_data() {
+        assert_nvidia_bad_data(" 67\n");
+        assert_nvidia_bad_data("67 \n");
     }
 
     #[test]
