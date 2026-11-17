@@ -118,6 +118,10 @@ pub enum Source {
         // TOML can't encode OsString
         block_dev: String,
     },
+    Nvidia {
+        // PCI bus id or GPU UUID, as nvidia-smi -i accepts
+        gpu: String,
+    },
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -265,6 +269,42 @@ pub struct Config {
     pub zones: Vec<Zone>,
 }
 
+/// Whether `value` is exactly `len` hex digits, in either case
+fn is_hex_digits(value: &str, len: usize) -> bool {
+    value.len() == len && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Whether `gpu` is a full GPU UUID as nvidia-smi prints it:
+/// `GPU-` and hex groups of 8, 4, 4, 4 and 12 digits.
+fn is_gpu_uuid(gpu: &str) -> bool {
+    const GROUP_LENGTHS: [usize; 5] = [8, 4, 4, 4, 12];
+
+    let Some(uuid) = gpu.strip_prefix("GPU-") else {
+        return false;
+    };
+    let groups: Vec<&str> = uuid.split('-').collect();
+
+    groups.len() == GROUP_LENGTHS.len()
+        && groups.iter().zip(GROUP_LENGTHS).all(|(group, len)| is_hex_digits(group, len))
+}
+
+/// Whether `gpu` is a full PCI bus id, `DDDD:BB:DD.F` or `DDDDDDDD:BB:DD.F`,
+/// with hex domain, bus and device and a function from 0 to 7.
+fn is_pci_bus_id(gpu: &str) -> bool {
+    let parts: Vec<&str> = gpu.split(':').collect();
+    let [domain, bus, device_function] = parts[..] else {
+        return false;
+    };
+    let Some((device, function)) = device_function.split_once('.') else {
+        return false;
+    };
+
+    (is_hex_digits(domain, 4) || is_hex_digits(domain, 8))
+        && is_hex_digits(bus, 2)
+        && is_hex_digits(device, 2)
+        && matches!(function, "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7")
+}
+
 pub fn load_config(path: &Path) -> Result<Config> {
     let contents = fs::read_to_string(path)
         .map_err(|e| Error::Io { path: path.to_owned(), source: e })?;
@@ -309,6 +349,17 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
                 path: path.to_owned(),
                 reason: format!("zones[{}].sources: must be non-empty", i),
             });
+        }
+
+        for (j, source) in zone_config.sources.iter().enumerate() {
+            if let Source::Nvidia { gpu } = source {
+                if !is_gpu_uuid(gpu) && !is_pci_bus_id(gpu) {
+                    return Err(Error::ConfigValidation {
+                        path: path.to_owned(),
+                        reason: format!("zones[{}].sources[{}].gpu: select the card by PCI bus id or UUID: {:?}", i, j, gpu),
+                    });
+                }
+            }
         }
 
         if !config.sessions.0.contains_key(&zone_config.session.0) {
@@ -356,7 +407,7 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
 mod tests {
     use {
         std::path::Path,
-        super::{Aggregation, Config, LogLevel, parse_config, SessionType},
+        super::{Aggregation, Config, LogLevel, parse_config, SessionType, Source},
         crate::error::{Error, Result},
     };
 
@@ -554,5 +605,104 @@ mod tests {
         let message = parse_error(&zone_toml(&[("sources", sources)]));
 
         assert!(message.contains("unknown variant `thermometer`"), "{}", message);
+    }
+
+    /// Build a zone whose second source is an nvidia source with `gpu`
+    fn nvidia_zone_toml(gpu: &str) -> String {
+        // Debug quoting escapes `\n` and `"` the way a TOML basic string does
+        let sources = format!(r#"[{{ type = "ipmi", sensor = "CPU Temp" }}, {{ type = "nvidia", gpu = {:?} }}]"#, gpu);
+        zone_toml(&[("sources", &sources)])
+    }
+
+    fn assert_nvidia_gpu_loads(gpu: &str) {
+        let config = parse(&nvidia_zone_toml(gpu)).unwrap();
+
+        match &config.zones[0].sources[1] {
+            Source::Nvidia { gpu: loaded } => assert_eq!(loaded, gpu),
+            other => panic!("expected an nvidia source, got {:?}", other),
+        }
+    }
+
+    fn assert_nvidia_gpu_rejected(gpu: &str) {
+        assert_eq!(validation_reason(&nvidia_zone_toml(gpu)),
+            format!("zones[0].sources[1].gpu: select the card by PCI bus id or UUID: {:?}", gpu));
+    }
+
+    #[test]
+    fn accepts_nvidia_pci_bus_id() {
+        assert_nvidia_gpu_loads("00000000:81:00.0");
+    }
+
+    #[test]
+    fn accepts_nvidia_pci_bus_id_with_short_domain_and_mixed_case() {
+        assert_nvidia_gpu_loads("0000:aF:1f.7");
+    }
+
+    #[test]
+    fn accepts_nvidia_uuid() {
+        assert_nvidia_gpu_loads("GPU-3c1a2b4d-5E6F-7a8b-9c0d-1e2f3a4b5c6d");
+    }
+
+    #[test]
+    fn rejects_nvidia_index() {
+        assert_nvidia_gpu_rejected("0");
+    }
+
+    #[test]
+    fn rejects_nvidia_index_list() {
+        assert_nvidia_gpu_rejected("0,1");
+    }
+
+    #[test]
+    fn rejects_nvidia_empty_gpu() {
+        assert_nvidia_gpu_rejected("");
+    }
+
+    #[test]
+    fn rejects_nvidia_bare_uuid_prefix() {
+        assert_nvidia_gpu_rejected("GPU-");
+    }
+
+    #[test]
+    fn rejects_nvidia_bare_colon() {
+        assert_nvidia_gpu_rejected(":");
+    }
+
+    #[test]
+    fn rejects_nvidia_two_bus_ids() {
+        assert_nvidia_gpu_rejected("00000000:81:00.0,00000000:82:00.0");
+    }
+
+    #[test]
+    fn rejects_nvidia_malformed_bus_ids() {
+        for gpu in [
+            " 00000000:81:00.0",
+            "00000000:81:00.0\n",
+            "000:81:00.0",
+            "000000:81:00.0",
+            "00000000:181:00.0",
+            "00000000:81:0.0",
+            "00000000:81:00.8",
+            "00000000:81:00",
+            "0000000g:81:00.0",
+            "00000000:81:00:0",
+        ] {
+            assert_nvidia_gpu_rejected(gpu);
+        }
+    }
+
+    #[test]
+    fn rejects_nvidia_malformed_uuids() {
+        for gpu in [
+            "GPU-3c1a2b4d-5e6f-7a8b-9c0d-1e2f3a4b5c6",
+            "GPU-3c1a2b4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d7",
+            "GPU-3c1a2b4d5e6f-7a8b-9c0d-1e2f3a4b5c6d",
+            "GPU-3c1a2b4d-5e6f-7a8b-9c0d-1e2f3a4b5c6g",
+            "gpu-3c1a2b4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",
+            "3c1a2b4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",
+            "GPU-3c1a2b4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d-",
+        ] {
+            assert_nvidia_gpu_rejected(gpu);
+        }
     }
 }

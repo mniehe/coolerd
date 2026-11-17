@@ -332,6 +332,7 @@ pub fn get_source_readings(ipmi: Arc<Mutex<Ipmi>>, sources: &[Source])
                 Source::File { path } => parse_file_source(path),
                 Source::Smart { block_dev } => parse_smart_source(block_dev),
                 Source::Hdparm { block_dev } => parse_hdparm_source(block_dev),
+                Source::Nvidia { gpu } => read_nvidia_source(Path::new("nvidia-smi"), gpu),
             }
         })
         .collect()
