@@ -127,6 +127,26 @@ fn parse_hdparm_source<T: AsRef<Path>>(block_dev: T) -> Result<u8> {
     result
 }
 
+/// Parse the output of `nvidia-smi --query-gpu=temperature.gpu
+/// --format=csv,noheader,nounits` for one GPU. The output must be a single
+/// line holding an integer in degrees Celsius.
+fn parse_nvidia_output(gpu: &str, stdout: &str) -> Result<u8> {
+    let bad_data = || Error::NvidiaBadData { gpu: gpu.to_owned(), output: stdout.to_owned() };
+    let trimmed = stdout.trim();
+
+    if trimmed.lines().count() != 1 {
+        return Err(bad_data());
+    }
+
+    let temperature = trimmed
+        .parse::<u32>()
+        .map_err(|_| bad_data())?
+        .try_into()
+        .map_err(|_| Error::ReadingExceedsBounds)?;
+
+    Ok(temperature)
+}
+
 /// Get the temperature from a plain-text file (typically a sysfs path). The
 /// contents of the file should be a decimal-formatted integer in units of
 /// thousandths degrees Celsius after whitespace is trimmed. If the temperature,
@@ -238,11 +258,18 @@ mod tests {
             sync::atomic::{AtomicUsize, Ordering},
         },
         serde_json::json,
-        super::{parse_file_source, parse_hdparm_output, parse_smart_output, smart_reading},
+        super::{
+            parse_file_source,
+            parse_hdparm_output,
+            parse_nvidia_output,
+            parse_smart_output,
+            smart_reading,
+        },
         crate::error::Error,
     };
 
     const BLOCK_DEV: &str = "/dev/sda";
+    const GPU: &str = "00000000:81:00.0";
     const SMART_OUTPUT: &str = r#"{ "temperature": { "current": 41 } }"#;
     const MALFORMED_SMART_OUTPUT: &str = r#"{ "temperature": "#;
 
@@ -395,5 +422,47 @@ mod tests {
     #[test]
     fn file_temperature_above_u8_exceeds_bounds() {
         assert!(matches!(file_reading("256000"), Err(Error::ReadingExceedsBounds)));
+    }
+
+    fn assert_nvidia_bad_data(stdout: &str) {
+        let result = parse_nvidia_output(GPU, stdout);
+
+        assert!(matches!(&result,
+            Err(Error::NvidiaBadData { gpu, output }) if gpu == GPU && output == stdout),
+            "{:?}", result);
+    }
+
+    #[test]
+    fn nvidia_temperature_line() {
+        assert_eq!(parse_nvidia_output(GPU, "67\n").unwrap(), 67);
+    }
+
+    #[test]
+    fn nvidia_not_available_is_bad_data() {
+        assert_nvidia_bad_data("[N/A]\n");
+    }
+
+    #[test]
+    fn nvidia_empty_output_is_bad_data() {
+        assert_nvidia_bad_data("");
+    }
+
+    #[test]
+    fn nvidia_two_lines_are_bad_data() {
+        assert_nvidia_bad_data("67\n68\n");
+    }
+
+    #[test]
+    fn nvidia_bad_data_message_names_gpu_and_trimmed_output() {
+        let message = parse_nvidia_output(GPU, "[N/A]\n").unwrap_err().to_string();
+
+        assert_eq!(message, r#"nvidia-smi reported bad data for GPU: 00000000:81:00.0: "[N/A]""#);
+    }
+
+    #[test]
+    fn nvidia_temperature_above_u8_exceeds_bounds() {
+        let result = parse_nvidia_output(GPU, "300\n");
+
+        assert!(matches!(result, Err(Error::ReadingExceedsBounds)), "{:?}", result);
     }
 }

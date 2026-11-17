@@ -58,10 +58,20 @@ pub enum Error {
     HdparmNoData(PathBuf),
     #[error("hdparm reported bad data: {0:?}")]
     HdparmBadData(PathBuf),
+    #[error("nvidia-smi reported bad data for GPU: {gpu}: {:?}", .output.trim())]
+    NvidiaBadData {
+        gpu: String,
+        output: String,
+    },
     #[error("Failed to run: {command:?}: {status}")]
     Command {
         command: PathBuf,
         status: ExitStatus,
+    },
+    #[error("Timed out after {seconds} second(s): {command:?}")]
+    CommandTimeout {
+        command: String,
+        seconds: u64,
     },
     #[error("Failed all {attempts} attempt(s); last attempt error: {source}")]
     RetriesFailed {
