@@ -90,9 +90,10 @@ sources = [
 # Method of aggregating the temperatures of the sources without their own
 # `steps` into the zone temperature. By default, the maximum temperature is
 # used. It is also possible to use the average temperature, which divides by
-# the number of temperatures used. In case there are lower-bound outliers in
-# the temperature readings, the `top` parameter can be set to only consider the
-# `n` highest temperatures.
+# the number of temperatures used and rounds down. In case there are
+# lower-bound outliers in the temperature readings, the `top` parameter can be
+# set to only consider the `n` highest temperatures. This is ignored when every
+# source has its own `steps`.
 #aggregation = { type = "maximum" }
 #aggregation = { type = "average" }
 #aggregation = { type = "average", top = 3 }
@@ -127,9 +128,12 @@ steps = [
 ]
 
 # Method of combining the duty cycles of the zone's curves: the zone curve and
-# the curve of each source with `steps`. The default, maximum, follows the
-# hottest curve. Average takes the mean, and `top` limits it to the `n`
-# highest duty cycles.
+# the curve of each source with `steps`. The default, maximum, uses the highest
+# duty cycle of any curve. Average takes the mean, rounded up, and `top` limits
+# it to the `n` highest duty cycles. Each curve counts once, however many
+# sources feed it. Average can give a duty cycle below the highest one a curve
+# asks for, so the source behind that curve may run hotter than its curve
+# intends.
 #duty_aggregation = { type = "maximum" }
 #duty_aggregation = { type = "average" }
 

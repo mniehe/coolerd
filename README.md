@@ -84,11 +84,15 @@ sudo ./target/release/ipmi-fan-control --config config.toml
 Fan curves
 ----------
 
-Each zone sets one duty cycle from one or more curves. The sources without their own `steps` are combined by `aggregation` into the zone temperature, which the zone's `steps` map to a duty cycle. A source with its own `steps` skips the zone temperature and maps its reading through its own curve. When every source has its own `steps`, the zone has no temperature: the zone's `steps` and `aggregation` are ignored, and the zone's `steps` may be omitted. The zone then combines the duty cycles of all its curves by `duty_aggregation`: `maximum` (the default) or `average`.
+Each zone sets one duty cycle from one or more curves. The sources without their own `steps` are combined by `aggregation` into the zone temperature, which the zone's `steps` map to a duty cycle. A source with its own `steps` skips the zone temperature and maps its reading through its own curve; its `steps` must be non-empty. When every source has its own `steps`, the zone has no temperature: the zone's `steps` and `aggregation` are ignored, and the zone's `steps` may be omitted.
+
+The zone then combines the duty cycles of all its curves by `duty_aggregation`. `maximum`, the default, takes the highest duty cycle. `average` takes the mean, rounded up, and counts each curve once, however many sources feed it. The mean can be lower than the highest duty cycle, so the source behind the most demanding curve may run hotter than that curve intends.
+
+An `average` `aggregation` divides by the number of temperatures it used; `top` only caps that number. Earlier versions divided by `top` even when the zone had fewer sources, so a zone whose `top` exceeds its source count now runs its fans faster: readings of 80 °C and 80 °C with `top = 3` give 80 °C, where they gave 53 °C.
 
 `hysteresis` holds each curve's temperature through small falls. A curve follows a rise at once, but follows a fall only once it reaches `hysteresis` degrees. The default is 0, which follows every reading.
 
-In this example the CPU uses the zone curve and the GPU its own. At CPU 50 °C and GPU 70 °C, the curves give 54% and 60%, and the zone runs at 60%.
+In this example the CPU uses the zone curve and the GPU its own. At CPU 50 °C and GPU 70 °C, the curves give 54% and 60%, and the zone runs at 60% on the first poll. On later polls, `hysteresis` can hold a curve's temperature above its reading, so the duty cycle can be higher than the current readings alone give.
 
 ```toml
 [[zones]]
