@@ -288,8 +288,14 @@ fn is_gpu_uuid(gpu: &str) -> bool {
         && groups.iter().zip(GROUP_LENGTHS).all(|(group, len)| is_hex_digits(group, len))
 }
 
+/// Whether `device` is a PCI device number: two hex digits from 00 to 1f
+fn is_pci_device(device: &str) -> bool {
+    // The device number has five bits, so the first hex digit is 0 or 1
+    is_hex_digits(device, 2) && matches!(device.as_bytes()[0], b'0' | b'1')
+}
+
 /// Whether `gpu` is a full PCI bus id, `DDDD:BB:DD.F` or `DDDDDDDD:BB:DD.F`,
-/// with hex domain, bus and device and a function from 0 to 7.
+/// with hex domain and bus, a device from 00 to 1f and a function from 0 to 7.
 fn is_pci_bus_id(gpu: &str) -> bool {
     let parts: Vec<&str> = gpu.split(':').collect();
     let [domain, bus, device_function] = parts[..] else {
@@ -301,7 +307,7 @@ fn is_pci_bus_id(gpu: &str) -> bool {
 
     (is_hex_digits(domain, 4) || is_hex_digits(domain, 8))
         && is_hex_digits(bus, 2)
-        && is_hex_digits(device, 2)
+        && is_pci_device(device)
         && matches!(function, "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7")
 }
 
@@ -689,6 +695,27 @@ mod tests {
         ] {
             assert_nvidia_gpu_rejected(gpu);
         }
+    }
+
+    #[test]
+    fn accepts_nvidia_highest_pci_device() {
+        assert_nvidia_gpu_loads("0000:00:1f.0");
+    }
+
+    #[test]
+    fn rejects_nvidia_pci_device_above_1f() {
+        assert_nvidia_gpu_rejected("0000:00:20.0");
+        assert_nvidia_gpu_rejected("00000000:81:ff.0");
+    }
+
+    #[test]
+    fn rejects_nvidia_non_hex_bus() {
+        assert_nvidia_gpu_rejected("00000000:8g:00.0");
+    }
+
+    #[test]
+    fn rejects_nvidia_non_hex_device() {
+        assert_nvidia_gpu_rejected("00000000:81:0z.0");
     }
 
     #[test]
