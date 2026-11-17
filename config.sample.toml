@@ -78,13 +78,20 @@ sources = [
   #   nvidia-smi --query-gpu=pci.bus_id,uuid --format=csv
   # { type = "nvidia", gpu = "00000000:81:00.0" },
   # { type = "nvidia", gpu = "GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" },
+
+  # Any source can carry its own `steps`, with the same rules as the zone's
+  # `steps` below. Such a source maps its temperature through its own curve
+  # and does not feed the zone temperature. This suits a GPU, which runs
+  # hotter than a CPU and needs a curve of its own.
+  # { type = "nvidia", gpu = "00000000:81:00.0", steps = [{ temp = 60, dcycle = 40 }, { temp = 90, dcycle = 100 }] },
 ]
 
-# Method of aggregating the temperatures from all of the sources. By default,
-# the maximum temperature is used. It is also possible to use the average
-# temperature. In case there are lower-bound outliers in the temperature
-# readings, the `top` parameter can be set to only consider the `n` highest
-# temperatures.
+# Method of aggregating the temperatures of the sources without their own
+# `steps` into the zone temperature. By default, the maximum temperature is
+# used. It is also possible to use the average temperature, which divides by
+# the number of temperatures used. In case there are lower-bound outliers in
+# the temperature readings, the `top` parameter can be set to only consider the
+# `n` highest temperatures.
 #aggregation = { type = "maximum" }
 #aggregation = { type = "average" }
 #aggregation = { type = "average", top = 3 }
@@ -108,10 +115,27 @@ sources = [
 # Note that these rules mean that having a single step will result in a fixed
 # fan speed. Also, the list must be sorted, `temp` must be strictly increasing,
 # and `dcycle` must be increasing.
+#
+# These steps map the zone temperature. When every source has its own `steps`,
+# the zone has no temperature and this list may be empty. When some sources
+# have `steps` and others do not, this list must be non-empty.
 steps = [
   { temp = 40, dcycle = 40 },
   { temp = 70, dcycle = 70 }
 ]
+
+# Method of combining the duty cycles of the zone's curves: the zone curve and
+# the curve of each source with `steps`. The default, maximum, follows the
+# hottest curve. Average takes the mean, and `top` limits it to the `n`
+# highest duty cycles.
+#duty_aggregation = { type = "maximum" }
+#duty_aggregation = { type = "average" }
+
+# Degrees Celsius a curve's temperature must fall before its duty cycle follows.
+# A rise is always followed at once, so the fans speed up without delay but do
+# not slow down for a fall of less than this. Each curve holds its own
+# temperature. The default is 0, which follows every reading.
+#hysteresis = 3
 
 # More fan zones can be added
 #[[zones]]

@@ -81,6 +81,29 @@ sudo ./target/debug/ipmi-fan-control --config config.toml
 sudo ./target/release/ipmi-fan-control --config config.toml
 ```
 
+Fan curves
+----------
+
+Each zone sets one duty cycle from one or more curves. The sources without their own `steps` are combined by `aggregation` into the zone temperature, which the zone's `steps` map to a duty cycle. A source with its own `steps` skips the zone temperature and maps its reading through its own curve. The zone then combines the duty cycles of all its curves by `duty_aggregation`: `maximum` (the default) or `average`.
+
+`hysteresis` holds each curve's temperature through small falls. A curve follows a rise at once, but follows a fall only once it reaches `hysteresis` degrees. The default is 0, which follows every reading.
+
+In this example the CPU uses the zone curve and the GPU its own. At CPU 50 °C and GPU 70 °C, the curves give 54% and 60%, and the zone runs at 60%.
+
+```toml
+[[zones]]
+ipmi_zones = [0]
+sources = [
+  { type = "ipmi", sensor = "CPU Temp" },
+  { type = "nvidia", gpu = "00000000:81:00.0", steps = [{ temp = 60, dcycle = 40 }, { temp = 90, dcycle = 100 }] },
+]
+steps = [{ temp = 45, dcycle = 45 }, { temp = 75, dcycle = 100 }]
+duty_aggregation = { type = "maximum" }
+hysteresis = 3
+```
+
+See [`config.sample.toml`](config.sample.toml) for every key.
+
 NixOS
 -----
 

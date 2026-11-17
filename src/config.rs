@@ -528,6 +528,34 @@ mod tests {
     }
 
     #[test]
+    fn sample_source_with_steps_loads_when_uncommented() {
+        let sample = include_str!("../config.sample.toml");
+        let line = sample.lines()
+            .find(|l| l.contains(r#"type = "nvidia""#) && l.contains("steps = "))
+            .expect("the sample has a commented nvidia source with steps");
+        let uncommented = line.replacen("# ", "", 1);
+        let config = parse(&sample.replacen(line, &uncommented, 1)).unwrap();
+        let sources = &config.zones[0].sources;
+
+        assert!(matches!(sources.last().unwrap().kind, Source::Nvidia { .. }));
+        assert_eq!(sources.last().unwrap().steps.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn readme_curve_example_loads() {
+        let readme = include_str!("../README.md");
+        let start = readme.find("```toml\n").expect("the README has a TOML example") + "```toml\n".len();
+        let end = start + readme[start..].find("```").unwrap();
+        let config = parse(&readme[start..end]).unwrap();
+        let zone = &config.zones[0];
+
+        assert!(zone.sources[0].steps.is_none());
+        assert!(zone.sources[1].steps.is_some());
+        assert!(matches!(zone.duty_aggregation, Aggregation::Maximum));
+        assert_eq!(zone.hysteresis, 3);
+    }
+
+    #[test]
     fn minimal_config_uses_defaults() {
         let config = parse(&zone_toml(&[])).unwrap();
 
