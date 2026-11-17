@@ -19,8 +19,12 @@ diff.
 
 The Finishing work block applies when a person reads this session directly. An
 agent working from a brief follows its role prompt instead: it stops the way
-that prompt says and returns its packet with nothing around it. The
-confirmation list below it applies to every agent.
+that prompt says and returns its packet with nothing around it. The same
+holds for the closing summary above and for the completion rule under
+Verification: an agent working from a brief reports in the format its role
+prompt defines, still naming every behaviour change, and runs the Verification
+commands only when the brief has it deliver a change. The confirmation list
+below applies to every agent.
 
 ### Finishing work
 Please avoid stopping while you still owe work the user asked for. Be persistent and do not stop unless needed.
@@ -103,9 +107,9 @@ here. Behaviour is proved by tests of pure functions.
   `cargo fmt`: the tree is not rustfmt output, and formatting it would bury
   the real change in the diff.
 - Every fallible path returns a variant of `Error` in `src/error.rs`. Do not
-  panic or call `process::exit` outside `main`: only a normal return runs
-  `IpmiSession::drop`, which sets every zone to 100% and restores the fan
-  mode.
+  panic or call `process::exit` outside `main`: a return from `main_wrapper`,
+  with `Ok` or with an `Error`, is what runs `IpmiSession::drop`, which sets
+  every zone to 100% and restores the fan mode.
 - That shutdown path is the safety net. A change must keep it running on every
   exit, including a failed zone loop and a signal.
 - A duty cycle is a `u8` from 0 to 100. Validate it where it enters, in
@@ -117,8 +121,8 @@ here. Behaviour is proved by tests of pure functions.
 - Validation lives in `load_config` and names the key it rejects, in the form
   `zones[0].steps[1].dcycle: reason`.
 - A source that runs an external program keeps the spawn apart from the
-  parsing of its output, as `parse_hdparm_output` does, so the parsing has
-  tests that need no binary.
+  parsing of its output, as `parse_hdparm_output` does, so a test can cover
+  the parsing without the binary.
 - A change to the config format updates `config.sample.toml`, `README.md` and
   the `settings` example in `nix/module.nix` in the same change, because the
   sample is the only reference users have.
@@ -129,8 +133,8 @@ here. Behaviour is proved by tests of pure functions.
 - Each `unsafe` block carries a comment that says why it is sound, as the
   existing ones in `src/freeipmi.rs` do.
 - Tests live in a `#[cfg(test)] mod tests` block in the file they test. Write
-  the failing test first and watch it fail. The suite is small today, so a
-  change to untested logic first moves that logic into a pure function.
+  the failing test first and watch it fail. A change to untested logic first
+  moves that logic into a pure function.
 - Leave `/dist` alone unless a build dependency changes. It is upstream
   packaging that nothing here exercises.
 
@@ -149,8 +153,8 @@ nix build .#default      # when the change touches Cargo.toml, Cargo.lock, build
 ```
 
 Review every change to code or prompts before it is done and resolve every
-Must Fix. What changed sets the depth, unless a Researcher brief's REVIEW line
-says otherwise:
+Must Fix. What changed sets the depth, unless the brief an agent works from
+names another depth:
 
 | Change | Review |
 |---|---|
@@ -170,8 +174,8 @@ size calls for and then, unless that run's `Dimensions:` line already lists
 range. Do not add the flag to the first run: `--dimension` replaces the
 manifest's selection.
 
-Prompt files are what an agent reads as instructions: `AGENTS.md` and
-`.claude/review/*.md`.
+Prompt files are what an agent reads as instructions: `AGENTS.md`, its symlink
+`CLAUDE.md`, `.claude/review/*.md` and `.claude/review/review.yaml`.
 
 Critical paths, where a small mistake sends a wrong command to a BMC, leaves
 the fans slow, or breaks the deployed unit:

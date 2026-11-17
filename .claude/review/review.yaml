@@ -29,7 +29,7 @@ dimensions:
     criteria: prompt.md
     tags: [llm]
 
-max_dimensions: 4
+max_dimensions: 5
 
 verify_notes: |
   Run every cargo command through `nix develop -c`; a bare cargo cannot build
