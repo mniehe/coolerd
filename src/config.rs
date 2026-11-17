@@ -649,6 +649,31 @@ mod tests {
 
         assert!(matches!(sources.last().unwrap().kind, Source::Nvidia { .. }));
         assert_eq!(sources.last().unwrap().steps.as_ref().unwrap().len(), 2);
+        assert_eq!(sources.last().unwrap().on_failure, OnFailure::Dcycle { dcycle: 80 });
+    }
+
+    /// Every TOML block of the README
+    fn readme_toml_blocks() -> Vec<&'static str> {
+        const FENCE: &str = "```toml\n";
+
+        include_str!("../README.md")
+            .split(FENCE)
+            .skip(1)
+            .filter_map(|rest| rest.split_once("```").map(|(block, _)| block))
+            .collect()
+    }
+
+    #[test]
+    fn readme_on_failure_example_loads() {
+        let blocks = readme_toml_blocks();
+        let block = blocks.iter()
+            .find(|b| b.contains("on_failure"))
+            .expect("the README has a TOML example with on_failure");
+        let config = parse(block).unwrap();
+        let sources = &config.zones[0].sources;
+
+        assert_eq!(sources[0].on_failure, OnFailure::Exit {});
+        assert_eq!(sources[1].on_failure, OnFailure::Dcycle { dcycle: 80 });
     }
 
     #[test]

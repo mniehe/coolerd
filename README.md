@@ -84,7 +84,7 @@ sudo ./target/release/ipmi-fan-control --config config.toml
 Fan curves
 ----------
 
-Each zone sets one duty cycle from one or more curves. The sources without their own `steps` are combined by `aggregation` into the zone temperature, which the zone's `steps` map to a duty cycle. A source with its own `steps` skips the zone temperature and maps its reading through its own curve; its `steps` must be non-empty. When every source has its own `steps`, the zone has no temperature: the zone's `steps` and `aggregation` are ignored, and the zone's `steps` may be omitted.
+Each zone sets one duty cycle from one or more curves. The sources without their own `steps` are combined by `aggregation` into the zone temperature, which the zone's `steps` map to a duty cycle. A source with its own `steps` skips the zone temperature and maps its reading through its own curve; its `steps` must be non-empty. When every source has its own `steps`, the zone has no temperature: the zone's `steps` and `aggregation` are not used to compute the duty cycle, and the zone's `steps` may be omitted. Both are still validated when given.
 
 The zone then combines the duty cycles of all its curves by `duty_aggregation`. `maximum`, the default, takes the highest duty cycle. `average` takes the mean, rounded up, and counts each curve once, however many sources feed it. The mean can be lower than the highest duty cycle, so the source behind the most demanding curve may run hotter than that curve intends.
 
@@ -107,6 +107,33 @@ hysteresis = 3
 ```
 
 See [`config.sample.toml`](config.sample.toml) for every key.
+
+When a source fails
+-------------------
+
+A zone reads each source once per update. A source that fails is read again after `retry_delay_ms`, up to `retries` times; a source that read well is not read again. All sources of a zone share these retries in each update, so a source that uses them up leaves none for the sources after it, and an update waits no longer than `retries` times `retry_delay_ms`. Each attempt of an `nvidia` source can take up to 5 seconds before nvidia-smi is killed, so a hung driver adds up to 5 seconds per attempt. All `ipmi` sources of a zone are read in one IPMI query, and each sensor in it can fail on its own.
+
+When a source still fails after the last retry, its `on_failure` decides what the zone does:
+
+* `{ type = "exit" }`, the default: the program stops. On the way out it sets the fans of every zone to 100% and restores the original fan mode. Earlier versions handled every failure this way.
+* `{ type = "ignore" }`: the zone leaves the source out. Its reading does not enter the zone temperature, and its own curve gives no duty cycle. The other sources keep driving the fans.
+* `{ type = "dcycle", dcycle = N }`: the zone leaves the source out as with `ignore`, and runs at N% or more until the source reads again. The other curves can still raise the fans above N%.
+
+A zone in which no source has a reading runs at 100%, whatever the modes. The program logs one error when a source starts to fail and one message when it reads again. A source that fails in every update is still tried in every update, with its retries. While it fails, its curve keeps its last temperature, so `hysteresis` applies from there when it reads again.
+
+`ignore` has a risk: a hot device that cannot be read no longer raises the fans. Use `ignore` only for a source whose heat another source also measures, such as a second sensor on the same CPU. For a device that produces much heat, such as a GPU, use `dcycle` with a duty cycle that keeps the device cool under full load.
+
+In this example the GPU falls back to 80%. With the CPU at 50 °C, a failed GPU runs the zone at 80%, where `ignore` would run it at 54%, the CPU curve's duty cycle. With the CPU at 75 °C, the zone runs at 100% either way.
+
+```toml
+[[zones]]
+ipmi_zones = [0]
+sources = [
+  { type = "ipmi", sensor = "CPU Temp" },
+  { type = "nvidia", gpu = "00000000:81:00.0", steps = [{ temp = 60, dcycle = 40 }, { temp = 90, dcycle = 100 }], on_failure = { type = "dcycle", dcycle = 80 } },
+]
+steps = [{ temp = 45, dcycle = 45 }, { temp = 75, dcycle = 100 }]
+```
 
 NixOS
 -----

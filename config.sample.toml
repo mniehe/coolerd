@@ -25,9 +25,13 @@ ipmi_zones = [0, 1]
 # default interval is 1 second.
 interval = 1
 
-# Number of retries to query temperature source. If temperature readings are
-# still not successfully queried after all attempts, then the program will fail
-# and exit. The default is 2 retries (3 attempts in total).
+# Number of retries to query temperature sources in each update. Only a source
+# that fails is read again, and all sources of the zone share these retries, so
+# a source that uses them up leaves none for the sources after it. A source
+# that still fails after the last retry is handled by its `on_failure` (see the
+# sources below); by default, the program exits. Each attempt of an nvidia
+# source can take up to 5 seconds. The default is 2 retries (3 attempts in
+# total).
 #retries = 2
 
 # Number of milliseconds to wait before retrying when querying a temperature
@@ -84,7 +88,23 @@ sources = [
   # its temperature through its own curve and does not feed the zone
   # temperature. This suits a GPU, which runs hotter than a CPU and needs a
   # curve of its own.
-  # { type = "nvidia", gpu = "00000000:81:00.0", steps = [{ temp = 60, dcycle = 40 }, { temp = 90, dcycle = 100 }] },
+  #
+  # Any source can also carry `on_failure`, which decides what the zone does
+  # when the source still fails after its retries:
+  #
+  # * { type = "exit" }: The program exits, which sets the fans to 100% and
+  #   restores the original fan mode. This is the default.
+  # * { type = "ignore" }: The source is left out until it reads again, and
+  #   the other sources drive the fans. A hot device that cannot be read then
+  #   no longer raises the fans, so use this only for a source that another
+  #   source covers.
+  # * { type = "dcycle", dcycle = 80 }: The source is left out, and the zone
+  #   runs at 80% or more until the source reads again. Use this for a device
+  #   that produces much heat, such as a GPU.
+  #
+  # A zone in which no source has a reading runs at 100%. A failing source is
+  # still tried in every update.
+  # { type = "nvidia", gpu = "00000000:81:00.0", steps = [{ temp = 60, dcycle = 40 }, { temp = 90, dcycle = 100 }], on_failure = { type = "dcycle", dcycle = 80 } },
 ]
 
 # Method of aggregating the temperatures of the sources without their own
@@ -92,8 +112,9 @@ sources = [
 # used. It is also possible to use the average temperature, which divides by
 # the number of temperatures used and rounds down. In case there are
 # lower-bound outliers in the temperature readings, the `top` parameter can be
-# set to only consider the `n` highest temperatures. This is ignored when every
-# source has its own `steps`.
+# set to only consider the `n` highest temperatures. When every source has its
+# own `steps`, this is not used to compute the duty cycle, but it is still
+# validated.
 #aggregation = { type = "maximum" }
 #aggregation = { type = "average" }
 #aggregation = { type = "average", top = 3 }
@@ -119,9 +140,10 @@ sources = [
 # and `dcycle` must be increasing.
 #
 # These steps map the zone temperature. When every source has its own `steps`,
-# the zone has no temperature, so this list and `aggregation` are ignored and
-# this list may be omitted. Otherwise this list is required, and when some
-# sources have `steps` and others do not, it must be non-empty.
+# the zone has no temperature, so this list and `aggregation` are not used to
+# compute the duty cycle, and this list may be omitted. They are still
+# validated when given. Otherwise this list is required, and when some sources
+# have `steps` and others do not, it must be non-empty.
 steps = [
   { temp = 40, dcycle = 40 },
   { temp = 70, dcycle = 70 }
