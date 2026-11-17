@@ -361,7 +361,7 @@ fn parse_file_source<T: AsRef<Path>>(path: T) -> Result<u8> {
 /// Get the temperature of one IPMI sensor from the readings of every
 /// temperature sensor. This function fails if the sensor is missing or has no
 /// reading, if its unit is not degrees Celsius, or if its value is not a
-/// number that fits in a [`u8`].
+/// number from 0 to 255. A fractional value is truncated.
 fn ipmi_sensor_temp(sensor: &str, readings: &HashMap<String, Option<SensorReading>>) -> Result<u8> {
     let reading = match readings.get(sensor) {
         Some(Some(r)) => r,
@@ -376,14 +376,30 @@ fn ipmi_sensor_temp(sensor: &str, readings: &HashMap<String, Option<SensorReadin
         });
     }
 
-    match reading.value {
+    let temperature = match reading.value {
         SensorValue::Uint32(t) => t.try_into().ok(),
-        SensorValue::Double(t) => (t as u32).try_into().ok(),
+        SensorValue::Double(t) => double_to_temp(t),
         v => return Err(Error::SensorBadValue {
             sensor: sensor.into(),
             value: v,
         }),
-    }.ok_or(Error::ReadingExceedsBounds)
+    };
+
+    temperature.ok_or_else(|| Error::SensorValueOutOfRange {
+        sensor: sensor.into(),
+        value: reading.value,
+    })
+}
+
+/// Truncate a sensor's floating-point value to a temperature. Returns `None`
+/// for a value that is not a number, is negative, or is 256 or more, which a
+/// cast would turn into 0 or 255 and pass as a reading.
+fn double_to_temp(value: f64) -> Option<u8> {
+    if !(0.0..256.0).contains(&value) {
+        return None;
+    }
+
+    Some(value as u8)
 }
 
 /// Read one source that is not an IPMI sensor
@@ -1596,6 +1612,41 @@ mod tests {
         assert!(matches!(ipmi_sensor_temp("Fahrenheit", &readings),
             Err(Error::SensorBadUnits { units: SensorUnits::Fahrenheit, .. })));
         assert!(matches!(ipmi_sensor_temp("Switch", &readings), Err(Error::SensorBadValue { .. })));
-        assert!(matches!(ipmi_sensor_temp("Hot", &readings), Err(Error::ReadingExceedsBounds)));
+        assert!(matches!(ipmi_sensor_temp("Hot", &readings),
+            Err(Error::SensorValueOutOfRange { sensor, value: SensorValue::Uint32(256) }) if sensor == "Hot"));
+    }
+
+    fn double(value: f64) -> Option<SensorReading> {
+        Some(SensorReading { value: SensorValue::Double(value), units: SensorUnits::Celsius })
+    }
+
+    #[test]
+    fn ipmi_value_outside_u8_is_out_of_range() {
+        let cases = [
+            ("NaN", f64::NAN),
+            ("Infinite", f64::INFINITY),
+            ("Negative infinite", f64::NEG_INFINITY),
+            ("Negative", -1.0),
+            ("Fraction below zero", -0.5),
+            ("Too hot", 256.0),
+            ("Far too hot", 1e20),
+        ];
+        let readings = sensor_map(&cases.map(|(name, value)| (name, double(value))));
+
+        let wrong: Vec<_> = cases.iter()
+            .map(|(name, _)| (name, ipmi_sensor_temp(name, &readings)))
+            .filter(|(name, result)| !matches!(result,
+                Err(Error::SensorValueOutOfRange { sensor, value: SensorValue::Double(_) }) if sensor == *name))
+            .collect();
+
+        assert!(wrong.is_empty(), "{:?}", wrong);
+    }
+
+    #[test]
+    fn ipmi_fraction_below_256_truncates() {
+        let readings = sensor_map(&[("Zero", double(0.0)), ("Highest", double(255.9))]);
+
+        assert_eq!(ipmi_sensor_temp("Zero", &readings).unwrap(), 0);
+        assert_eq!(ipmi_sensor_temp("Highest", &readings).unwrap(), 255);
     }
 }

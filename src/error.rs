@@ -43,6 +43,11 @@ pub enum Error {
         sensor: String,
         value: SensorValue,
     },
+    #[error("Sensor value is not a temperature from 0 to 255: {sensor}: {value:?}")]
+    SensorValueOutOfRange {
+        sensor: String,
+        value: SensorValue,
+    },
     #[error("Sensor reading not available: {0}")]
     SensorNoReading(String),
     #[error("Temperature reading out of bounds")]
