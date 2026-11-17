@@ -294,6 +294,22 @@ mod tests {
     }
 
     #[test]
+    fn rise_smaller_than_hysteresis_is_followed_from_a_held_temperature() {
+        let mut zone = zone(&HOLD_STEPS, vec![plain()]);
+        zone.hysteresis = 5;
+
+        assert_eq!(duties(&zone, &[&[60], &[58], &[62]]), [70, 70, 73]);
+    }
+
+    #[test]
+    fn rise_smaller_than_hysteresis_is_followed() {
+        let mut zone = zone(&HOLD_STEPS, vec![plain()]);
+        zone.hysteresis = 5;
+
+        assert_eq!(duties(&zone, &[&[60], &[61]]), [70, 71]);
+    }
+
+    #[test]
     fn fall_equal_to_hysteresis_is_followed() {
         let mut zone = zone(&HOLD_STEPS, vec![plain()]);
         zone.hysteresis = 5;
