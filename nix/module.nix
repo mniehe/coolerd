@@ -22,10 +22,8 @@ with lib; let
       freeipmi
     ]
     ++ optional cfg.enableSmartMonTools smartmontools
-    ++ optional cfg.enableHdparm hdparm;
-
-  # Path with all runtime dependencies
-  runtimePath = lib.makeBinPath runtimeDeps;
+    ++ optional cfg.enableHdparm hdparm
+    ++ cfg.extraPackages;
 in {
   options.services.ipmi-fan-control = {
     enable = mkEnableOption "IPMI fan control service";
@@ -86,6 +84,13 @@ in {
       type = types.bool;
       default = false;
       description = "Enable support for querying Hitachi/HGST/WD drive temperatures while spun down";
+    };
+
+    extraPackages = mkOption {
+      type = types.listOf types.package;
+      default = [];
+      example = literalExpression "[(lib.getBin config.hardware.nvidia.package)]";
+      description = "Extra packages to put on the service's PATH, such as the package that provides nvidia-smi";
     };
   };
 
@@ -155,8 +160,6 @@ in {
         AmbientCapabilities =
           lib.optionals (cfg.enableSmartMonTools || cfg.enableHdparm) ["CAP_SYS_RAWIO"]
           ++ lib.optionals cfg.enableSmartMonTools ["CAP_SYS_ADMIN"];
-        # Ensure the binary can find all runtime dependencies
-        Environment = "PATH=${runtimePath}:$PATH";
       };
     };
   };

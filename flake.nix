@@ -17,8 +17,54 @@
           inherit system;
           overlays = [self.overlays.default];
         };
+        lib = nixpkgs.lib;
+
+        # Evaluate a minimal host that enables the service, plus one extra module
+        evalHost = extraModule:
+          (lib.nixosSystem {
+            modules = [
+              self.nixosModules.default
+              {
+                nixpkgs.hostPlatform = system;
+                nixpkgs.overlays = [self.overlays.default];
+                fileSystems."/".device = "/dev/null";
+                boot.loader.grub.enable = false;
+                services.ipmi-fan-control.enable = true;
+              }
+              extraModule
+            ];
+          }).config;
+
+        withExtra = evalHost ({pkgs, ...}: {
+          services.ipmi-fan-control.extraPackages = [pkgs.hello];
+        });
+        withoutExtra = evalHost {};
+
+        hasPackage = name: packages: lib.any (p: lib.getName p == name) packages;
+        unit = host: host.systemd.services.ipmi-fan-control;
+        hasPathEntry = host:
+          lib.any (lib.hasPrefix "PATH=")
+          (lib.toList ((unit host).serviceConfig.Environment or []));
+
+        moduleFailures =
+          lib.optional (!hasPackage "hello" (unit withExtra).path)
+          "extraPackages: hello is not in the unit path"
+          ++ lib.optional (hasPathEntry withExtra)
+          "serviceConfig.Environment sets PATH"
+          ++ lib.optional (!hasPackage "freeipmi" (unit withoutExtra).path)
+          "default: freeipmi is not in the unit path"
+          ++ lib.optional (withoutExtra.services.ipmi-fan-control.extraPackages != [])
+          "default: extraPackages is not empty";
       in {
         formatter = pkgs.alejandra;
+
+        checks = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          module-eval = pkgs.runCommand "module-eval" {} ''
+            ${lib.concatMapStrings (m: "echo ${lib.escapeShellArg m} >&2\n") moduleFailures}
+            ${lib.optionalString (moduleFailures != []) "exit 1"}
+            touch $out
+          '';
+        };
 
         packages = {
           default = pkgs.ipmi-fan-control;

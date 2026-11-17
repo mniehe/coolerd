@@ -79,3 +79,16 @@ sudo ./target/debug/ipmi-fan-control --config config.toml
 # Release
 sudo ./target/release/ipmi-fan-control --config config.toml
 ```
+
+NixOS
+-----
+
+This flake provides a NixOS module, `nixosModules.default`, and an overlay, `overlays.default`, that adds the package. The module's options live under `services.ipmi-fan-control`. The module puts freeipmi on the service's `PATH`, plus smartmontools and hdparm when `enableSmartMonTools` and `enableHdparm` are set.
+
+A source that runs another program needs that program on the service's `PATH`. Add its package to `extraPackages`. For example, to make `nvidia-smi` available:
+
+```nix
+services.ipmi-fan-control.extraPackages = [(lib.getBin config.hardware.nvidia.package)];
+```
+
+_Note_: The attribute that holds `nvidia-smi` depends on the host's driver package. `config.hardware.nvidia.package` is the driver that `hardware.nvidia` installs; a host that installs the driver another way must name that package instead.
