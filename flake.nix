@@ -21,7 +21,7 @@
 
         # Evaluate a minimal host that enables the service, plus one extra module
         evalHost = extraModule:
-          (lib.nixosSystem {
+          lib.nixosSystem {
             modules = [
               self.nixosModules.default
               {
@@ -33,27 +33,65 @@
               }
               extraModule
             ];
-          }).config;
+          };
 
-        withExtra = evalHost ({pkgs, ...}: {
-          services.ipmi-fan-control.extraPackages = [pkgs.hello];
-        });
-        withoutExtra = evalHost {};
+        # Each host names the packages whose bin directory must be on the unit's PATH
+        hosts = {
+          default = {
+            nixos = evalHost {};
+            expected = p: [p.freeipmi];
+          };
+          extra = {
+            nixos = evalHost ({pkgs, ...}: {
+              services.ipmi-fan-control.extraPackages = [pkgs.hello];
+            });
+            expected = p: [p.freeipmi p.hello];
+          };
+          drives = {
+            nixos = evalHost ({pkgs, ...}: {
+              services.ipmi-fan-control = {
+                enableSmartMonTools = true;
+                enableHdparm = true;
+                extraPackages = [pkgs.hello];
+              };
+            });
+            expected = p: [p.freeipmi p.smartmontools p.hdparm p.hello];
+          };
+        };
 
         hasPackage = name: packages: lib.any (p: lib.getName p == name) packages;
-        unit = host: host.systemd.services.ipmi-fan-control;
-        hasPathEntry = host:
-          lib.any (lib.hasPrefix "PATH=")
+        unit = host: host.nixos.config.systemd.services.ipmi-fan-control;
+        unitText = host: host.nixos.config.systemd.units."ipmi-fan-control.service".text;
+
+        # PATH= at the start of a value or after a space or quote, so LD_LIBRARY_PATH= does not count
+        assignsPath = s: builtins.match "(.*[ \"])?PATH=.*" s != null;
+        envSetsPath = host:
+          lib.any (v: lib.isString v && assignsPath v)
           (lib.toList ((unit host).serviceConfig.Environment or []));
+        pathLines = host:
+          lib.filter (line: lib.hasPrefix "Environment=" line && assignsPath (lib.removePrefix "Environment=" line))
+          (lib.splitString "\n" (unitText host));
+
+        # environment.PATH is what the unit file sets; a forced value there bypasses the path option
+        effectivePath = host: lib.splitString ":" ((unit host).environment.PATH or "");
+        missingFromPath = host:
+          lib.filter (p: !lib.elem (lib.makeBinPath [p]) (effectivePath host))
+          (host.expected host.nixos.pkgs);
+
+        hostFailures = name: host:
+          map (p: "${name}: ${lib.getName p} is not on the effective unit PATH") (missingFromPath host)
+          ++ lib.optional (envSetsPath host)
+          "${name}: serviceConfig.Environment sets PATH"
+          ++ lib.optional (lib.length (pathLines host) != 1)
+          "${name}: the unit file does not assign PATH exactly once";
 
         moduleFailures =
-          lib.optional (!hasPackage "hello" (unit withExtra).path)
+          lib.concatLists (lib.mapAttrsToList hostFailures hosts)
+          ++ lib.optional (!hasPackage "hello" (unit hosts.extra).path)
           "extraPackages: hello is not in the unit path"
-          ++ lib.optional (hasPathEntry withExtra)
-          "serviceConfig.Environment sets PATH"
-          ++ lib.optional (!hasPackage "freeipmi" (unit withoutExtra).path)
+          ++ lib.optional (!hasPackage "freeipmi" (unit hosts.default).path)
           "default: freeipmi is not in the unit path"
-          ++ lib.optional (withoutExtra.services.ipmi-fan-control.extraPackages != [])
+          ++ lib.optional (hosts.default.nixos.config.services.ipmi-fan-control.extraPackages != [])
           "default: extraPackages is not empty";
       in {
         formatter = pkgs.alejandra;
