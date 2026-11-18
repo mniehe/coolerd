@@ -808,6 +808,24 @@ mod tests {
     }
 
     #[test]
+    fn sample_zone_with_named_curve_loads_when_uncommented() {
+        const ZONE_STEPS: &str = "steps = [\n  { temp = 40, dcycle = 40 },\n  { temp = 70, dcycle = 70 }\n]\n";
+        let sample = include_str!("../config.sample.toml");
+        let line = sample.lines()
+            .find(|l| l.starts_with("#curve = "))
+            .expect("the sample has a commented zone curve");
+        assert!(sample.contains(ZONE_STEPS), "the sample has the zone steps");
+        // The zone names the curve in place of its own steps
+        let edited = sample.replacen(ZONE_STEPS, "", 1).replacen(line, &line[1..], 1);
+        let config = parse(&edited).unwrap();
+        let zone = &config.zones[0];
+        let name = zone.curve.as_ref().unwrap();
+
+        assert_eq!(zone.steps.as_ref().unwrap().len(), config.curves[name].steps.len());
+        assert_eq!(zone.curve_hysteresis, Some(config.curves[name].hysteresis));
+    }
+
+    #[test]
     fn sample_source_with_steps_loads_when_uncommented() {
         let sample = include_str!("../config.sample.toml");
         let line = sample.lines()

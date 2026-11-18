@@ -207,9 +207,10 @@ steps = [
 ]
 
 # In place of `steps`, the zone can name a curve from the `curves` section
-# with `curve`, here one defined as `[curves.cpu]`. The zone cannot have both.
-# The rules above for the zone's `steps` apply to the named curve's steps.
-#curve = "cpu"
+# with `curve`, here the `gpu` curve defined above. The zone cannot have both,
+# so remove `steps` when you set `curve`. The rules above for the zone's
+# `steps` apply to the named curve's steps.
+#curve = "gpu"
 
 # Method of combining the duty cycles of the zone's curves: the zone curve and
 # the curve of each source with `steps`. The default, maximum, uses the highest
