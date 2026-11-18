@@ -604,10 +604,12 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
             if let Some(steps) = &source.steps {
                 // An empty curve gives 100%, which an average would dilute
                 if steps.is_empty() {
-                    return Err(Error::ConfigValidation {
-                        path: path.to_owned(),
-                        reason: format!("zones[{}].sources[{}].steps: must be non-empty; remove the key to use the zone's steps", i, j),
-                    });
+                    let reason = match &source.curve {
+                        Some(name) => format!("zones[{}].sources[{}].curve: curve {:?} has empty steps", i, j, name),
+                        None => format!("zones[{}].sources[{}].steps: must be non-empty; remove the key to use the zone's steps", i, j),
+                    };
+
+                    return Err(Error::ConfigValidation { path: path.to_owned(), reason });
                 }
 
                 check_steps(steps, &format!("zones[{}].sources[{}].steps", i, j))
@@ -628,10 +630,12 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
         let empty_zone_steps = matches!(&zone_config.steps, Some(steps) if steps.is_empty());
 
         if any_with_steps && any_without_steps && empty_zone_steps {
-            return Err(Error::ConfigValidation {
-                path: path.to_owned(),
-                reason: format!("zones[{}].steps: must be non-empty when a source has no steps", i),
-            });
+            let reason = match &zone_config.curve {
+                Some(name) => format!("zones[{}].curve: curve {:?} has empty steps; the zone curve must be non-empty when a source has no steps", i, name),
+                None => format!("zones[{}].steps: must be non-empty when a source has no steps", i),
+            };
+
+            return Err(Error::ConfigValidation { path: path.to_owned(), reason });
         }
     }
 
@@ -1653,8 +1657,17 @@ mod tests {
         let sources = r#"[{ type = "file", path = "/sys/temp", curve = "gpu" }]"#;
         let contents = with_gpu_curve(&zone_toml(&[("sources", sources)]), "[]", "");
 
+        assert_eq!(validation_reason(&contents), r#"zones[0].sources[0].curve: curve "gpu" has empty steps"#);
+    }
+
+    #[test]
+    fn rejects_empty_named_zone_curve_when_a_source_has_no_steps() {
+        let sources = format!(r#"[{{ type = "ipmi", sensor = "CPU Temp" }}, {{ type = "file", path = "/sys/temp", steps = {} }}]"#, GPU_STEPS);
+        let zone = omit_key(&zone_toml(&[("sources", &sources), ("curve", r#""gpu""#)]), "steps");
+        let contents = with_gpu_curve(&zone, "[]", "");
+
         assert_eq!(validation_reason(&contents),
-            "zones[0].sources[0].steps: must be non-empty; remove the key to use the zone's steps");
+            r#"zones[0].curve: curve "gpu" has empty steps; the zone curve must be non-empty when a source has no steps"#);
     }
 
     #[test]
