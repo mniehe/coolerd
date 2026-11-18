@@ -18,6 +18,8 @@ use {
             Arc,
             atomic::{AtomicBool, Ordering},
             Mutex,
+            MutexGuard,
+            PoisonError,
         },
     },
     clap::Parser,
@@ -63,6 +65,12 @@ async fn interrupted() -> io::Result<()> {
     Ok(())
 }
 
+/// Lock `mutex`, also when a thread panicked while holding it. A panic in one
+/// zone task must not stop the shutdown path from setting the fans to 100%.
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 struct IpmiSession {
     /// Session name (for logging only)
     name: String,
@@ -101,7 +109,7 @@ impl IpmiSession {
 
 impl Drop for IpmiSession {
     fn drop(&mut self) {
-        let mut ipmi_lock = self.ipmi.lock().unwrap();
+        let mut ipmi_lock = lock_or_recover(&self.ipmi);
 
         for z in &self.restore_zones {
             info!("[{}] Setting zone {} duty cycle to 100%", self.name, z);
@@ -249,7 +257,7 @@ impl MainApp {
     ) -> Result<()> {
         trace!("Querying sources for zones {:?}", zone_config.ipmi_zones);
 
-        let mut query_ipmi = || Ok(session.ipmi.lock().unwrap().get_temperature_readings()?);
+        let mut query_ipmi = || Ok(lock_or_recover(&session.ipmi).get_temperature_readings()?);
         let failed_last = state.failed_sources();
         let readings = read_zone_sources(zone_config, &failed_last, &mut query_ipmi,
             &mut |index, source| readers.read(index, source))?;
@@ -258,7 +266,7 @@ impl MainApp {
 
         Self::log_transitions(&session.name, zone_config, &update.transitions);
 
-        let mut ipmi_lock = session.ipmi.lock().unwrap();
+        let mut ipmi_lock = lock_or_recover(&session.ipmi);
 
         for z in &zone_config.ipmi_zones {
             let dcycle_cur = ipmi_lock.get_duty_cycle(*z)?;
@@ -354,5 +362,34 @@ async fn main() {
             }
             process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        std::{
+            sync::{Arc, Mutex},
+            thread,
+        },
+        super::lock_or_recover,
+    };
+
+    #[test]
+    fn lock_recovers_a_poisoned_mutex() {
+        let mutex = Arc::new(Mutex::new(1u8));
+        let holder = mutex.clone();
+
+        let panicked = thread::spawn(move || {
+            let _guard = holder.lock().unwrap();
+            panic!("panic while holding the lock");
+        }).join();
+
+        assert!(panicked.is_err());
+        assert!(mutex.is_poisoned());
+
+        let mut guard = lock_or_recover(&mutex);
+        *guard += 1;
+        assert_eq!(*guard, 2);
     }
 }
