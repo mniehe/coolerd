@@ -8,6 +8,8 @@ jobs:
   build:
     name: Build project
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -60,10 +62,10 @@ jobs:
         uses: cachix/install-nix-action@v31.11.5
 
       - name: Check flake
-        run: nix flake check
+        run: nix flake check --no-update-lock-file
 
       - name: Build package
-        run: nix build .#default
+        run: nix build --no-update-lock-file .#default
 
   actions_lock:
     name: Verify actions lockfile
