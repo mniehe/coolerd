@@ -469,6 +469,9 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
     config.sessions.0.entry(SessionName::default().0)
         .or_default();
 
+    check_sessions(&config.sessions)
+        .map_err(|reason| Error::ConfigValidation { path: path.to_owned(), reason })?;
+
     if config.zones.is_empty() {
         return Err(Error::ConfigValidation {
             path: path.to_owned(),
@@ -585,6 +588,30 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
     }
 
     Ok(config)
+}
+
+/// Check that no setting of a remote session holds a NUL byte, which a C string
+/// cannot carry to freeipmi. The reason never shows the value, which may be a
+/// password. Sessions are checked in name order, so the same config always
+/// gives the same reason.
+fn check_sessions(sessions: &Sessions) -> Result<(), String> {
+    let mut names: Vec<&String> = sessions.0.keys().collect();
+    names.sort();
+
+    for name in names {
+        let SessionType::Remote { hostname, username, password } = &sessions.0[name].0 else {
+            continue;
+        };
+        let settings = [("hostname", hostname), ("username", username), ("password", &password.0)];
+
+        for (key, value) in settings {
+            if value.contains('\0') {
+                return Err(format!("sessions.{}.{}: must not contain a NUL byte", name, key));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Check a curve's steps. `key` names the list in the reason, such as
@@ -758,6 +785,48 @@ mod tests {
             }
             other => panic!("expected a remote session, got {:?}", other),
         }
+    }
+
+    /// A config whose zone uses a remote session named `bmc` with the given
+    /// hostname, username and password, each a TOML basic string body
+    fn remote_session_toml(hostname: &str, username: &str, password: &str) -> String {
+        format!("{}\n[sessions]\nbmc = {{ type = \"remote\", hostname = \"{}\", username = \"{}\", password = \"{}\" }}\n",
+            zone_toml(&[("session", r#""bmc""#)]), hostname, username, password)
+    }
+
+    #[test]
+    fn accepts_remote_session() {
+        let config = parse(&remote_session_toml("bmc.lan", "admin", "secret")).unwrap();
+
+        assert!(matches!(config.sessions.0["bmc"].0, SessionType::Remote { .. }));
+    }
+
+    #[test]
+    fn rejects_nul_in_session_hostname() {
+        assert_eq!(validation_reason(&remote_session_toml(r"bmc\u0000.lan", "admin", "secret")),
+            "sessions.bmc.hostname: must not contain a NUL byte");
+    }
+
+    #[test]
+    fn rejects_nul_in_session_username() {
+        assert_eq!(validation_reason(&remote_session_toml("bmc.lan", r"ad\u0000min", "secret")),
+            "sessions.bmc.username: must not contain a NUL byte");
+    }
+
+    #[test]
+    fn rejects_nul_in_session_password_without_naming_it() {
+        let reason = validation_reason(&remote_session_toml("bmc.lan", "admin", r"sec\u0000ret"));
+
+        assert_eq!(reason, "sessions.bmc.password: must not contain a NUL byte");
+    }
+
+    #[test]
+    fn rejects_nul_in_ipmitool_session_arguments() {
+        let contents = format!("{}\n[sessions]\n{}\n",
+            zone_toml(&[("session", r#""remote""#)]),
+            r#"remote = ["-I", "lanplus", "-H", "bmc.lan", "-U", "admin", "-P", "sec\u0000ret"]"#);
+
+        assert_eq!(validation_reason(&contents), "sessions.remote.password: must not contain a NUL byte");
     }
 
     #[test]

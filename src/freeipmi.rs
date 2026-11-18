@@ -48,6 +48,10 @@ pub enum Error {
     },
     #[error("Failed to execute command: {0}")]
     CommandFailed(String),
+    #[error("Session {field} contains a NUL byte")]
+    NulByte {
+        field: &'static str,
+    },
 }
 
 type Result<T, E = Error> = result::Result<T, E>;
@@ -79,6 +83,12 @@ pub struct SensorReading {
 /// ipmi_*_errormsg() functions.
 unsafe fn from_static_utf8_cstr(ptr: *const i8) -> Result<&'static str> {
     Ok(CStr::from_ptr(ptr).to_str()?)
+}
+
+/// Convert the session setting `field` to a C string. The error names only the
+/// field, so that a password never reaches a log.
+fn session_cstring(field: &'static str, value: &str) -> Result<CString> {
+    CString::new(value).map_err(|_| Error::NulByte { field })
 }
 
 /// Low-level wrapper for libfreeipmi context.
@@ -143,9 +153,9 @@ impl LfiCtx {
         username: &str,
         password: &str,
     ) -> Result<()> {
-        let hostname_cstr = CString::new(hostname).unwrap();
-        let username_cstr = CString::new(username).unwrap();
-        let password_cstr = CString::new(password).unwrap();
+        let hostname_cstr = session_cstring("hostname", hostname)?;
+        let username_cstr = session_cstring("username", username)?;
+        let password_cstr = session_cstring("password", password)?;
 
         // [Unsafe] freeipmi stores its own copy of these strings in
         // buffers within ctx. It performs its own max length checks.
@@ -382,19 +392,21 @@ impl LimSession {
     pub fn new(st: &SessionType) -> Result<Self> {
         lim_init()?;
 
-        // These two strings will be "owned" by the C struct and will be freed
-        // in the Drop implementation. This allows LimSession to remain movable.
-        let (hostname, username, password) = match st {
-            SessionType::Local => (None, ptr::null_mut(), ptr::null_mut()),
+        // Both strings are converted before either becomes a raw pointer, so
+        // an early return drops them instead of leaking them
+        let (hostname, credentials) = match st {
+            SessionType::Local => (None, None),
             SessionType::Remote { hostname, username, password } => (
                 Some(hostname.clone()),
-                CString::new(username.as_str()).unwrap().into_raw(),
-                CString::new(password.0.as_str()).unwrap().into_raw(),
+                Some((
+                    session_cstring("username", username)?,
+                    session_cstring("password", &password.0)?,
+                )),
             ),
         };
 
         // [Unsafe] No memory safety concerns. This will never leak because no
-        // code below this point can panic.
+        // code below this point can panic or return once ctx is non-NULL.
         let ctx = unsafe { bindings::ipmi_monitoring_ctx_create() };
         if ctx.is_null() {
             return Err(Error::Lim {
@@ -402,6 +414,13 @@ impl LimSession {
                 message: "(unknown)",
             });
         }
+
+        // These two strings will be "owned" by the C struct and will be freed
+        // in the Drop implementation. This allows LimSession to remain movable.
+        let (username, password) = match credentials {
+            Some((username, password)) => (username.into_raw(), password.into_raw()),
+            None => (ptr::null_mut(), ptr::null_mut()),
+        };
 
         let config = bindings::ipmi_monitoring_ipmi_config {
             // In-band options. All options are set to the default because we
@@ -496,7 +515,8 @@ impl LimSession {
     pub fn temperature_sensor_readings(&mut self) -> Result<usize> {
         // LIM does not store this string
         let hostname_cstr = self.hostname.as_ref()
-            .map(|s| CString::new(s.as_str()).unwrap());
+            .map(|s| session_cstring("hostname", s))
+            .transpose()?;
         let hostname_ptr = hostname_cstr.as_ref()
             .map_or(ptr::null(), |s| s.as_ptr());
         let mut sensor_type = bindings::ipmi_monitoring_sensor_type_IPMI_MONITORING_SENSOR_TYPE_TEMPERATURE;
@@ -643,3 +663,21 @@ impl Drop for LimSession {
 
 /// The internal pointers and structs are safe to move between threads.
 unsafe impl Send for LimSession {}
+
+#[cfg(test)]
+mod tests {
+    use super::{Error, session_cstring};
+
+    #[test]
+    fn session_string_converts() {
+        assert_eq!(session_cstring("hostname", "bmc.lan").unwrap().as_bytes(), b"bmc.lan");
+    }
+
+    #[test]
+    fn session_string_with_nul_is_error_naming_only_the_field() {
+        let result = session_cstring("password", "sec\0ret");
+
+        assert_eq!(result, Err(Error::NulByte { field: "password" }));
+        assert_eq!(result.unwrap_err().to_string(), "Session password contains a NUL byte");
+    }
+}
