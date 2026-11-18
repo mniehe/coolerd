@@ -930,6 +930,15 @@ mod tests {
     }
 
     #[test]
+    fn named_zone_curve_ignores_the_zone_hysteresis() {
+        let mut zone = zone(&HOLD_STEPS, vec![plain()]);
+        zone.hysteresis = 5;
+        zone.curve_hysteresis = Some(0);
+
+        assert_eq!(duties(&zone, &[&[70], &[68]]), [85, 82]);
+    }
+
+    #[test]
     fn zone_without_source_steps_keeps_its_duty() {
         // A stage 1 zone: no source steps, no hysteresis, default aggregation
         let zone = zone(&ZONE_STEPS, vec![plain(), plain(), plain()]);

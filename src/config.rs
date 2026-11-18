@@ -1553,13 +1553,23 @@ mod tests {
 
     #[test]
     fn accepts_zone_that_names_a_curve() {
-        let contents = with_gpu_curve(&omit_key(&zone_toml(&[("curve", r#""gpu""#)]), "steps"), GPU_STEPS, "");
+        let zone_keys = [("curve", r#""gpu""#), ("hysteresis", "5")];
+        let contents = with_gpu_curve(&omit_key(&zone_toml(&zone_keys), "steps"), GPU_STEPS, "hysteresis = 3\n");
         let config = parse(&contents).unwrap();
         let zone = &config.zones[0];
 
         assert_eq!(zone.steps.as_ref().unwrap().len(), 2);
-        // The curve's hysteresis defaults to 0, whatever the zone's is
-        assert_eq!(zone.curve_hysteresis, Some(0));
+        assert_eq!(zone.hysteresis, 5);
+        assert_eq!(zone.curve_hysteresis, Some(3));
+    }
+
+    #[test]
+    fn curve_hysteresis_defaults_to_zero() {
+        let zone_keys = [("curve", r#""gpu""#), ("hysteresis", "5")];
+        let contents = with_gpu_curve(&omit_key(&zone_toml(&zone_keys), "steps"), GPU_STEPS, "");
+        let config = parse(&contents).unwrap();
+
+        assert_eq!(config.zones[0].curve_hysteresis, Some(0));
     }
 
     #[test]
