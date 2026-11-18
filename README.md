@@ -92,6 +92,10 @@ An `average` `aggregation` divides by the number of temperatures it used; `top` 
 
 `hysteresis` holds each curve's temperature through small falls. A curve follows a rise at once, but follows a fall only once it reaches `hysteresis` degrees. The default is 0, which follows every reading.
 
+`smoothing_samples` on a source replaces each reading by the mean of the source's last `smoothing_samples` readings, rounded down, so a short spike moves the fans less. The mean comes first: the zone temperature, the source's own curve and `hysteresis` all see the smoothed reading. The default is 1, which uses each reading as it is, and 0 is rejected. The count is in updates, so the mean covers about `smoothing_samples` times `interval` seconds. When a source fails, its stored readings are dropped, and it starts again from fresh readings. With `smoothing_samples = 3` and steps from 40 °C at 40% to 80 °C at 100%, readings of 40, 70, 40 and 40 °C give 40%, 62%, 55% and 55%, where the same readings without smoothing give 40%, 85%, 40% and 40%.
+
+Smoothing delays the response to real heat; `hysteresis` does not, because it follows every rise at once. A device that heats up reaches its duty cycle only after `smoothing_samples` updates, because the mean still holds its cooler readings. Use smoothing for a sensor whose readings jump, as some AMD CPU and GPU sensors do, not for a device that heats quickly.
+
 In this example the CPU uses the zone curve and the GPU its own. At CPU 50 °C and GPU 70 °C, the curves give 54% and 60%, and the zone runs at 60% on the first poll. On later polls, `hysteresis` can hold a curve's temperature above its reading, so the duty cycle can be higher than the current readings alone give.
 
 ```toml

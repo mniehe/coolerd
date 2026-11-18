@@ -680,6 +680,20 @@ mod tests {
         assert_eq!(sources.last().unwrap().on_failure, OnFailure::Dcycle { dcycle: 80 });
     }
 
+    #[test]
+    fn sample_smoothed_source_loads_when_uncommented() {
+        let sample = include_str!("../config.sample.toml");
+        let line = sample.lines()
+            .find(|l| l.trim_start().starts_with("# {") && l.contains("smoothing_samples = "))
+            .expect("the sample has a commented source with smoothing_samples");
+        let uncommented = line.replacen("# ", "", 1);
+        let config = parse(&sample.replacen(line, &uncommented, 1)).unwrap();
+        let sources = &config.zones[0].sources;
+
+        assert_eq!(sources.last().unwrap().smoothing_samples, 3);
+        assert!(sources[..sources.len() - 1].iter().all(|s| s.smoothing_samples == 1));
+    }
+
     /// Every TOML block of the README
     fn readme_toml_blocks() -> Vec<&'static str> {
         const FENCE: &str = "```toml\n";

@@ -114,6 +114,21 @@ sources = [
   # A zone in which no source has a reading runs at 100%. A failing source is
   # still tried once in every update.
   # { type = "nvidia", gpu = "00000000:81:00.0", steps = [{ temp = 60, dcycle = 40 }, { temp = 90, dcycle = 100 }], on_failure = { type = "dcycle", dcycle = 80 } },
+
+  # Any source can also carry `smoothing_samples`, a number from 1 to 255. The
+  # source then feeds the mean of its last `smoothing_samples` readings,
+  # rounded down, in place of each reading, so a short spike moves the fans
+  # less. The mean comes before `aggregation`, the source's own `steps` and
+  # `hysteresis`. The default is 1, which uses each reading as it is. A failed
+  # read drops the stored readings, so the source starts again from fresh
+  # readings.
+  #
+  # The count is in updates, so the mean covers about `smoothing_samples`
+  # times `interval` seconds: 3 with an interval of 1 is about 3 seconds. This
+  # also delays the response to real heat. A device that heats up reaches its
+  # duty cycle only after `smoothing_samples` updates. Use it for a sensor
+  # whose readings jump, not for a device that heats quickly.
+  # { type = "ipmi", sensor = "System Temp", smoothing_samples = 3 },
 ]
 
 # Method of aggregating the temperatures of the sources without their own
