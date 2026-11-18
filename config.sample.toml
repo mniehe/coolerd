@@ -11,6 +11,25 @@
 # (Note: This option is ignored if the RUST_LOG environment variable is set)
 log_level = "debug"
 
+# Named curves. Define a curve once here and name it with `curve` on any
+# number of sources and zones, in place of their own `steps`. The key after
+# `curves.` is the name. `steps` follows the rules of a zone's `steps` below.
+# A source or zone that names a curve gets the curve's steps, so the rules of
+# its own `steps` apply too: a source cannot name a curve with no steps.
+#
+# `hysteresis` is the number of degrees Celsius the curve's temperature must
+# fall before its duty cycle follows, as the zone's `hysteresis` does for
+# inline `steps`. A named curve always uses its own `hysteresis`, never the
+# zone's. The default is 0, which follows every reading. Each source or zone
+# that names the curve holds its own temperature. A curve that nothing names
+# is still validated.
+[curves.gpu]
+steps = [
+  { temp = 60, dcycle = 40 },
+  { temp = 90, dcycle = 100 }
+]
+hysteresis = 3
+
 # Definition of a logical fan zone.
 [[zones]]
 # IPMI session. If unspecified, the `default` session is used, which uses the
@@ -119,6 +138,12 @@ sources = [
   # still tried once in every update.
   # { type = "nvidia", gpu = "00000000:81:00.0", steps = [{ temp = 60, dcycle = 40 }, { temp = 90, dcycle = 100 }], on_failure = { type = "dcycle", dcycle = 80 } },
 
+  # In place of `steps`, a source can name a curve from the `curves` section
+  # above with `curve`. A source cannot have both. Several sources can name
+  # one curve; each maps its own temperature through it. Such a source counts
+  # as a source with its own `steps` everywhere in this file.
+  # { type = "nvidia", gpu = "00000000:82:00.0", curve = "gpu", on_failure = { type = "dcycle", dcycle = 80 } },
+
   # Any source can also carry `smoothing_samples`, a number from 1 to 255. The
   # source then feeds the mean of its last `smoothing_samples` readings,
   # rounded down, in place of each reading, so a short spike moves the fans
@@ -181,6 +206,11 @@ steps = [
   { temp = 70, dcycle = 70 }
 ]
 
+# In place of `steps`, the zone can name a curve from the `curves` section
+# with `curve`, here one defined as `[curves.cpu]`. The zone cannot have both.
+# The rules above for the zone's `steps` apply to the named curve's steps.
+#curve = "cpu"
+
 # Method of combining the duty cycles of the zone's curves: the zone curve and
 # the curve of each source with `steps`. The default, maximum, uses the highest
 # duty cycle of any curve. Average takes the mean, rounded up, and `top` limits
@@ -195,6 +225,9 @@ steps = [
 # A rise is always followed at once, so the fans speed up without delay but do
 # not slow down for a fall of less than this. Each curve holds its own
 # temperature. The default is 0, which follows every reading.
+#
+# This applies only to inline `steps`: the zone's and those of each source. A
+# named curve uses the `hysteresis` of its entry in `curves`.
 #hysteresis = 3
 
 # More fan zones can be added

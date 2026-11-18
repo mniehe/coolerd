@@ -90,7 +90,7 @@ The zone then combines the duty cycles of all its curves by `duty_aggregation`. 
 
 An `average` `aggregation` divides by the number of temperatures it used; `top` only caps that number. Earlier versions divided by `top` even when the zone had fewer sources, so a zone whose `top` exceeds its source count now runs its fans faster: readings of 80 °C and 80 °C with `top = 3` give 80 °C, where they gave 53 °C.
 
-`hysteresis` holds each curve's temperature through small falls. A curve follows a rise at once, but follows a fall only once it reaches `hysteresis` degrees. The default is 0, which follows every reading.
+`hysteresis` holds each curve's temperature through small falls. A curve follows a rise at once, but follows a fall only once it reaches `hysteresis` degrees. The default is 0, which follows every reading. The zone's `hysteresis` applies only to inline `steps`, the zone's and those of each source; a named curve, described below, has its own.
 
 `smoothing_samples` on a source replaces each reading by the mean of the source's last `smoothing_samples` readings, rounded down, so a short spike moves the fans less. The mean comes first: the zone temperature, the source's own curve and `hysteresis` all see the smoothed reading. The default is 1, which uses each reading as it is, and 0 is rejected. The count is in updates, so the mean covers about `smoothing_samples` times `interval` seconds. When a source fails, its stored readings are dropped, and it starts again from fresh readings. With `smoothing_samples = 3` and steps from 40 °C at 40% to 80 °C at 100%, readings of 40, 70, 40 and 40 °C give 40%, 62%, 55% and 55%, where the same readings without smoothing give 40%, 85%, 40% and 40%.
 
@@ -108,6 +108,27 @@ sources = [
 steps = [{ temp = 45, dcycle = 45 }, { temp = 75, dcycle = 100 }]
 duty_aggregation = { type = "maximum" }
 hysteresis = 3
+```
+
+### Named curves
+
+A curve can be defined once in the top-level `curves` table and named with `curve` by any number of sources and zones, in place of their own `steps`. A source or zone cannot have both `steps` and `curve`, and a name that `curves` does not hold is rejected. Each entry has `steps`, with the rules of a zone's `steps`, and an optional `hysteresis`, which defaults to 0. A named curve uses its own `hysteresis` and never the zone's.
+
+A source or zone that names a curve behaves as if it had the curve's `steps` inline: the rules for its own `steps` apply, so a source cannot name a curve with no steps, and a source that names a curve does not feed the zone temperature. Each source that names a curve maps its own temperature and holds it on its own, so two GPUs on one curve do not share a held temperature.
+
+In this example both GPUs use the curve `gpu`. With both at 60, 72, 70 and 68 °C in turn, the zone runs at 40%, 64%, 64% and 56%: the fall of 2 °C to 70 °C is held, and the fall of 4 °C to 68 °C is followed. The same `steps` inline on each GPU, with the zone's `hysteresis = 3`, give the same duty cycles.
+
+```toml
+[curves.gpu]
+steps = [{ temp = 60, dcycle = 40 }, { temp = 90, dcycle = 100 }]
+hysteresis = 3
+
+[[zones]]
+ipmi_zones = [0]
+sources = [
+  { type = "nvidia", gpu = "00000000:81:00.0", curve = "gpu" },
+  { type = "nvidia", gpu = "00000000:82:00.0", curve = "gpu" },
+]
 ```
 
 See [`config.sample.toml`](config.sample.toml) for every key.

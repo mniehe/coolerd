@@ -782,6 +782,22 @@ mod tests {
 
         assert_eq!(config.zones.len(), 1);
         assert_eq!(config.zones[0].ipmi_zones, [0, 1]);
+        assert!(!config.curves.is_empty());
+    }
+
+    #[test]
+    fn sample_source_with_named_curve_loads_when_uncommented() {
+        let sample = include_str!("../config.sample.toml");
+        let line = sample.lines()
+            .find(|l| l.trim_start().starts_with("# {") && l.contains("curve = "))
+            .expect("the sample has a commented source with curve");
+        let uncommented = line.replacen("# ", "", 1);
+        let config = parse(&sample.replacen(line, &uncommented, 1)).unwrap();
+        let source = config.zones[0].sources.last().unwrap();
+        let name = source.curve.as_ref().unwrap();
+
+        assert_eq!(source.steps.as_ref().unwrap().len(), config.curves[name].steps.len());
+        assert_eq!(source.curve_hysteresis, Some(config.curves[name].hysteresis));
     }
 
     #[test]
@@ -849,6 +865,19 @@ mod tests {
         assert!(zone.sources[1].steps.is_some());
         assert!(matches!(zone.duty_aggregation, Aggregation::Maximum));
         assert_eq!(zone.hysteresis, 3);
+    }
+
+    #[test]
+    fn readme_named_curve_example_loads() {
+        let blocks = readme_toml_blocks();
+        let block = blocks.iter()
+            .find(|b| b.contains("[curves."))
+            .expect("the README has a TOML example with a curves table");
+        let config = parse(block).unwrap();
+        let named: Vec<_> = config.zones[0].sources.iter().filter(|s| s.curve.is_some()).collect();
+
+        assert!(named.len() >= 2, "{:?}", named);
+        assert!(named.iter().all(|s| s.steps.is_some() && s.curve_hysteresis.is_some()));
     }
 
     #[test]
