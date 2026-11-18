@@ -184,19 +184,58 @@ impl Ipmi {
     /// result will be [`None`].
     pub fn get_temperature_readings(&mut self)
         -> Result<HashMap<String, Option<SensorReading>>> {
-        let num_sensors = self.lim.temperature_sensor_readings()?;
-        trace!("Number of sensors: {}", num_sensors);
-
-        let mut entries = Vec::with_capacity(num_sensors);
-
-        for _ in 0..num_sensors {
-            entries.push((self.lim.read_sensor_name(), self.lim.read_sensor()));
-
-            self.lim.iterator_next()?;
-        }
-
-        Ok(collect_sensor_readings(entries))
+        read_all_sensors(&mut self.lim)
     }
+}
+
+/// The operations of one sensor reading iteration, so that the traversal can be
+/// tested without a BMC
+trait SensorIterator {
+    /// Start the query and return the number of entries
+    fn start_query(&mut self) -> result::Result<usize, freeipmi::Error>;
+    /// Read the name of the current entry
+    fn current_name(&mut self) -> result::Result<String, freeipmi::Error>;
+    /// Read the reading of the current entry
+    fn current_reading(&mut self) -> result::Result<Option<SensorReading>, freeipmi::Error>;
+    /// Move to the next entry
+    fn advance(&mut self) -> result::Result<(), freeipmi::Error>;
+}
+
+impl SensorIterator for LimSession {
+    fn start_query(&mut self) -> result::Result<usize, freeipmi::Error> {
+        self.temperature_sensor_readings()
+    }
+
+    fn current_name(&mut self) -> result::Result<String, freeipmi::Error> {
+        self.read_sensor_name()
+    }
+
+    fn current_reading(&mut self) -> result::Result<Option<SensorReading>, freeipmi::Error> {
+        self.read_sensor()
+    }
+
+    fn advance(&mut self) -> result::Result<(), freeipmi::Error> {
+        self.iterator_next()
+    }
+}
+
+/// Run one sensor reading iteration. An entry whose name or reading failed
+/// still advances the iterator and is handled by [`collect_sensor_readings`].
+/// A failed query or advance returns the error and no readings.
+fn read_all_sensors(sensors: &mut impl SensorIterator)
+    -> Result<HashMap<String, Option<SensorReading>>> {
+    let num_sensors = sensors.start_query()?;
+    trace!("Number of sensors: {}", num_sensors);
+
+    let mut entries = Vec::with_capacity(num_sensors);
+
+    for _ in 0..num_sensors {
+        entries.push((sensors.current_name(), sensors.current_reading()));
+
+        sensors.advance()?;
+    }
+
+    Ok(collect_sensor_readings(entries))
 }
 
 /// The name and the reading of one sensor of a sensor reading iteration
@@ -243,7 +282,7 @@ fn collect_sensor_readings(entries: impl IntoIterator<Item = SensorEntry>)
 mod tests {
     use {
         std::collections::HashMap,
-        super::{collect_sensor_readings, SensorEntry},
+        super::{collect_sensor_readings, read_all_sensors, Error, SensorEntry, SensorIterator},
         crate::freeipmi::{self, SensorReading, SensorUnits, SensorValue},
     };
 
@@ -347,5 +386,127 @@ mod tests {
             ("CPU Temp", Some(45)),
             ("System Temp", Some(30)),
         ]));
+    }
+
+    const QUERY_ACTION: &str = "get temperature sensor readings";
+    const ADVANCE_ACTION: &str = "get next sensor reading";
+
+    /// A sensor iteration over fixed entries that counts its advances. Reading
+    /// past the last entry panics.
+    struct FakeSensors {
+        entries: Vec<SensorEntry>,
+        query_fails: bool,
+        failing_advance: Option<usize>,
+        position: usize,
+        advances: usize,
+    }
+
+    impl FakeSensors {
+        fn new(entries: Vec<SensorEntry>) -> Self {
+            Self { entries, query_fails: false, failing_advance: None, position: 0, advances: 0 }
+        }
+    }
+
+    impl SensorIterator for FakeSensors {
+        fn start_query(&mut self) -> Result<usize, freeipmi::Error> {
+            if self.query_fails {
+                return Err(lim_error(QUERY_ACTION));
+            }
+
+            Ok(self.entries.len())
+        }
+
+        fn current_name(&mut self) -> Result<String, freeipmi::Error> {
+            self.entries[self.position].0.as_ref()
+                .cloned()
+                .map_err(|_| lim_error("read sensor name"))
+        }
+
+        fn current_reading(&mut self) -> Result<Option<SensorReading>, freeipmi::Error> {
+            self.entries[self.position].1.as_ref()
+                .copied()
+                .map_err(|_| lim_error("read sensor units"))
+        }
+
+        fn advance(&mut self) -> Result<(), freeipmi::Error> {
+            self.advances += 1;
+
+            if self.failing_advance == Some(self.position) {
+                return Err(lim_error(ADVANCE_ACTION));
+            }
+
+            self.position += 1;
+            Ok(())
+        }
+    }
+
+    /// The freeipmi error inside `result`, which must be an error
+    fn freeipmi_error(result: super::Result<HashMap<String, Option<SensorReading>>>) -> freeipmi::Error {
+        match result {
+            Err(Error::FreeIpmi(e)) => e,
+            other => panic!("expected a freeipmi error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn traversal_of_good_entries_gives_the_full_map() {
+        let mut sensors = FakeSensors::new(vec![
+            good("CPU Temp", celsius(45)),
+            good("System Temp", celsius(30)),
+            good("Peripheral Temp", None),
+        ]);
+
+        let readings = read_all_sensors(&mut sensors).unwrap();
+
+        assert_eq!(temps(&readings), HashMap::from([
+            ("CPU Temp", Some(45)),
+            ("System Temp", Some(30)),
+            ("Peripheral Temp", None),
+        ]));
+        assert_eq!(sensors.advances, 3);
+    }
+
+    #[test]
+    fn traversal_advances_once_per_entry_past_bad_entries() {
+        let mut sensors = FakeSensors::new(vec![
+            good("CPU Temp", celsius(45)),
+            (Err(lim_error("read sensor name")), Ok(celsius(99))),
+            (Ok("VRM Temp".to_owned()), Err(lim_error("read sensor units"))),
+            good("System Temp", celsius(30)),
+        ]);
+
+        let readings = read_all_sensors(&mut sensors).unwrap();
+
+        assert_eq!(sensors.advances, 4);
+        assert_eq!(temps(&readings), HashMap::from([
+            ("CPU Temp", Some(45)),
+            ("System Temp", Some(30)),
+        ]));
+    }
+
+    #[test]
+    fn traversal_returns_the_advance_error_and_no_map() {
+        let mut sensors = FakeSensors::new(vec![
+            good("CPU Temp", celsius(45)),
+            good("System Temp", celsius(30)),
+            good("Peripheral Temp", celsius(35)),
+        ]);
+        sensors.failing_advance = Some(1);
+
+        let error = freeipmi_error(read_all_sensors(&mut sensors));
+
+        assert_eq!(error, lim_error(ADVANCE_ACTION));
+        assert_eq!(sensors.advances, 2);
+    }
+
+    #[test]
+    fn traversal_returns_the_query_error() {
+        let mut sensors = FakeSensors::new(vec![good("CPU Temp", celsius(45))]);
+        sensors.query_fails = true;
+
+        let error = freeipmi_error(read_all_sensors(&mut sensors));
+
+        assert_eq!(error, lim_error(QUERY_ACTION));
+        assert_eq!(sensors.advances, 0);
     }
 }
