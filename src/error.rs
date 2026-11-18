@@ -89,6 +89,8 @@ pub enum Error {
     },
     #[error("IPMI error: {0}")]
     Ipmi(#[from] ipmi::Error),
+    #[error("Not a regular file: {0:?}")]
+    NotRegularFile(PathBuf),
     #[error("{path:?}: {source}")]
     Io {
         path: PathBuf,

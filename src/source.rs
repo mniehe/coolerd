@@ -210,10 +210,18 @@ fn read_nvidia_source(runner: &mut CommandRunner, gpu: &str) -> Result<u8> {
 /// contents of the file should be a decimal-formatted integer in units of
 /// thousandths degrees Celsius after whitespace is trimmed. If the temperature,
 /// after being converted to degrees Celsius, does not fit in a [`u8`], then
-/// [`Error::ReadingExceedsBounds`] is returned.
+/// [`Error::ReadingExceedsBounds`] is returned. A path that is not a regular
+/// file, after symlinks are followed, gives [`Error::NotRegularFile`], because
+/// reading a FIFO without a writer would block the zone for ever.
 fn parse_file_source<T: AsRef<Path>>(path: T) -> Result<u8> {
-    let contents = fs::read_to_string(path.as_ref())
-        .map_err(|e| Error::Io { path: path.as_ref().to_owned(), source: e })?;
+    let path = path.as_ref();
+    let io_error = |e| Error::Io { path: path.to_owned(), source: e };
+
+    if !fs::metadata(path).map_err(io_error)?.file_type().is_file() {
+        return Err(Error::NotRegularFile(path.to_owned()));
+    }
+
+    let contents = fs::read_to_string(path).map_err(io_error)?;
     let trimmed = contents.trim();
 
     // The file should be in milli-degrees Celsius
@@ -516,9 +524,11 @@ mod tests {
             cell::RefCell,
             collections::HashMap,
             io,
-            os::unix::process::ExitStatusExt,
+            os::unix::{fs::symlink, process::ExitStatusExt},
             path::{Path, PathBuf},
-            process::ExitStatus,
+            process::{Command, ExitStatus},
+            sync::mpsc,
+            thread,
             time::{Duration, Instant},
         },
         serde_json::json,
@@ -703,6 +713,55 @@ mod tests {
     #[test]
     fn file_temperature_above_u8_exceeds_bounds() {
         assert!(matches!(file_reading("256000"), Err(Error::ReadingExceedsBounds)));
+    }
+
+    #[test]
+    fn file_through_symlink_reads() {
+        let dir = TempDir::new();
+        let target = dir.write("temp", "42000\n");
+        let link = dir.0.join("link");
+        symlink(&target, &link).unwrap();
+
+        assert_eq!(parse_file_source(&link).unwrap(), 42);
+    }
+
+    /// Read `path` on another thread, failing the test if the read blocks
+    fn bounded_file_reading(path: &Path) -> Result<u8, Error> {
+        let (sender, receiver) = mpsc::channel();
+        let reader_path = path.to_owned();
+        thread::spawn(move || sender.send(parse_file_source(reader_path)));
+
+        receiver.recv_timeout(FINISH_LIMIT).expect("the read blocked")
+    }
+
+    #[test]
+    fn file_that_is_a_fifo_is_error_without_blocking() {
+        let dir = TempDir::new();
+        let fifo = dir.0.join("fifo");
+        {
+            let _guard = script_lock();
+            let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
+            assert!(status.success(), "mkfifo failed: {}", status);
+        }
+
+        let result = bounded_file_reading(&fifo);
+
+        assert!(matches!(&result, Err(Error::NotRegularFile(p)) if *p == fifo), "{:?}", result);
+    }
+
+    #[test]
+    fn file_that_is_a_directory_is_error() {
+        let dir = TempDir::new();
+        let result = bounded_file_reading(&dir.0);
+
+        assert!(matches!(&result, Err(Error::NotRegularFile(p)) if *p == dir.0), "{:?}", result);
+    }
+
+    #[test]
+    fn file_not_regular_error_names_the_path() {
+        let error = Error::NotRegularFile(PathBuf::from("/run/temp-fifo"));
+
+        assert_eq!(error.to_string(), r#"Not a regular file: "/run/temp-fifo""#);
     }
 
     fn assert_nvidia_bad_data(stdout: &str) {

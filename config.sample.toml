@@ -57,6 +57,9 @@ sources = [
   # * Units must be milli-degrees Celsius (1/1000 °C)
   # * No characters other than numbers and whitespace are permitted
   #
+  # The path must be a regular file after symlinks are followed; a FIFO,
+  # directory or device fails the source without being read.
+  #
   # The thermal_zone sysfs paths on Linux satisfy these conditions.
   # { type = "file", path = "/sys/class/thermal/thermal_zone1/temp" },
 
