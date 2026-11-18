@@ -174,10 +174,6 @@ pub struct ZoneUpdate {
     pub smoothed_temps: Vec<Option<u8>>,
 }
 
-/// How many readings of a source are averaged; one leaves each reading as it
-/// is
-const SMOOTHING_SAMPLES: u8 = 1;
-
 /// What a zone keeps of one source between polls
 struct SourceState {
     smoother: Smoother,
@@ -229,8 +225,8 @@ impl ZoneState {
         Self {
             zone_curve: HeldTemp(None),
             sources: zone.sources.iter()
-                .map(|_| SourceState {
-                    smoother: Smoother::new(SMOOTHING_SAMPLES),
+                .map(|source| SourceState {
+                    smoother: Smoother::new(source.smoothing_samples),
                     curve: HeldTemp(None),
                     failed: false,
                 })
@@ -826,6 +822,72 @@ mod tests {
             vec![Some(40), Some(40), Some(78), Some(40)],
             vec![Some(40), Some(40), Some(60), Some(40)],
         ]);
+    }
+
+    /// A source that feeds the mean of its last `samples` readings
+    fn smoothing(source: SourceConfig, samples: u8) -> SourceConfig {
+        SourceConfig { smoothing_samples: samples, ..source }
+    }
+
+    fn smoothed_temps(updates: &[ZoneUpdate]) -> Vec<Vec<Option<u8>>> {
+        updates.iter().map(|u| u.smoothed_temps.clone()).collect()
+    }
+
+    #[test]
+    fn smoothed_source_maps_the_mean_of_its_last_readings() {
+        // Means 40, 55, 50, 50 on the curve 40 C 40% to 80 C 100%
+        let zone = zone(&HOLD_STEPS, vec![smoothing(plain(), 3)]);
+
+        assert_eq!(duties(&zone, &[&[40], &[70], &[40], &[40]]), [40, 62, 55, 55]);
+    }
+
+    #[test]
+    fn source_without_smoothing_maps_each_reading() {
+        let zone = zone(&HOLD_STEPS, vec![plain()]);
+
+        assert_eq!(duties(&zone, &[&[40], &[70], &[40], &[40]]), [40, 85, 40, 40]);
+    }
+
+    #[test]
+    fn smoothed_source_on_its_own_curve_maps_the_mean() {
+        let zone = zone(&[], vec![smoothing(curved(&HOLD_STEPS), 3)]);
+
+        assert_eq!(duties(&zone, &[&[40], &[70], &[40], &[40]]), [40, 62, 55, 55]);
+    }
+
+    #[test]
+    fn failed_poll_restarts_smoothing_from_fresh_readings() {
+        // Without the restart, 40, 70 and 60 would give 56
+        let zone = zone(&HOLD_STEPS, vec![smoothing(failing(plain(), OnFailure::Ignore {}), 3)]);
+        let updates = updates(&zone, &[vec![Temp(40)], vec![Temp(70)], vec![failed()], vec![Temp(60)]]);
+
+        assert_eq!(smoothed_temps(&updates), [vec![Some(40)], vec![Some(55)], vec![None], vec![Some(60)]]);
+        assert_eq!(updates[3].curve_temps, [60]);
+    }
+
+    #[test]
+    fn zone_smooths_only_the_smoothed_source() {
+        // The first source smooths 40, 70 to 55; the second keeps 60. Their
+        // average, 57, maps to 65.
+        let mut zone = zone(&HOLD_STEPS, vec![smoothing(plain(), 3), plain()]);
+        zone.aggregation = Aggregation::Average { top: None };
+        let updates = updates(&zone, &[temps(&[40, 40]), temps(&[70, 60])]);
+
+        assert_eq!(updates[1].smoothed_temps, [Some(55), Some(60)]);
+        assert_eq!(updates[1].curve_temps, [57]);
+        assert_eq!(updates[1].duty, 65);
+    }
+
+    #[test]
+    fn hysteresis_holds_a_fall_of_the_smoothed_temperature() {
+        // Means 70, 65, 66 (truncated from 66.67): the fall to 65 is
+        // smaller than the hysteresis and is held at 70
+        let mut zone = zone(&HOLD_STEPS, vec![smoothing(plain(), 3)]);
+        zone.hysteresis = 6;
+        let updates = updates(&zone, &[temps(&[70]), temps(&[60]), temps(&[70])]);
+
+        assert_eq!(smoothed_temps(&updates), [vec![Some(70)], vec![Some(65)], vec![Some(66)]]);
+        assert_eq!(updates.iter().map(|u| u.curve_temps.clone()).collect::<Vec<_>>(), [[70], [70], [70]]);
     }
 
     #[test]

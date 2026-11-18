@@ -154,20 +154,21 @@ pub struct SourceConfig {
     pub kind: Source,
     pub steps: Option<Vec<Step>>,
     pub on_failure: OnFailure,
+    pub smoothing_samples: u8,
 }
 
 impl SourceConfig {
     /// A source of `kind` with every other key at its default
     pub fn new(kind: Source) -> Self {
-        Self { kind, steps: None, on_failure: OnFailure::default() }
+        Self { kind, steps: None, on_failure: OnFailure::default(), smoothing_samples: 1 }
     }
 }
 
-/// Serde cannot combine `flatten` with `deny_unknown_fields`, so `steps` and
-/// `on_failure` are taken out of the table by hand and the rest goes to
-/// [`Source`], which still rejects an unknown key or type. A sequence, the
-/// positional form that [`Source`] accepts, goes to it unchanged and has no
-/// `steps` and the default `on_failure`.
+/// Serde cannot combine `flatten` with `deny_unknown_fields`, so `steps`,
+/// `on_failure` and `smoothing_samples` are taken out of the table by hand and
+/// the rest goes to [`Source`], which still rejects an unknown key or type. A
+/// sequence, the positional form that [`Source`] accepts, goes to it unchanged
+/// and has every other key at its default.
 impl<'de> Deserialize<'de> for SourceConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -200,11 +201,13 @@ impl<'de> Deserialize<'de> for SourceConfig {
                 let mut table = toml::value::Table::new();
                 let mut steps = None;
                 let mut on_failure = None;
+                let mut smoothing_samples = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     let repeated = match key.as_str() {
                         "steps" => steps.is_some(),
                         "on_failure" => on_failure.is_some(),
+                        "smoothing_samples" => smoothing_samples.is_some(),
                         _ => table.contains_key(&key),
                     };
 
@@ -223,6 +226,10 @@ impl<'de> Deserialize<'de> for SourceConfig {
                             on_failure = Some(OnFailure::deserialize(value)
                                 .map_err(|e| de::Error::custom(format!("on_failure: {}", e)))?);
                         }
+                        "smoothing_samples" => {
+                            smoothing_samples = Some(u8::deserialize(value)
+                                .map_err(|e| de::Error::custom(format!("smoothing_samples: {}", e)))?);
+                        }
                         _ => {
                             table.insert(key, value);
                         }
@@ -232,7 +239,14 @@ impl<'de> Deserialize<'de> for SourceConfig {
                 let kind = Source::deserialize(toml::Value::Table(table))
                     .map_err(de::Error::custom)?;
 
-                Ok(SourceConfig { kind, steps, on_failure: on_failure.unwrap_or_default() })
+                let defaults = SourceConfig::new(kind);
+
+                Ok(SourceConfig {
+                    steps,
+                    on_failure: on_failure.unwrap_or(defaults.on_failure),
+                    smoothing_samples: smoothing_samples.unwrap_or(defaults.smoothing_samples),
+                    ..defaults
+                })
             }
         }
 
@@ -490,6 +504,13 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
                         reason: format!("zones[{}].sources[{}].on_failure[type=dcycle].dcycle: invalid percentage: {}", i, j, dcycle),
                     });
                 }
+            }
+
+            if source.smoothing_samples == 0 {
+                return Err(Error::ConfigValidation {
+                    path: path.to_owned(),
+                    reason: format!("zones[{}].sources[{}].smoothing_samples: must be greater than 0", i, j),
+                });
             }
 
             if let Source::Nvidia { gpu } = &source.kind {
@@ -1141,6 +1162,83 @@ mod tests {
         let message = parse_error(&zone_toml(&[("sources", sources)]));
 
         assert!(message.contains("duplicate field `on_failure`"), "{}", message);
+    }
+
+    /// Sources whose entry at `index` sets `smoothing_samples` to `value`,
+    /// after plain sources
+    fn smoothing_sources(index: usize, value: &str) -> String {
+        let mut sources = vec![r#"{ type = "file", path = "/sys/temp" }"#.to_owned(); index];
+        sources.push(format!(r#"{{ type = "file", path = "/sys/temp", smoothing_samples = {} }}"#, value));
+
+        format!("[{}]", sources.join(", "))
+    }
+
+    #[test]
+    fn accepts_smoothing_samples() {
+        let config = parse(&zone_toml(&[("sources", &smoothing_sources(0, "3"))])).unwrap();
+
+        assert_eq!(config.zones[0].sources[0].smoothing_samples, 3);
+    }
+
+    #[test]
+    fn accepts_smoothing_samples_beside_steps_and_on_failure() {
+        let sources = format!(r#"[{{ type = "nvidia", gpu = "{}", smoothing_samples = 4, steps = {}, on_failure = {{ type = "ignore" }} }}]"#, GPU, GPU_STEPS);
+        let config = parse(&zone_toml(&[("sources", &sources)])).unwrap();
+        let source = &config.zones[0].sources[0];
+
+        assert!(matches!(&source.kind, Source::Nvidia { gpu } if gpu == GPU));
+        assert_eq!(source.smoothing_samples, 4);
+        assert_eq!(source.steps.as_ref().unwrap().len(), 2);
+        assert_eq!(source.on_failure, OnFailure::Ignore {});
+    }
+
+    #[test]
+    fn smoothing_samples_defaults_to_one() {
+        let config = parse(&zone_toml(&[])).unwrap();
+
+        assert_eq!(config.zones[0].sources[0].smoothing_samples, 1);
+    }
+
+    #[test]
+    fn positional_source_smoothing_samples_defaults_to_one() {
+        let config = parse(&zone_toml(&[("sources", r#"[["file", "/dev/null"]]"#)])).unwrap();
+
+        assert_eq!(config.zones[0].sources[0].smoothing_samples, 1);
+    }
+
+    #[test]
+    fn rejects_smoothing_samples_zero() {
+        assert_eq!(validation_reason(&zone_toml(&[("sources", &smoothing_sources(0, "0"))])),
+            "zones[0].sources[0].smoothing_samples: must be greater than 0");
+    }
+
+    #[test]
+    fn smoothing_samples_zero_error_names_the_source_index() {
+        assert_eq!(validation_reason(&zone_toml(&[("sources", &smoothing_sources(1, "0"))])),
+            "zones[0].sources[1].smoothing_samples: must be greater than 0");
+    }
+
+    #[test]
+    fn smoothing_samples_zero_error_names_the_zone_index() {
+        let contents = zone_toml(&[]) + &zone_toml(&[("sources", &smoothing_sources(2, "0"))]);
+
+        assert_eq!(validation_reason(&contents),
+            "zones[1].sources[2].smoothing_samples: must be greater than 0");
+    }
+
+    #[test]
+    fn rejects_smoothing_samples_above_255() {
+        let message = parse_error(&zone_toml(&[("sources", &smoothing_sources(0, "256"))]));
+
+        assert!(message.contains("smoothing_samples: invalid value"), "{}", message);
+    }
+
+    #[test]
+    fn rejects_repeated_smoothing_samples_in_source() {
+        let sources = r#"[{ type = "file", path = "/sys/temp", smoothing_samples = 3, smoothing_samples = 1 }]"#;
+        let message = parse_error(&zone_toml(&[("sources", sources)]));
+
+        assert!(message.contains("duplicate field `smoothing_samples`"), "{}", message);
     }
 
     #[test]
