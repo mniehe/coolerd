@@ -518,6 +518,7 @@ mod tests {
             sources,
             aggregation: Aggregation::Maximum,
             steps: Some(steps.to_vec()),
+            curve: None,
             duty_aggregation: Aggregation::Maximum,
             hysteresis: 0,
             curve_hysteresis: None,

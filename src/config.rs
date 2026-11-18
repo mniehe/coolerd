@@ -155,6 +155,8 @@ pub struct SourceConfig {
     pub steps: Option<Vec<Step>>,
     pub on_failure: OnFailure,
     pub smoothing_samples: u8,
+    /// The name of an entry of `curves`, which sets `steps`
+    pub curve: Option<String>,
     /// The hysteresis of the named curve that set `steps`; `None` means the
     /// zone's `hysteresis` applies. Not a config key.
     pub curve_hysteresis: Option<u8>,
@@ -163,13 +165,20 @@ pub struct SourceConfig {
 impl SourceConfig {
     /// A source of `kind` with every other key at its default
     pub fn new(kind: Source) -> Self {
-        Self { kind, steps: None, on_failure: OnFailure::default(), smoothing_samples: 1, curve_hysteresis: None }
+        Self {
+            kind,
+            steps: None,
+            on_failure: OnFailure::default(),
+            smoothing_samples: 1,
+            curve: None,
+            curve_hysteresis: None,
+        }
     }
 }
 
 /// Serde cannot combine `flatten` with `deny_unknown_fields`, so `steps`,
-/// `on_failure` and `smoothing_samples` are taken out of the table by hand and
-/// the rest goes to [`Source`], which still rejects an unknown key or type. A
+/// `curve`, `on_failure` and `smoothing_samples` are taken out of the table by
+/// hand and the rest goes to [`Source`], which still rejects an unknown key or type. A
 /// sequence, the positional form that [`Source`] accepts, goes to it unchanged
 /// and has every other key at its default.
 impl<'de> Deserialize<'de> for SourceConfig {
@@ -203,12 +212,14 @@ impl<'de> Deserialize<'de> for SourceConfig {
             {
                 let mut table = toml::value::Table::new();
                 let mut steps = None;
+                let mut curve = None;
                 let mut on_failure = None;
                 let mut smoothing_samples = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     let repeated = match key.as_str() {
                         "steps" => steps.is_some(),
+                        "curve" => curve.is_some(),
                         "on_failure" => on_failure.is_some(),
                         "smoothing_samples" => smoothing_samples.is_some(),
                         _ => table.contains_key(&key),
@@ -224,6 +235,10 @@ impl<'de> Deserialize<'de> for SourceConfig {
                         "steps" => {
                             steps = Some(Vec::<Step>::deserialize(value)
                                 .map_err(|e| de::Error::custom(format!("steps: {}", e)))?);
+                        }
+                        "curve" => {
+                            curve = Some(String::deserialize(value)
+                                .map_err(|e| de::Error::custom(format!("curve: {}", e)))?);
                         }
                         "on_failure" => {
                             on_failure = Some(OnFailure::deserialize(value)
@@ -246,6 +261,7 @@ impl<'de> Deserialize<'de> for SourceConfig {
 
                 Ok(SourceConfig {
                     steps,
+                    curve,
                     on_failure: on_failure.unwrap_or(defaults.on_failure),
                     smoothing_samples: smoothing_samples.unwrap_or(defaults.smoothing_samples),
                     ..defaults
@@ -286,6 +302,9 @@ pub struct Zone {
     /// has `steps`, so the zone curve is never used.
     #[serde(default)]
     pub steps: Option<Vec<Step>>,
+    /// The name of an entry of `curves`, which sets `steps`
+    #[serde(default)]
+    pub curve: Option<String>,
     /// How the duties of the zone's curves combine into one
     #[serde(default)]
     pub duty_aggregation: Aggregation,
@@ -413,7 +432,20 @@ pub struct Config {
     pub log_level: LogLevel,
     #[serde(default)]
     pub sessions: Sessions,
+    /// Curves that a source or a zone names with `curve`
+    #[serde(default)]
+    pub curves: HashMap<String, CurveConfig>,
     pub zones: Vec<Zone>,
+}
+
+/// A curve defined once and named by any number of sources and zones
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurveConfig {
+    pub steps: Vec<Step>,
+    /// Degrees the curve's temperature must fall before its duty follows
+    #[serde(default)]
+    pub hysteresis: u8,
 }
 
 /// Whether `value` is exactly `len` hex digits, in either case
@@ -486,6 +518,11 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
             reason: "zones: must be non-empty".to_owned(),
         });
     }
+
+    // Before the zone checks, so that a named curve meets every check of
+    // inline steps
+    resolve_curves(&mut config)
+        .map_err(|reason| Error::ConfigValidation { path: path.to_owned(), reason })?;
 
     for (i, zone_config) in config.zones.iter().enumerate() {
         if zone_config.interval.0 == 0 {
@@ -622,6 +659,50 @@ fn check_sessions(sessions: &Sessions) -> Result<(), String> {
     Ok(())
 }
 
+/// Check the `curves` table and every `curve` key, then copy each named curve
+/// into the `steps` and `curve_hysteresis` of the source or zone that names
+/// it, so that the runtime needs no `curves` table. Curves are checked in name
+/// order, so the same config always gives the same reason.
+fn resolve_curves(config: &mut Config) -> Result<(), String> {
+    let mut names: Vec<&String> = config.curves.keys().collect();
+    names.sort();
+
+    for name in names {
+        check_steps(&config.curves[name].steps, &format!("curves.{}.steps", name))?;
+    }
+
+    for (i, zone) in config.zones.iter_mut().enumerate() {
+        if let Some(name) = &zone.curve {
+            let curve = named_curve(&config.curves, name, zone.steps.is_some(), &format!("zones[{}].curve", i))?;
+
+            zone.steps = Some(curve.steps.clone());
+            zone.curve_hysteresis = Some(curve.hysteresis);
+        }
+
+        for (j, source) in zone.sources.iter_mut().enumerate() {
+            if let Some(name) = &source.curve {
+                let key = format!("zones[{}].sources[{}].curve", i, j);
+                let curve = named_curve(&config.curves, name, source.steps.is_some(), &key)?;
+
+                source.steps = Some(curve.steps.clone());
+                source.curve_hysteresis = Some(curve.hysteresis);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// The curve that `key` names, which must exist and must not stand beside
+/// inline `steps`
+fn named_curve<'a>(curves: &'a HashMap<String, CurveConfig>, name: &str, has_steps: bool, key: &str) -> Result<&'a CurveConfig, String> {
+    if has_steps {
+        return Err(format!("{}: set either steps or curve, not both", key));
+    }
+
+    curves.get(name).ok_or_else(|| format!("{}: unknown curve {:?}", key, name))
+}
+
 /// Check a curve's steps. `key` names the list in the reason, such as
 /// `zones[0].steps`.
 fn check_steps(steps: &[Step], key: &str) -> Result<(), String> {
@@ -648,7 +729,10 @@ mod tests {
     use {
         std::path::Path,
         super::{Aggregation, Config, LogLevel, OnFailure, parse_config, SessionType, Source},
-        crate::error::{Error, Result},
+        crate::{
+            curve::{SourceReading, ZoneState},
+            error::{Error, Result},
+        },
     };
 
     const CONFIG_PATH: &str = "/etc/ipmi-fan-control.toml";
@@ -1405,6 +1489,160 @@ mod tests {
 
         assert_eq!(validation_reason(&zone_toml(&[("duty_aggregation", aggregation)])),
             "zones[0].duty_aggregation[type=average].top: must be greater than 0");
+    }
+
+    /// `contents` followed by a `[curves.gpu]` table with `steps` and the
+    /// extra lines in `rest`
+    fn with_gpu_curve(contents: &str, steps: &str, rest: &str) -> String {
+        format!("{}\n[curves.gpu]\nsteps = {}\n{}", contents, steps, rest)
+    }
+
+    /// A zone of two file sources, each with the extra keys in `keys`
+    fn two_sources_toml(keys: &str) -> String {
+        let sources = format!(r#"[{{ type = "file", path = "/sys/a", {} }}, {{ type = "file", path = "/sys/b", {} }}]"#, keys, keys);
+
+        omit_key(&zone_toml(&[("sources", &sources)]), "steps")
+    }
+
+    #[test]
+    fn accepts_sources_that_name_a_curve() {
+        let contents = with_gpu_curve(&two_sources_toml(r#"curve = "gpu""#), GPU_STEPS, "hysteresis = 3\n");
+        let config = parse(&contents).unwrap();
+
+        assert_eq!(config.curves["gpu"].hysteresis, 3);
+
+        for source in &config.zones[0].sources {
+            assert_eq!(source.curve.as_deref(), Some("gpu"));
+            let steps = source.steps.as_ref().unwrap();
+            assert_eq!(steps.iter().map(|s| (s.temp, s.dcycle)).collect::<Vec<_>>(), [(60, 40), (90, 100)]);
+            assert_eq!(source.curve_hysteresis, Some(3));
+        }
+    }
+
+    #[test]
+    fn accepts_zone_that_names_a_curve() {
+        let contents = with_gpu_curve(&omit_key(&zone_toml(&[("curve", r#""gpu""#)]), "steps"), GPU_STEPS, "");
+        let config = parse(&contents).unwrap();
+        let zone = &config.zones[0];
+
+        assert_eq!(zone.steps.as_ref().unwrap().len(), 2);
+        // The curve's hysteresis defaults to 0, whatever the zone's is
+        assert_eq!(zone.curve_hysteresis, Some(0));
+    }
+
+    #[test]
+    fn inline_steps_keep_the_zone_hysteresis() {
+        let config = parse(&source_steps_toml(GPU_STEPS)).unwrap();
+        let zone = &config.zones[0];
+
+        assert_eq!(zone.curve_hysteresis, None);
+        assert!(zone.sources.iter().all(|s| s.curve.is_none() && s.curve_hysteresis.is_none()));
+    }
+
+    /// The duties of the first zone of `contents` when both of its sources
+    /// read each of `temps` in turn
+    fn zone_duties(contents: &str, temps: &[u8]) -> Vec<u8> {
+        let config = parse(contents).unwrap();
+        let zone = &config.zones[0];
+        let mut state = ZoneState::new(zone);
+
+        temps.iter()
+            .map(|&t| state.next_duty(zone, &[SourceReading::Temp(t), SourceReading::Temp(t)]).duty)
+            .collect()
+    }
+
+    #[test]
+    fn named_curve_gives_the_duties_of_the_same_inline_steps() {
+        let named = with_gpu_curve(&two_sources_toml(r#"curve = "gpu""#), GPU_STEPS, "hysteresis = 3\n");
+        let inline = two_sources_toml(&format!("steps = {}", GPU_STEPS)) + "hysteresis = 3\n";
+        // A fall of 2 from 72 C is held; a fall of 4 is followed
+        let temps = [60, 72, 70, 68];
+
+        assert_eq!(zone_duties(&named, &temps), [40, 64, 64, 56]);
+        assert_eq!(zone_duties(&inline, &temps), [40, 64, 64, 56]);
+    }
+
+    #[test]
+    fn rejects_unknown_source_curve() {
+        let sources = r#"[{ type = "ipmi", sensor = "CPU Temp" }, { type = "file", path = "/sys/temp", curve = "x" }]"#;
+
+        assert_eq!(validation_reason(&zone_toml(&[("sources", sources)])),
+            r#"zones[0].sources[1].curve: unknown curve "x""#);
+    }
+
+    #[test]
+    fn rejects_unknown_zone_curve() {
+        let contents = omit_key(&zone_toml(&[("curve", r#""x""#)]), "steps");
+
+        assert_eq!(validation_reason(&contents), r#"zones[0].curve: unknown curve "x""#);
+    }
+
+    #[test]
+    fn rejects_source_with_steps_and_curve() {
+        let sources = format!(r#"[{{ type = "file", path = "/sys/temp", steps = {}, curve = "gpu" }}]"#, GPU_STEPS);
+        let contents = with_gpu_curve(&zone_toml(&[("sources", &sources)]), GPU_STEPS, "");
+
+        assert_eq!(validation_reason(&contents), "zones[0].sources[0].curve: set either steps or curve, not both");
+    }
+
+    #[test]
+    fn rejects_zone_with_steps_and_curve() {
+        let contents = with_gpu_curve(&zone_toml(&[("curve", r#""gpu""#)]), GPU_STEPS, "");
+
+        assert_eq!(validation_reason(&contents), "zones[0].curve: set either steps or curve, not both");
+    }
+
+    #[test]
+    fn rejects_curve_dcycle_above_100() {
+        let contents = with_gpu_curve(&zone_toml(&[]), "[{ temp = 60, dcycle = 40 }, { temp = 90, dcycle = 101 }]", "");
+
+        assert_eq!(validation_reason(&contents), "curves.gpu.steps[1].dcycle: invalid percentage: 101");
+    }
+
+    #[test]
+    fn rejects_curve_non_increasing_temp() {
+        let contents = with_gpu_curve(&zone_toml(&[]), "[{ temp = 60, dcycle = 40 }, { temp = 60, dcycle = 50 }]", "");
+
+        assert_eq!(validation_reason(&contents), "curves.gpu.steps[1].temp: values are not strictly increasing");
+    }
+
+    #[test]
+    fn rejects_empty_named_curve_on_a_source() {
+        let sources = r#"[{ type = "file", path = "/sys/temp", curve = "gpu" }]"#;
+        let contents = with_gpu_curve(&zone_toml(&[("sources", sources)]), "[]", "");
+
+        assert_eq!(validation_reason(&contents),
+            "zones[0].sources[0].steps: must be non-empty; remove the key to use the zone's steps");
+    }
+
+    #[test]
+    fn rejects_zone_without_a_curve_when_a_source_has_none() {
+        let sources = r#"[{ type = "ipmi", sensor = "CPU Temp" }, { type = "file", path = "/sys/temp", curve = "gpu" }]"#;
+        let contents = with_gpu_curve(&omit_key(&zone_toml(&[("sources", sources)]), "steps"), GPU_STEPS, "");
+
+        assert_eq!(validation_reason(&contents), "zones[0].steps: must be set when a source has no steps");
+    }
+
+    #[test]
+    fn rejects_unknown_key_in_curve() {
+        let message = parse_error(&with_gpu_curve(&zone_toml(&[]), GPU_STEPS, "slope = 1\n"));
+
+        assert!(message.contains("unknown field `slope`"), "{}", message);
+    }
+
+    #[test]
+    fn rejects_repeated_curve_in_source() {
+        let sources = r#"[{ type = "file", path = "/sys/temp", curve = "gpu", curve = "gpu" }]"#;
+        let message = parse_error(&with_gpu_curve(&zone_toml(&[("sources", sources)]), GPU_STEPS, ""));
+
+        assert!(message.contains("duplicate field `curve`"), "{}", message);
+    }
+
+    #[test]
+    fn positional_source_has_no_curve() {
+        let config = parse(&zone_toml(&[("sources", r#"[["file", "/dev/null"]]"#)])).unwrap();
+
+        assert!(config.zones[0].sources[0].curve.is_none());
     }
 
     /// Build a zone whose second source is an nvidia source with `gpu`
