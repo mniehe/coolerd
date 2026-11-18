@@ -1035,6 +1035,63 @@ mod tests {
         });
     }
 
+    /// A block device that does not exist, so that a host that has the real
+    /// disk tool touches no disk
+    const ABSENT_DEV: &str = "/nonexistent/ipmi-fan-control-test-disk";
+
+    /// Keep a child on the runner of source 0 as a run of `program`, the
+    /// program that [`ZoneReaders::read`] runs for `source`, and give the
+    /// results of reading `source` at index 0 and then at index 1
+    fn reads_beside_kept_child(program: &str, source: &Source) -> (Result<u8, Error>, Result<u8, Error>) {
+        let mut readers = ZoneReaders::default();
+
+        // Dropped inside the runtime, so the kept child is killed and reaped there
+        blocking(move || {
+            readers.runner(0).keep(spawn_sleeper(), Path::new(program));
+
+            (readers.read(0, source), readers.read(1, source))
+        })
+    }
+
+    /// Assert that only the source whose runner keeps a child is refused. The
+    /// other may fail another way, as the real program can be absent.
+    fn assert_only_source_0_refused(program: &str, source: Source) {
+        let (first, second) = reads_beside_kept_child(program, &source);
+
+        assert!(matches!(&first, Err(Error::CommandStillRunning { .. })), "{:?}", first);
+        assert!(!matches!(&second, Err(Error::CommandStillRunning { .. })), "{:?}", second);
+    }
+
+    #[test]
+    fn nvidia_read_uses_the_runner_of_its_own_index() {
+        assert_only_source_0_refused("nvidia-smi", Source::Nvidia { gpu: GPU.into() });
+    }
+
+    #[test]
+    fn smart_read_uses_the_runner_of_its_own_index() {
+        assert_only_source_0_refused("smartctl", Source::Smart { block_dev: ABSENT_DEV.into() });
+    }
+
+    #[test]
+    fn hdparm_read_uses_the_runner_of_its_own_index() {
+        assert_only_source_0_refused("hdparm", Source::Hdparm { block_dev: ABSENT_DEV.into() });
+    }
+
+    #[test]
+    fn runner_of_a_source_persists_between_reads() {
+        let source = Source::Nvidia { gpu: GPU.into() };
+        let mut readers = ZoneReaders::default();
+
+        let (first, second) = blocking(move || {
+            readers.runner(0).keep(spawn_sleeper(), Path::new("nvidia-smi"));
+
+            (readers.read(0, &source), readers.read(0, &source))
+        });
+
+        assert!(matches!(&first, Err(Error::CommandStillRunning { .. })), "{:?}", first);
+        assert!(matches!(&second, Err(Error::CommandStillRunning { .. })), "{:?}", second);
+    }
+
     /// A zone with no wait between retries
     fn zone(sources: Vec<SourceConfig>, retries: usize) -> Zone {
         Zone {
