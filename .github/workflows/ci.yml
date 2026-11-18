@@ -8,11 +8,13 @@ jobs:
   build:
     name: Build project
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
     env:
       CARGO_TERM_COLOR: always
     steps:
       - name: Check out repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 
@@ -45,19 +47,41 @@ jobs:
       - name: Build in debug mode
         run: cargo build --verbose
 
-  build_source_packages:
-    name: Build source packages
-    runs-on: ubuntu-22.04
-    env:
-      CARGO_TERM_COLOR: always
+  nix:
+    name: Check and build flake
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Check out repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v7.0.1
         with:
-          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Build all source packages
-        run: |
-          sudo apt-get -y update
-          sudo apt-get -y install cargo debhelper devscripts dh-exec
-          ./dist/build_source_package.py -a
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@v3.24.2
+
+      - name: Check flake
+        run: nix flake check --no-update-lock-file
+
+      - name: Build package
+        run: nix build --no-update-lock-file .#default
+
+  actions_lock:
+    name: Verify actions lockfile
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install gh-actions-lock
+        run: gh extension install github/gh-actions-lock --pin v0.4.1
+
+      - name: Verify lockfile
+        run: gh actions-lock --verify
