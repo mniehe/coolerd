@@ -121,7 +121,7 @@ A source that fails is read again after `retry_delay_ms`, up to `retries` times;
 
 A source that failed in the previous update gets one attempt in each update and no retries, until it reads again. A source that keeps failing therefore leaves the retries to the other sources and adds one attempt to each update.
 
-A program that does not answer in time is stopped: smartctl and hdparm after 30 seconds, nvidia-smi after 5 seconds. Earlier versions waited for smartctl and hdparm without a limit. A stopped program can fail to exit, as nvidia-smi can in a hung driver. Its source then does not start the program again until the old process is gone, and until then that source fails at once. Each source tracks only its own process, so other sources still run, including sources that run the same program.
+A program that does not answer in time is stopped: smartctl and hdparm after 30 seconds, nvidia-smi after 5 seconds. Earlier versions waited for smartctl and hdparm without a limit. Only that program is stopped, not the processes it started, so a wrapper script used in place of one of these tools must not leave helper processes behind. A stopped program can fail to exit, as nvidia-smi can in a hung driver. Its source then does not start the program again until the old process is gone, and until then that source fails at once. Each source tracks only its own process, so other sources still run, including sources that run the same program.
 
 When a source still fails after the last retry, its `on_failure` decides what the zone does:
 
