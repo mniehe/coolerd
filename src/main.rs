@@ -258,8 +258,8 @@ impl MainApp {
         for z in &zone_config.ipmi_zones {
             let dcycle_cur = ipmi_lock.get_duty_cycle(*z)?;
 
-            debug!("[{}] Zone {}: curve_temps={:?}C, dcycle_cur={}%, dcycle_new={}%",
-                   session.name, z, update.curve_temps, dcycle_cur, dcycle_new);
+            debug!("[{}] Zone {}: smoothed_temps={:?}C, curve_temps={:?}C, dcycle_cur={}%, dcycle_new={}%",
+                   session.name, z, update.smoothed_temps, update.curve_temps, dcycle_cur, dcycle_new);
 
             if dcycle_new != dcycle_cur {
                 ipmi_lock.set_duty_cycle(*z, dcycle_new)?;

@@ -1,5 +1,5 @@
 use {
-    std::cmp::Reverse,
+    std::{cmp::Reverse, collections::VecDeque},
     crate::config::{Aggregation, OnFailure, Step, Zone},
 };
 
@@ -109,6 +109,43 @@ impl HeldTemp {
     }
 }
 
+/// The last readings of one source, which replace each new reading by their
+/// mean
+struct Smoother {
+    readings: VecDeque<u8>,
+    capacity: usize,
+}
+
+impl Smoother {
+    fn new(capacity: u8) -> Self {
+        let capacity = usize::from(capacity);
+
+        Self { readings: VecDeque::with_capacity(capacity), capacity }
+    }
+
+    /// Store a reading, dropping the oldest at capacity, and return the
+    /// truncated mean of the stored readings
+    fn push(&mut self, temp: u8) -> u8 {
+        if self.readings.len() >= self.capacity {
+            self.readings.pop_front();
+        }
+
+        self.readings.push_back(temp);
+
+        let sum = self.readings.iter().copied().map(u32::from).sum::<u32>();
+        // The deque holds at most 255 readings and at least the one just
+        // pushed, so the count is not zero and the mean fits in a u8
+        let count = self.readings.len() as u32;
+
+        (sum / count) as u8
+    }
+
+    /// Forget every stored reading
+    fn clear(&mut self) {
+        self.readings.clear();
+    }
+}
+
 /// The outcome of reading one source in one poll
 #[derive(Clone, Debug, PartialEq)]
 pub enum SourceReading {
@@ -132,10 +169,18 @@ pub struct ZoneUpdate {
     pub curve_temps: Vec<u8>,
     /// The sources that started or stopped failing in this poll
     pub transitions: Vec<Transition>,
+    /// The reading of each source after smoothing, in source order; `None`
+    /// for a source that failed in this poll
+    pub smoothed_temps: Vec<Option<u8>>,
 }
+
+/// How many readings of a source are averaged; one leaves each reading as it
+/// is
+const SMOOTHING_SAMPLES: u8 = 1;
 
 /// What a zone keeps of one source between polls
 struct SourceState {
+    smoother: Smoother,
     /// Only a source with `steps` uses its curve
     curve: HeldTemp,
     failed: bool,
@@ -184,7 +229,11 @@ impl ZoneState {
         Self {
             zone_curve: HeldTemp(None),
             sources: zone.sources.iter()
-                .map(|_| SourceState { curve: HeldTemp(None), failed: false })
+                .map(|_| SourceState {
+                    smoother: Smoother::new(SMOOTHING_SAMPLES),
+                    curve: HeldTemp(None),
+                    failed: false,
+                })
                 .collect(),
         }
     }
@@ -195,19 +244,27 @@ impl ZoneState {
     }
 
     /// Compute the zone duty from one reading per source, in source order.
-    /// Sources without `steps` are aggregated into the zone curve; each source
-    /// with `steps` maps its reading through its own curve. A failed source
-    /// takes part in neither, its curve holds its temperature, and its
-    /// `on_failure` sets the lowest duty the zone may run at.
+    /// Each reading is first replaced by the mean of the source's last
+    /// readings. Sources without `steps` are aggregated into the zone curve;
+    /// each source with `steps` maps its reading through its own curve. A
+    /// failed source takes part in neither, forgets its stored readings, its
+    /// curve holds its temperature, and its `on_failure` sets the lowest duty
+    /// the zone may run at.
     pub fn next_duty(&mut self, zone: &Zone, readings: &[SourceReading]) -> ZoneUpdate {
         if readings.len() != zone.sources.len() || readings.len() != self.sources.len() {
-            return ZoneUpdate { duty: FULL_DUTY, curve_temps: Vec::new(), transitions: Vec::new() };
+            return ZoneUpdate {
+                duty: FULL_DUTY,
+                curve_temps: Vec::new(),
+                transitions: Vec::new(),
+                smoothed_temps: Vec::new(),
+            };
         }
 
         let mut zone_readings = Vec::new();
         let mut source_temps = Vec::new();
         let mut source_duties = Vec::new();
         let mut transitions = Vec::new();
+        let mut smoothed_temps = Vec::new();
         let mut floor = 0;
 
         let sources = zone.sources.iter().zip(&mut self.sources).zip(readings);
@@ -216,12 +273,17 @@ impl ZoneState {
             transitions.extend(state.transition(index, reading));
 
             let reading = match reading {
-                SourceReading::Temp(temp) => *temp,
+                SourceReading::Temp(temp) => state.smoother.push(*temp),
                 SourceReading::Failed(_) => {
+                    // A recovered source starts from fresh readings
+                    state.smoother.clear();
+                    smoothed_temps.push(None);
                     floor = floor.max(failure_floor(&source.on_failure));
                     continue;
                 }
             };
+
+            smoothed_temps.push(Some(reading));
 
             match &source.steps {
                 Some(steps) => {
@@ -257,7 +319,7 @@ impl ZoneState {
             None => FULL_DUTY,
         };
 
-        ZoneUpdate { duty, curve_temps, transitions }
+        ZoneUpdate { duty, curve_temps, transitions, smoothed_temps }
     }
 }
 
@@ -268,6 +330,7 @@ mod tests {
             aggregate,
             duty_for_temp,
             Rounding,
+            Smoother,
             SourceReading::{self, Failed, Temp},
             Transition,
             ZoneState,
@@ -696,6 +759,91 @@ mod tests {
         let zone = zone(&ZONE_STEPS, vec![plain(), curved(&GPU_STEPS)]);
 
         assert_eq!(duties(&zone, &[&[30]]), [100]);
+    }
+
+    /// Push each reading into a smoother and collect the means
+    fn smoothed(smoother: &mut Smoother, readings: &[u8]) -> Vec<u8> {
+        readings.iter().map(|&t| smoother.push(t)).collect()
+    }
+
+    #[test]
+    fn smoother_gives_truncated_mean_of_last_readings() {
+        // 40 + 70 is 55; then 40, 70, 40 and 70, 40, 40 are 50
+        let mut smoother = Smoother::new(3);
+
+        assert_eq!(smoothed(&mut smoother, &[40, 70, 40, 40]), [40, 55, 50, 50]);
+    }
+
+    #[test]
+    fn smoother_of_one_sample_returns_each_reading() {
+        let mut smoother = Smoother::new(1);
+
+        assert_eq!(smoothed(&mut smoother, &[40, 70, 40, 40]), [40, 70, 40, 40]);
+    }
+
+    #[test]
+    fn smoother_starts_fresh_after_clear() {
+        let mut smoother = Smoother::new(3);
+        smoothed(&mut smoother, &[40, 70]);
+        smoother.clear();
+
+        assert_eq!(smoother.push(60), 60);
+    }
+
+    #[test]
+    fn smoother_of_255_hottest_readings_gives_255() {
+        // The sum of the readings, 65025, overflows a u8
+        let mut smoother = Smoother::new(255);
+        let means = smoothed(&mut smoother, &[255; 256]);
+
+        assert!(means.iter().all(|&mean| mean == 255), "{:?}", means);
+    }
+
+    #[test]
+    fn unsmoothed_zone_keeps_todays_duties_and_temperatures() {
+        // A zone of every kind of source: a zone curve with an average of two
+        // plain sources, a source curve, an ignored source that fails, and
+        // hysteresis. The duties are those of a772062, before smoothing.
+        let mut zone = zone(&HOLD_STEPS, vec![
+            plain(),
+            plain(),
+            curved(&GPU_STEPS),
+            failing(curved(&HOLD_STEPS), OnFailure::Ignore {}),
+        ]);
+        zone.aggregation = Aggregation::Average { top: None };
+        zone.hysteresis = 5;
+        let updates = updates(&zone, &[
+            vec![Temp(40), Temp(40), Temp(60), Temp(40)],
+            vec![Temp(70), Temp(70), Temp(80), failed()],
+            vec![Temp(40), Temp(40), Temp(78), Temp(40)],
+            vec![Temp(40), Temp(40), Temp(60), Temp(40)],
+        ]);
+        let duties: Vec<_> = updates.iter().map(|u| u.duty).collect();
+        let curve_temps: Vec<_> = updates.iter().map(|u| u.curve_temps.clone()).collect();
+        let smoothed_temps: Vec<_> = updates.iter().map(|u| u.smoothed_temps.clone()).collect();
+
+        assert_eq!(duties, [40, 85, 80, 40]);
+        assert_eq!(curve_temps, [vec![40, 60, 40], vec![70, 80], vec![40, 80, 40], vec![40, 60, 40]]);
+        assert_eq!(smoothed_temps, [
+            vec![Some(40), Some(40), Some(60), Some(40)],
+            vec![Some(70), Some(70), Some(80), None],
+            vec![Some(40), Some(40), Some(78), Some(40)],
+            vec![Some(40), Some(40), Some(60), Some(40)],
+        ]);
+    }
+
+    #[test]
+    fn failed_source_has_no_smoothed_temperature() {
+        let zone = cpu_gpu_zone(OnFailure::Ignore {});
+
+        assert_eq!(updates(&zone, &[vec![Temp(50), failed()]])[0].smoothed_temps, [Some(50), None]);
+    }
+
+    #[test]
+    fn reading_count_mismatch_gives_no_smoothed_temperature() {
+        let zone = zone(&ZONE_STEPS, vec![plain(), curved(&GPU_STEPS)]);
+
+        assert!(updates(&zone, &[temps(&[30])])[0].smoothed_temps.is_empty());
     }
 
     const STEPS: [Step; 2] = [
