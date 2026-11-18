@@ -202,6 +202,11 @@ pub mod testing {
     /// Longest a test waits for a script's file or a child's state to appear
     pub const APPEAR_WAIT: Duration = Duration::from_secs(10);
 
+    /// Limit for a run that must time out after its script has recorded a
+    /// pid. It is far above any scheduling delay, so the script records the
+    /// pid before the deadline even on a loaded host.
+    pub const READY_LIMIT: Duration = Duration::from_secs(10);
+
     /// Directory under the system temp dir that is removed when dropped
     pub struct TempDir(pub PathBuf);
 
@@ -318,6 +323,13 @@ pub mod testing {
     pub fn sleeping_body(pid_file: &Path) -> String {
         format!("echo $$ > '{}'\nexec sleep 30", pid_file.display())
     }
+
+    /// Body of a script that starts a descendant, records the descendant's
+    /// pid in `pid_file`, prints a reading and exits. The descendant sleeps
+    /// until killed and keeps the script's stdout open.
+    pub fn descendant_body(pid_file: &Path) -> String {
+        format!("sleep 30 &\necho $! > '{}'\necho 71", pid_file.display())
+    }
 }
 
 #[cfg(test)]
@@ -341,6 +353,7 @@ mod tests {
             RunLimits,
             testing::{
                 blocking,
+                descendant_body,
                 poll_until,
                 script_lock,
                 sleeping_body,
@@ -350,6 +363,7 @@ mod tests {
                 written_pid,
                 KillOnDrop,
                 TempDir,
+                READY_LIMIT,
             },
         },
         crate::error::Error,
@@ -493,23 +507,22 @@ mod tests {
         let dir = TempDir::new();
         let pid_file = dir.0.join("pid");
         let _stray = KillOnDrop(pid_file.clone());
-        // The script exits at once, but the background sleep keeps its stdout open
-        let body = format!("sleep 30 &\necho $! > '{}'\necho 71", pid_file.display());
         let _guard = script_lock();
-        let script = write_script(&dir, "tool", &body);
+        // The script exits at once, but the background sleep keeps its stdout open
+        let script = write_script(&dir, "tool", &descendant_body(&pid_file));
         let mut runner = CommandRunner::default();
 
         let start = Instant::now();
-        let result = blocking(|| runner.run(&script, &[], limits(TIMEOUT_LIMIT)));
+        let result = blocking(|| runner.run(&script, &[], limits(READY_LIMIT)));
         let elapsed = start.elapsed();
 
         assert!(matches!(&result, Err(Error::CommandTimeout { .. })), "{:?}", result);
-        assert!(elapsed < TIMEOUT_LIMIT + KILL_GRACE + RETURN_SLACK, "returned after {:?}", elapsed);
+        assert!(elapsed < READY_LIMIT + KILL_GRACE + RETURN_SLACK, "returned after {:?}", elapsed);
         assert!(runner.release_exited(), "the exited script is still kept");
+        let pid = written_pid(&pid_file).expect("the script did not record its descendant's pid");
+        let pipe = pipe_of(&pid, "1").expect("stdout of the descendant is not a pipe");
         // Nothing of ours still reads the pipe the descendant writes to
-        if let Some(pipe) = written_pid(&pid_file).and_then(|pid| pipe_of(&pid, "1")) {
-            assert!(!holds_pipe(&pipe), "{} is still open here", pipe);
-        }
+        assert!(!holds_pipe(&pipe), "{} is still open here", pipe);
     }
 
     /// A script that creates `marker` when it runs

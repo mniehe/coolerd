@@ -543,6 +543,7 @@ mod tests {
                 RunLimits,
                 testing::{
                     blocking,
+                    descendant_body,
                     poll_until,
                     script_lock,
                     sleeping_body,
@@ -552,6 +553,7 @@ mod tests {
                     written_pid,
                     KillOnDrop,
                     TempDir,
+                    READY_LIMIT,
                 },
             },
             config::{
@@ -994,13 +996,12 @@ mod tests {
         let pid_file = dir.0.join("pid");
         let _stray = KillOnDrop(pid_file.clone());
         // The script exits at once, but the background sleep keeps its stdout open
-        let body = format!("sleep 30 &\necho $! > '{}'\necho 71", pid_file.display());
-
-        let mut run = nvidia_script_reading(&dir, &body, TIMEOUT_LIMIT);
+        let mut run = nvidia_script_reading(&dir, &descendant_body(&pid_file), READY_LIMIT);
 
         assert_timed_out(&run);
-        assert!(run.elapsed < TIMEOUT_LIMIT + KILL_GRACE + RETURN_SLACK, "returned after {:?}", run.elapsed);
+        assert!(run.elapsed < READY_LIMIT + KILL_GRACE + RETURN_SLACK, "returned after {:?}", run.elapsed);
         assert!(run.runner.release_exited(), "the exited script is still kept");
+        assert!(written_pid(&pid_file).is_some(), "the script did not record its descendant's pid");
     }
 
     #[test]
