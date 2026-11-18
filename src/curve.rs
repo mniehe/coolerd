@@ -362,11 +362,7 @@ mod tests {
 
     /// A source that feeds the zone curve
     fn plain() -> SourceConfig {
-        SourceConfig {
-            kind: Source::File { path: "/sys/temp".to_owned() },
-            steps: None,
-            on_failure: OnFailure::default(),
-        }
+        SourceConfig::new(Source::File { path: "/sys/temp".to_owned() })
     }
 
     /// A source with a curve of its own

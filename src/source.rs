@@ -1425,11 +1425,11 @@ mod tests {
     }
 
     fn file(path: &str, on_failure: OnFailure) -> SourceConfig {
-        SourceConfig { kind: Source::File { path: path.to_owned() }, steps: None, on_failure }
+        SourceConfig { on_failure, ..SourceConfig::new(Source::File { path: path.to_owned() }) }
     }
 
     fn ipmi(sensor: &str, on_failure: OnFailure) -> SourceConfig {
-        SourceConfig { kind: Source::Ipmi { sensor: sensor.to_owned() }, steps: None, on_failure }
+        SourceConfig { on_failure, ..SourceConfig::new(Source::Ipmi { sensor: sensor.to_owned() }) }
     }
 
     const IGNORE: OnFailure = OnFailure::Ignore {};

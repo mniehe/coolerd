@@ -156,6 +156,13 @@ pub struct SourceConfig {
     pub on_failure: OnFailure,
 }
 
+impl SourceConfig {
+    /// A source of `kind` with every other key at its default
+    pub fn new(kind: Source) -> Self {
+        Self { kind, steps: None, on_failure: OnFailure::default() }
+    }
+}
+
 /// Serde cannot combine `flatten` with `deny_unknown_fields`, so `steps` and
 /// `on_failure` are taken out of the table by hand and the rest goes to
 /// [`Source`], which still rejects an unknown key or type. A sequence, the
@@ -181,7 +188,7 @@ impl<'de> Deserialize<'de> for SourceConfig {
             {
                 let kind = Source::deserialize(SeqAccessDeserializer::new(seq))?;
 
-                Ok(SourceConfig { kind, steps: None, on_failure: OnFailure::default() })
+                Ok(SourceConfig::new(kind))
             }
 
             // The table is collected by hand, so a repeated key is rejected
