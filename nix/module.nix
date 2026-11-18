@@ -45,7 +45,17 @@ in {
           zones = [
             {
               session = "default";
-              ipmi_zones = [0 1];
+              fans = [
+                {
+                  type = "supermicro";
+                  zone = 0;
+                }
+                {
+                  type = "supermicro";
+                  zone = 1;
+                }
+              ];
+              # The older form of the same fans: ipmi_zones = [0 1];
               interval = 10;
               sources = [
                 {

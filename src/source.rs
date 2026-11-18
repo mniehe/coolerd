@@ -1163,7 +1163,7 @@ mod tests {
             interval: Interval::default(),
             retries: Retries(retries),
             retry_delay_ms: RetryDelayMs(0),
-            ipmi_zones: vec![0],
+            ipmi_zones: Some(vec![0]),
             sources,
             aggregation: Aggregation::Maximum,
             steps: Some(vec![Step { temp: 45, dcycle: 45 }, Step { temp: 75, dcycle: 100 }]),
@@ -1171,6 +1171,8 @@ mod tests {
             duty_aggregation: Aggregation::Maximum,
             hysteresis: 0,
             curve_hysteresis: None,
+            fans: None,
+            fan_list: Vec::new(),
         }
     }
 

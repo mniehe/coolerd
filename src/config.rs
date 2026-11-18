@@ -283,6 +283,16 @@ pub enum Aggregation {
     },
 }
 
+/// One fan that a zone drives
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "lowercase", tag = "type")]
+pub enum FanConfig {
+    /// A Supermicro IPMI fan zone on the zone's `session`
+    Supermicro {
+        zone: u8,
+    },
+}
+
 /// A zone may also be written as a TOML array, whose values serde reads in the
 /// order the fields are declared. Add a new field after the existing ones, so
 /// that a config in that form keeps loading.
@@ -297,7 +307,9 @@ pub struct Zone {
     pub retries: Retries,
     #[serde(default)]
     pub retry_delay_ms: RetryDelayMs,
-    pub ipmi_zones: Vec<u8>,
+    /// The legacy form of `fans`: Supermicro zone numbers
+    #[serde(default)]
+    pub ipmi_zones: Option<Vec<u8>>,
     pub sources: Vec<SourceConfig>,
     #[serde(default)]
     pub aggregation: Aggregation,
@@ -319,6 +331,12 @@ pub struct Zone {
     /// `hysteresis` applies. Not a config key.
     #[serde(skip)]
     pub curve_hysteresis: Option<u8>,
+    /// The fans the zone drives
+    #[serde(default)]
+    pub fans: Option<Vec<FanConfig>>,
+    /// The fans of `fans` or `ipmi_zones`, whichever is set. Not a config key.
+    #[serde(skip)]
+    pub fan_list: Vec<FanConfig>,
 }
 
 impl Zone {
@@ -527,7 +545,7 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
     resolve_curves(&mut config)
         .map_err(|reason| Error::ConfigValidation { path: path.to_owned(), reason })?;
 
-    for (i, zone_config) in config.zones.iter().enumerate() {
+    for (i, zone_config) in config.zones.iter_mut().enumerate() {
         if zone_config.interval.0 == 0 {
             return Err(Error::ConfigValidation {
                 path: path.to_owned(),
@@ -535,12 +553,10 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
             });
         }
 
-        if zone_config.ipmi_zones.is_empty() {
-            return Err(Error::ConfigValidation {
-                path: path.to_owned(),
-                reason: format!("zones[{}].ipmi_zones: must be non-empty", i),
-            });
-        } else if zone_config.sources.is_empty() {
+        zone_config.fan_list = zone_fans(zone_config, i)
+            .map_err(|reason| Error::ConfigValidation { path: path.to_owned(), reason })?;
+
+        if zone_config.sources.is_empty() {
             return Err(Error::ConfigValidation {
                 path: path.to_owned(),
                 reason: format!("zones[{}].sources: must be non-empty", i),
@@ -639,7 +655,85 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
         }
     }
 
+    // After every zone's own checks, because it compares zones
+    check_fan_owners(&config.zones)
+        .map_err(|reason| Error::ConfigValidation { path: path.to_owned(), reason })?;
+
     Ok(config)
+}
+
+/// The fans of zone `i` from `fans` or `ipmi_zones`, whichever is set
+fn zone_fans(zone: &Zone, i: usize) -> Result<Vec<FanConfig>, String> {
+    Ok(keyed_fans(zone, i)?.into_iter().map(|(_, fan)| fan).collect())
+}
+
+/// The fans of zone `i` from `fans` or `ipmi_zones`, each with the key that
+/// names it in a reason
+fn keyed_fans(zone: &Zone, i: usize) -> Result<Vec<(String, FanConfig)>, String> {
+    match (&zone.ipmi_zones, &zone.fans) {
+        (Some(_), Some(_)) => Err(format!("zones[{}].fans: cannot be combined with ipmi_zones", i)),
+        (Some(numbers), None) => legacy_fans(numbers, i),
+        (None, Some(fans)) => listed_fans(fans, i),
+        (None, None) => Err(format!("zones[{}].fans: must be non-empty", i)),
+    }
+}
+
+/// The Supermicro fans of an `ipmi_zones` list. A repeated number is dropped,
+/// because such a config loaded before `fans` existed.
+fn legacy_fans(numbers: &[u8], i: usize) -> Result<Vec<(String, FanConfig)>, String> {
+    if numbers.is_empty() {
+        return Err(format!("zones[{}].ipmi_zones: must be non-empty", i));
+    }
+
+    let mut fans: Vec<(String, FanConfig)> = Vec::new();
+
+    for (k, &zone) in numbers.iter().enumerate() {
+        let fan = FanConfig::Supermicro { zone };
+
+        if fans.iter().all(|(_, listed)| *listed != fan) {
+            fans.push((format!("zones[{}].ipmi_zones[{}]", i, k), fan));
+        }
+    }
+
+    Ok(fans)
+}
+
+/// The fans of a `fans` list, which must not repeat a fan
+fn listed_fans(fans: &[FanConfig], i: usize) -> Result<Vec<(String, FanConfig)>, String> {
+    if fans.is_empty() {
+        return Err(format!("zones[{}].fans: must be non-empty", i));
+    }
+
+    for (k, fan) in fans.iter().enumerate() {
+        if fans[..k].contains(fan) {
+            return Err(format!("zones[{}].fans[{}]: listed twice", i, k));
+        }
+    }
+
+    Ok(fans.iter().enumerate()
+        .map(|(k, fan)| (format!("zones[{}].fans[{}]", i, k), fan.clone()))
+        .collect())
+}
+
+/// Check that no fan is driven by two zones, which would fight over its duty.
+/// A Supermicro fan is the same fan in two zones when both name the same zone
+/// number on the same session. The zones must have passed `zone_fans`.
+fn check_fan_owners(zones: &[Zone]) -> Result<(), String> {
+    let mut owners = HashMap::new();
+
+    for (i, zone) in zones.iter().enumerate() {
+        for (key, fan) in keyed_fans(zone, i)? {
+            let owner = (zone.session.0.clone(), fan);
+
+            if let Some(first) = owners.get(&owner) {
+                return Err(format!("{}: already driven by zones[{}]", key, first));
+            }
+
+            owners.insert(owner, i);
+        }
+    }
+
+    Ok(())
 }
 
 /// Check that no setting of a remote session holds a NUL byte, which a C string
@@ -735,7 +829,7 @@ fn check_steps(steps: &[Step], key: &str) -> Result<(), String> {
 mod tests {
     use {
         std::path::Path,
-        super::{Aggregation, Config, LogLevel, OnFailure, parse_config, SessionType, Source},
+        super::{Aggregation, Config, FanConfig, LogLevel, OnFailure, parse_config, SessionType, Source},
         crate::{
             curve::{SourceReading, ZoneState},
             error::{Error, Result},
@@ -788,8 +882,35 @@ mod tests {
         let config = parse(include_str!("../config.sample.toml")).unwrap();
 
         assert_eq!(config.zones.len(), 1);
-        assert_eq!(config.zones[0].ipmi_zones, [0, 1]);
+        assert_eq!(config.zones[0].fan_list, [FanConfig::Supermicro { zone: 0 }]);
         assert!(!config.curves.is_empty());
+    }
+
+    #[test]
+    fn sample_ipmi_zones_loads_in_place_of_fans() {
+        const FANS: &str = "fans = [\n  { type = \"supermicro\", zone = 0 },\n]\n";
+        let sample = include_str!("../config.sample.toml");
+        let line = sample.lines()
+            .find(|l| l.starts_with("#ipmi_zones = "))
+            .expect("the sample has a commented ipmi_zones");
+        assert!(sample.contains(FANS), "the sample has the zone fans");
+        let edited = sample.replacen(FANS, "", 1).replacen(line, &line[1..], 1);
+        let config = parse(&edited).unwrap();
+
+        assert_eq!(config.zones[0].fan_list, [FanConfig::Supermicro { zone: 0 }]);
+    }
+
+    #[test]
+    fn sample_second_zone_loads_when_uncommented() {
+        let sample = include_str!("../config.sample.toml");
+        let start = sample.find("#[[zones]]\n").expect("the sample has a commented second zone");
+        let end = start + sample[start..].find("\n\n").unwrap();
+        let block = &sample[start..end];
+        let uncommented: Vec<&str> = block.lines().map(|l| &l[1..]).collect();
+        let config = parse(&sample.replacen(block, &uncommented.join("\n"), 1)).unwrap();
+
+        assert_eq!(config.zones.len(), 2);
+        assert_eq!(config.zones[1].fan_list, [FanConfig::Supermicro { zone: 1 }]);
     }
 
     #[test]
@@ -890,6 +1011,17 @@ mod tests {
         assert!(zone.sources[1].steps.is_some());
         assert!(matches!(zone.duty_aggregation, Aggregation::Maximum));
         assert_eq!(zone.hysteresis, 3);
+    }
+
+    #[test]
+    fn readme_fans_example_loads() {
+        let blocks = readme_toml_blocks();
+        let block = blocks.iter()
+            .find(|b| b.contains("fans = "))
+            .expect("the README has a TOML example with fans");
+        let config = parse(block).unwrap();
+
+        assert_eq!(config.zones[0].fan_list, [FanConfig::Supermicro { zone: 0 }, FanConfig::Supermicro { zone: 1 }]);
     }
 
     #[test]
@@ -1032,6 +1164,103 @@ mod tests {
     fn rejects_empty_ipmi_zones() {
         assert_eq!(validation_reason(&zone_toml(&[("ipmi_zones", "[]")])),
             "zones[0].ipmi_zones: must be non-empty");
+    }
+
+    fn supermicro(zones: &[u8]) -> Vec<FanConfig> {
+        zones.iter().map(|&zone| FanConfig::Supermicro { zone }).collect()
+    }
+
+    /// A one-zone config that names its fans with `fans` in place of
+    /// `ipmi_zones`
+    fn fans_toml(fans: &str) -> String {
+        omit_key(&zone_toml(&[("fans", fans)]), "ipmi_zones")
+    }
+
+    const SUPERMICRO_0_AND_1: &str = r#"[{ type = "supermicro", zone = 0 }, { type = "supermicro", zone = 1 }]"#;
+
+    #[test]
+    fn ipmi_zones_and_fans_load_to_equal_fan_lists() {
+        let legacy = parse(&zone_toml(&[("ipmi_zones", "[0, 1]")])).unwrap();
+        let listed = parse(&fans_toml(SUPERMICRO_0_AND_1)).unwrap();
+
+        assert_eq!(legacy.zones[0].fan_list, supermicro(&[0, 1]));
+        assert_eq!(listed.zones[0].fan_list, legacy.zones[0].fan_list);
+    }
+
+    #[test]
+    fn repeated_ipmi_zone_loads_as_one_fan() {
+        let config = parse(&zone_toml(&[("ipmi_zones", "[0, 0]")])).unwrap();
+
+        assert_eq!(config.zones[0].fan_list, supermicro(&[0]));
+    }
+
+    #[test]
+    fn rejects_fan_listed_twice() {
+        let fans = r#"[{ type = "supermicro", zone = 0 }, { type = "supermicro", zone = 0 }]"#;
+
+        assert_eq!(validation_reason(&fans_toml(fans)), "zones[0].fans[1]: listed twice");
+    }
+
+    #[test]
+    fn rejects_fans_beside_ipmi_zones() {
+        let contents = zone_toml(&[("fans", SUPERMICRO_0_AND_1)]);
+
+        assert_eq!(validation_reason(&contents), "zones[0].fans: cannot be combined with ipmi_zones");
+    }
+
+    #[test]
+    fn rejects_zone_without_fans() {
+        let contents = omit_key(&zone_toml(&[]), "ipmi_zones");
+
+        assert_eq!(validation_reason(&contents), "zones[0].fans: must be non-empty");
+    }
+
+    #[test]
+    fn rejects_empty_fans() {
+        assert_eq!(validation_reason(&fans_toml("[]")), "zones[0].fans: must be non-empty");
+    }
+
+    #[test]
+    fn rejects_unknown_key_in_fan() {
+        let message = parse_error(&fans_toml(r#"[{ type = "supermicro", zone = 0, speed = 1 }]"#));
+
+        assert!(message.contains("unknown field `speed`"), "{}", message);
+    }
+
+    /// Two zones that drive the IPMI zones of `first` and `second`, each a
+    /// line of keys, and a remote session named `bmc`
+    fn two_zones_toml(first: &str, second: &str) -> String {
+        let zone = |keys: &str| format!("[[zones]]\n{}\n{}{}\n",
+            keys,
+            "sources = [{ type = \"ipmi\", sensor = \"CPU Temp\" }]\n",
+            "steps = [{ temp = 40, dcycle = 40 }]");
+
+        format!("{}{}\n[sessions]\nbmc = {{ type = \"remote\", hostname = \"bmc.lan\", username = \"admin\", password = \"secret\" }}\n",
+            zone(first), zone(second))
+    }
+
+    #[test]
+    fn rejects_ipmi_zone_driven_by_two_zones_of_one_session() {
+        let contents = two_zones_toml("ipmi_zones = [1, 0]", "ipmi_zones = [2, 2, 0]");
+
+        assert_eq!(validation_reason(&contents), "zones[1].ipmi_zones[2]: already driven by zones[0]");
+    }
+
+    #[test]
+    fn rejects_supermicro_fan_driven_by_two_zones_of_one_session() {
+        let contents = two_zones_toml(
+            r#"fans = [{ type = "supermicro", zone = 0 }]"#,
+            r#"fans = [{ type = "supermicro", zone = 1 }, { type = "supermicro", zone = 0 }]"#);
+
+        assert_eq!(validation_reason(&contents), "zones[1].fans[1]: already driven by zones[0]");
+    }
+
+    #[test]
+    fn accepts_one_ipmi_zone_on_two_sessions() {
+        let config = parse(&two_zones_toml("ipmi_zones = [0]", "session = \"bmc\"\nipmi_zones = [0]")).unwrap();
+
+        assert_eq!(config.zones[0].fan_list, supermicro(&[0]));
+        assert_eq!(config.zones[1].fan_list, supermicro(&[0]));
     }
 
     #[test]

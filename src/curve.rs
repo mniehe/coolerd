@@ -514,7 +514,7 @@ mod tests {
             interval: Interval::default(),
             retries: Retries::default(),
             retry_delay_ms: RetryDelayMs::default(),
-            ipmi_zones: vec![0],
+            ipmi_zones: Some(vec![0]),
             sources,
             aggregation: Aggregation::Maximum,
             steps: Some(steps.to_vec()),
@@ -522,6 +522,8 @@ mod tests {
             duty_aggregation: Aggregation::Maximum,
             hysteresis: 0,
             curve_hysteresis: None,
+            fans: None,
+            fan_list: Vec::new(),
         }
     }
 

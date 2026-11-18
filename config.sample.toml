@@ -37,8 +37,20 @@ hysteresis = 3
 # `sessions` section.
 session = "default"
 
-# List of IPMI zones to be included in this logical zone.
-ipmi_zones = [0, 1]
+# Fans driven by this logical zone, each set to the zone's duty cycle. A
+# `supermicro` fan is one IPMI fan zone of the board that `session` reaches.
+# Each fan may be listed once, and two zones on one session cannot drive the
+# same IPMI zone. Two session names that reach the same board are not
+# detected, so do not drive one board through two sessions.
+fans = [
+  { type = "supermicro", zone = 0 },
+]
+
+# The older form of `fans`, which lists the IPMI zone numbers of `supermicro`
+# fans. `ipmi_zones = [0]` drives the same fans as `fans` above. A zone sets
+# either `fans` or `ipmi_zones`, not both. A number repeated in this list is
+# driven once.
+#ipmi_zones = [0]
 
 # Number of seconds to wait between fan update interations. If unspecified, the
 # default interval is 1 second.
@@ -231,9 +243,9 @@ steps = [
 # named curve uses the `hysteresis` of its entry in `curves`.
 #hysteresis = 3
 
-# More fan zones can be added
+# More fan zones can be added. Each drives fans that no other zone drives.
 #[[zones]]
-#ipmi_zones = [1]
+#fans = [{ type = "supermicro", zone = 1 }]
 #interval = 5
 #sources = [
 #    { type = "smart", block_dev = "/dev/disk/by-id/..." },

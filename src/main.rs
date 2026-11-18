@@ -28,7 +28,7 @@ use {
         time::sleep,
     },
 
-    config::{Config, load_config, Zone},
+    config::{Config, FanConfig, load_config, Zone},
     curve::{Transition, ZoneState},
     error::{Error, Result},
     session::IpmiSession,
@@ -77,8 +77,10 @@ impl MainApp {
             let restore_zones: Vec<_> = config.zones
                 .iter()
                 .filter(|z| &z.session.0 == name)
-                .flat_map(|z| &z.ipmi_zones)
-                .copied()
+                .flat_map(|z| &z.fan_list)
+                .map(|fan| match fan {
+                    FanConfig::Supermicro { zone } => *zone,
+                })
                 .collect();
 
             // Don't waste resources if nothing would use the session
@@ -166,7 +168,7 @@ impl MainApp {
         zone_config: Arc<Zone>,
     ) -> Result<()> {
         info!("[{}] Starting loop for IPMI zones {:?}",
-              session.name(), zone_config.ipmi_zones);
+              session.name(), zone_config.fan_list);
 
         let mut state = ZoneState::new(&zone_config);
         let mut readers = ZoneReaders::default();
@@ -192,7 +194,7 @@ impl MainApp {
         state: &mut ZoneState,
         readers: &mut ZoneReaders,
     ) -> Result<()> {
-        trace!("Querying sources for zones {:?}", zone_config.ipmi_zones);
+        trace!("Querying sources for zones {:?}", zone_config.fan_list);
 
         let mut query_ipmi = || session.lock().get_temperature_readings();
         let failed_last = state.failed_sources();
@@ -205,7 +207,7 @@ impl MainApp {
 
         let mut ipmi_lock = session.lock();
 
-        for z in &zone_config.ipmi_zones {
+        for FanConfig::Supermicro { zone: z } in &zone_config.fan_list {
             let dcycle_cur = ipmi_lock.get_duty_cycle(*z)?;
 
             debug!("[{}] Zone {}: smoothed_temps={:?}C, curve_temps={:?}C, dcycle_cur={}%, dcycle_new={}%",
@@ -232,11 +234,11 @@ impl MainApp {
             match transition {
                 Transition::Failed { source, error } => {
                     error!("[{}] Zones {:?}: source {} failed: {}",
-                           session_name, zone_config.ipmi_zones, describe(*source), error);
+                           session_name, zone_config.fan_list, describe(*source), error);
                 }
                 Transition::Recovered { source } => {
                     info!("[{}] Zones {:?}: source {} reads again",
-                          session_name, zone_config.ipmi_zones, describe(*source));
+                          session_name, zone_config.fan_list, describe(*source));
                 }
             }
         }

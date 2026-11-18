@@ -168,6 +168,24 @@ sources = [
 steps = [{ temp = 45, dcycle = 45 }, { temp = 75, dcycle = 100 }]
 ```
 
+Fans
+----
+
+Each zone drives the fans in its `fans` list, all at the zone's duty cycle. A `supermicro` fan is one IPMI fan zone of the board that the zone's `session` reaches.
+
+```toml
+[[zones]]
+fans = [{ type = "supermicro", zone = 0 }, { type = "supermicro", zone = 1 }]
+sources = [{ type = "ipmi", sensor = "CPU Temp" }]
+steps = [{ temp = 40, dcycle = 40 }, { temp = 70, dcycle = 70 }]
+```
+
+`ipmi_zones = [0, 1]` is the older form of the same list and still loads. A zone sets either `fans` or `ipmi_zones`, not both. A number repeated in `ipmi_zones` is driven once, but a fan listed twice in `fans` is rejected.
+
+A fan belongs to one zone. Two zones on one session can no longer name the same IPMI zone: earlier versions loaded such a config, and the zones overwrote each other's duty cycle. The check compares session names, so two session names that reach the same board are not detected. Do not drive one board through two sessions.
+
+On startup the program switches each board it uses to full fan mode. On exit, also after an error, it sets each zone's fans to 100% and then restores the board's original fan mode. If the switch to full fan mode fails, the program does the same before it exits.
+
 NixOS
 -----
 
