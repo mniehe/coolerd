@@ -174,11 +174,9 @@ pub struct ZoneUpdate {
     pub smoothed_temps: Vec<Option<u8>>,
 }
 
-/// What a zone keeps of one source between polls
+/// What a binding keeps of one source between polls
 struct SourceState {
     smoother: Smoother,
-    /// Only a source with `steps` uses its curve
-    curve: HeldTemp,
     failed: bool,
 }
 
@@ -280,7 +278,7 @@ impl Binding {
                 // A missing source never reads; any capacity serves
                 let samples = zone.sources.get(index).map_or(1, |s| s.smoothing_samples);
 
-                SourceState { smoother: Smoother::new(samples), curve: HeldTemp(None), failed: false }
+                SourceState { smoother: Smoother::new(samples), failed: false }
             })
             .collect();
 
@@ -337,42 +335,83 @@ impl Binding {
     }
 }
 
-/// The held temperatures of a zone's curves and the failed sources between
-/// polls
+/// The bindings a zone is lowered to: the sources without `steps` joined on
+/// the zone curve first, then one binding per source with `steps`, in source
+/// order. A named curve brings its own hysteresis; an inline one uses the
+/// zone's.
+fn zone_bindings(zone: &Zone) -> Vec<Binding> {
+    let mut bindings = Vec::new();
+
+    let joined: Vec<usize> = zone.sources.iter().enumerate()
+        .filter(|(_, source)| source.steps.is_none())
+        .map(|(index, _)| index)
+        .collect();
+
+    if !joined.is_empty() {
+        // Validation leaves the zone steps absent only when every source has
+        // `steps`; an absent curve maps to 100% all the same
+        let steps = zone.steps.clone().unwrap_or_default();
+        let hysteresis = zone.curve_hysteresis.unwrap_or(zone.hysteresis);
+
+        bindings.push(Binding {
+            sources: Selection::Joined(joined, zone.aggregation.clone()),
+            curve: Curve { steps, hysteresis },
+        });
+    }
+
+    for (index, source) in zone.sources.iter().enumerate() {
+        let Some(steps) = &source.steps else {
+            continue;
+        };
+        let hysteresis = source.curve_hysteresis.unwrap_or(zone.hysteresis);
+
+        bindings.push(Binding {
+            sources: Selection::One(index),
+            curve: Curve { steps: steps.clone(), hysteresis },
+        });
+    }
+
+    bindings
+}
+
+/// A zone's bindings and what each keeps between polls
 pub struct ZoneState {
-    zone_curve: HeldTemp,
-    /// One per source, in source order
-    sources: Vec<SourceState>,
+    bindings: Vec<Binding>,
+    /// One per binding, in binding order
+    states: Vec<BindingState>,
+    /// The number of sources the bindings were built for
+    source_count: usize,
 }
 
 impl ZoneState {
     pub fn new(zone: &Zone) -> Self {
-        Self {
-            zone_curve: HeldTemp(None),
-            sources: zone.sources.iter()
-                .map(|source| SourceState {
-                    smoother: Smoother::new(source.smoothing_samples),
-                    curve: HeldTemp(None),
-                    failed: false,
-                })
-                .collect(),
-        }
+        let bindings = zone_bindings(zone);
+        let states = bindings.iter().map(|binding| binding.new_state(zone)).collect();
+
+        Self { bindings, states, source_count: zone.sources.len() }
     }
 
     /// Whether each source, in source order, failed in the last poll
     pub fn failed_sources(&self) -> Vec<bool> {
-        self.sources.iter().map(|s| s.failed).collect()
+        let mut failed = vec![false; self.source_count];
+
+        for (binding, state) in self.bindings.iter().zip(&self.states) {
+            for (&index, source) in binding.sources.indices().iter().zip(&state.sources) {
+                if let Some(slot) = failed.get_mut(index) {
+                    *slot = source.failed;
+                }
+            }
+        }
+
+        failed
     }
 
     /// Compute the zone duty from one reading per source, in source order.
-    /// Each reading is first replaced by the mean of the source's last
-    /// readings. Sources without `steps` are aggregated into the zone curve;
-    /// each source with `steps` maps its reading through its own curve. A
-    /// failed source takes part in neither, forgets its stored readings, its
-    /// curve holds its temperature, and its `on_failure` sets the lowest duty
-    /// the zone may run at.
+    /// Each binding smooths its sources' readings and maps them through its
+    /// curve. The duties of the bindings are joined by `duty_aggregation`,
+    /// and the zone runs no lower than the floor of any failed source.
     pub fn next_duty(&mut self, zone: &Zone, readings: &[SourceReading]) -> ZoneUpdate {
-        if readings.len() != zone.sources.len() || readings.len() != self.sources.len() {
+        if readings.len() != zone.sources.len() || readings.len() != self.source_count {
             return ZoneUpdate {
                 duty: FULL_DUTY,
                 curve_temps: Vec::new(),
@@ -381,57 +420,31 @@ impl ZoneState {
             };
         }
 
-        let mut zone_readings = Vec::new();
-        let mut source_temps = Vec::new();
-        let mut source_duties = Vec::new();
+        let mut duties = Vec::new();
+        let mut curve_temps = Vec::new();
         let mut transitions = Vec::new();
-        let mut smoothed_temps = Vec::new();
+        let mut smoothed_temps = vec![None; self.source_count];
         let mut floor = 0;
 
-        let sources = zone.sources.iter().zip(&mut self.sources).zip(readings);
+        for (binding, state) in self.bindings.iter().zip(&mut self.states) {
+            let contribution = binding.step(zone, state, readings);
 
-        for (index, ((source, state), reading)) in sources.enumerate() {
-            transitions.extend(state.transition(index, reading));
+            duties.extend(contribution.duty);
+            curve_temps.extend(contribution.curve_temp);
+            transitions.extend(contribution.transitions);
+            floor = floor.max(contribution.floor);
 
-            let reading = match reading {
-                SourceReading::Temp(temp) => state.smoother.push(*temp),
-                SourceReading::Failed(_) => {
-                    // A recovered source starts from fresh readings
-                    state.smoother.clear();
-                    smoothed_temps.push(None);
-                    floor = floor.max(failure_floor(&source.on_failure));
-                    continue;
+            for (&index, temp) in binding.sources.indices().iter().zip(contribution.smoothed) {
+                if let Some(slot) = smoothed_temps.get_mut(index) {
+                    *slot = temp;
                 }
-            };
-
-            smoothed_temps.push(Some(reading));
-
-            match &source.steps {
-                Some(steps) => {
-                    let temp = state.curve.update(reading, zone.hysteresis);
-                    source_temps.push(temp);
-                    source_duties.push(duty_for_temp(steps, temp));
-                }
-                None => zone_readings.push(reading),
             }
         }
 
-        let mut curve_temps = Vec::new();
-        let mut duties = Vec::new();
-
-        // No reading reaches the zone curve when every source without `steps`
-        // failed or every source has `steps`
-        if let Some(reading) = aggregate(&zone_readings, &zone.aggregation, Rounding::Down) {
-            let temp = self.zone_curve.update(reading, zone.hysteresis);
-            curve_temps.push(temp);
-            // Validation leaves the zone steps absent only when no reading
-            // reaches the zone curve; an absent curve maps to 100% all the same
-            let steps = zone.steps.as_deref().unwrap_or(&[]);
-            duties.push(duty_for_temp(steps, temp));
-        }
-
-        curve_temps.append(&mut source_temps);
-        duties.append(&mut source_duties);
+        // Bindings visit sources out of order; report them in source order
+        transitions.sort_by_key(|transition| match transition {
+            Transition::Failed { source, .. } | Transition::Recovered { source } => *source,
+        });
 
         // A zone with no curve left to give a duty, as when every source
         // failed, runs at full speed
@@ -507,6 +520,7 @@ mod tests {
             steps: Some(steps.to_vec()),
             duty_aggregation: Aggregation::Maximum,
             hysteresis: 0,
+            curve_hysteresis: None,
         }
     }
 
@@ -855,6 +869,63 @@ mod tests {
         state.next_duty(&zone, &temps(&[60, 60]));
 
         assert_eq!(state.next_duty(&zone, &temps(&[58, 50])).curve_temps, [60, 50]);
+    }
+
+    /// A source on its own curve with the hysteresis of a named curve
+    fn named(steps: &[Step], hysteresis: u8) -> SourceConfig {
+        SourceConfig { curve_hysteresis: Some(hysteresis), ..curved(steps) }
+    }
+
+    #[test]
+    fn each_source_curve_uses_its_own_hysteresis() {
+        // Both fall 2 from 70: A's curve holds 70 (85%), B's maps 68 (82%).
+        // The mean of 85 and 82 rounds up to 84; 85 if both held, 82 if
+        // both fell.
+        let mut zone = zone(&[], vec![named(&HOLD_STEPS, 3), named(&HOLD_STEPS, 0)]);
+        zone.duty_aggregation = Aggregation::Average { top: None };
+        let updates = updates(&zone, &[temps(&[70, 70]), temps(&[68, 68])]);
+
+        assert_eq!(updates[1].curve_temps, [70, 68]);
+        assert_eq!(updates[1].duty, 84);
+    }
+
+    #[test]
+    fn transitions_and_failed_sources_keep_source_order() {
+        // The zone curve's binding comes first but holds source 1
+        let zone = zone(&ZONE_STEPS, vec![
+            failing(curved(&GPU_STEPS), OnFailure::Ignore {}),
+            failing(plain(), OnFailure::Ignore {}),
+            curved(&GPU_STEPS),
+        ]);
+        let mut state = ZoneState::new(&zone);
+        let update = state.next_duty(&zone, &[failed(), failed(), Temp(70)]);
+
+        assert_eq!(update.transitions, [
+            Transition::Failed { source: 0, error: "timed out".to_owned() },
+            Transition::Failed { source: 1, error: "timed out".to_owned() },
+        ]);
+        assert_eq!(update.smoothed_temps, [None, None, Some(70)]);
+        assert_eq!(state.failed_sources(), [true, true, false]);
+
+        state.next_duty(&zone, &[failed(), Temp(50), Temp(70)]);
+
+        assert_eq!(state.failed_sources(), [true, false, false]);
+    }
+
+    #[test]
+    fn named_source_curve_ignores_the_zone_hysteresis() {
+        let mut zone = zone(&[], vec![named(&HOLD_STEPS, 0)]);
+        zone.hysteresis = 5;
+
+        assert_eq!(duties(&zone, &[&[70], &[68]]), [85, 82]);
+    }
+
+    #[test]
+    fn named_zone_curve_uses_its_own_hysteresis() {
+        let mut zone = zone(&HOLD_STEPS, vec![plain()]);
+        zone.curve_hysteresis = Some(3);
+
+        assert_eq!(duties(&zone, &[&[70], &[68]]), [85, 85]);
     }
 
     #[test]

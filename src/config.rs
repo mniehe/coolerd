@@ -155,12 +155,15 @@ pub struct SourceConfig {
     pub steps: Option<Vec<Step>>,
     pub on_failure: OnFailure,
     pub smoothing_samples: u8,
+    /// The hysteresis of the named curve that set `steps`; `None` means the
+    /// zone's `hysteresis` applies. Not a config key.
+    pub curve_hysteresis: Option<u8>,
 }
 
 impl SourceConfig {
     /// A source of `kind` with every other key at its default
     pub fn new(kind: Source) -> Self {
-        Self { kind, steps: None, on_failure: OnFailure::default(), smoothing_samples: 1 }
+        Self { kind, steps: None, on_failure: OnFailure::default(), smoothing_samples: 1, curve_hysteresis: None }
     }
 }
 
@@ -286,9 +289,14 @@ pub struct Zone {
     /// How the duties of the zone's curves combine into one
     #[serde(default)]
     pub duty_aggregation: Aggregation,
-    /// Degrees a curve's temperature must fall before its duty follows
+    /// Degrees the temperature of an inline curve must fall before its duty
+    /// follows
     #[serde(default)]
     pub hysteresis: u8,
+    /// The hysteresis of the named curve that set `steps`; `None` means
+    /// `hysteresis` applies. Not a config key.
+    #[serde(skip)]
+    pub curve_hysteresis: Option<u8>,
 }
 
 impl Zone {

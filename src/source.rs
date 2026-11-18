@@ -1169,6 +1169,7 @@ mod tests {
             steps: Some(vec![Step { temp: 45, dcycle: 45 }, Step { temp: 75, dcycle: 100 }]),
             duty_aggregation: Aggregation::Maximum,
             hysteresis: 0,
+            curve_hysteresis: None,
         }
     }
 
