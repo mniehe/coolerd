@@ -1,4 +1,5 @@
 mod bindings;
+mod command;
 mod config;
 mod curve;
 mod error;
@@ -30,7 +31,7 @@ use {
     curve::{Transition, ZoneState},
     error::{Error, Result},
     ipmi::{FanMode, Ipmi},
-    source::{read_source, read_zone_sources},
+    source::{read_zone_sources, ZoneReaders},
 };
 
 static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -223,14 +224,16 @@ impl MainApp {
               session.name, zone_config.ipmi_zones);
 
         let mut state = ZoneState::new(&zone_config);
+        let mut readers = ZoneReaders::default();
 
         loop {
             let s = session.clone();
             let z = zone_config.clone();
             let st = &mut state;
+            let r = &mut readers;
 
             task::block_in_place(move || {
-                Self::update_duty_cycle(s, z.as_ref(), st)
+                Self::update_duty_cycle(s, z.as_ref(), st, r)
             })?;
 
             sleep(zone_config.interval.to_duration()).await;
@@ -242,12 +245,14 @@ impl MainApp {
         session: Arc<IpmiSession>,
         zone_config: &Zone,
         state: &mut ZoneState,
+        readers: &mut ZoneReaders,
     ) -> Result<()> {
         trace!("Querying sources for zones {:?}", zone_config.ipmi_zones);
 
         let mut query_ipmi = || Ok(session.ipmi.lock().unwrap().get_temperature_readings()?);
         let failed_last = state.failed_sources();
-        let readings = read_zone_sources(zone_config, &failed_last, &mut query_ipmi, &read_source)?;
+        let readings = read_zone_sources(zone_config, &failed_last, &mut query_ipmi,
+            &mut |index, source| readers.read(index, source))?;
         let update = state.next_duty(zone_config, &readings);
         let dcycle_new = update.duty;
 

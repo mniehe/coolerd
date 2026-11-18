@@ -1,22 +1,20 @@
 use {
     std::{
-        collections::{BTreeSet, HashMap},
+        collections::HashMap,
         convert::TryInto,
+        ffi::OsStr,
         fs,
-        io::{self, BufRead, BufReader, Read},
+        io::BufRead,
         iter,
-        path::{Path, PathBuf},
-        process::{Child, ChildStdout, Command, ExitStatus, Stdio},
-        sync::{
-            mpsc::{self, Receiver, RecvTimeoutError},
-            Mutex,
-            MutexGuard,
-        },
+        path::Path,
+        process::ExitStatus,
+        str,
         thread,
-        time::{Duration, Instant},
+        time::Duration,
     },
-    log::{trace, warn},
+    log::trace,
     crate::{
+        command::{CommandRunner, RunLimits},
         config::{OnFailure, Source, SourceConfig, Zone},
         curve::SourceReading,
         error::{Error, Result},
@@ -32,43 +30,49 @@ const DISK_TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 /// table is often longer than [`NVIDIA_OUTPUT_CAP`].
 const DISK_TOOL_OUTPUT_CAP: u64 = 1024 * 1024;
 
+/// Longest wait for one nvidia-smi run
+const NVIDIA_SMI_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Most bytes of nvidia-smi output read
+const NVIDIA_OUTPUT_CAP: u64 = 4096;
+
 /// Get the temperature of a hard drive via smartctl. This function fails if
 /// smartctl does not return temperature data (eg. if a drive is in standby),
 /// does not exit within [`DISK_TOOL_TIMEOUT`], or if the reported temperature
 /// does not fit in a [`u8`].
-fn parse_smart_source<T: AsRef<Path>>(block_dev: T) -> Result<u8> {
-    read_smart_with_limit(Path::new("smartctl"), block_dev.as_ref(), DISK_TOOL_TIMEOUT)
+fn parse_smart_source(runner: &mut CommandRunner, block_dev: &Path) -> Result<u8> {
+    read_smart_with_limit(runner, Path::new("smartctl"), block_dev, DISK_TOOL_TIMEOUT)
 }
 
 /// Get the temperature of a hard drive via `program`, a smartctl, waiting at
 /// most `limit` for it to exit
-fn read_smart_with_limit(program: &Path, block_dev: &Path, limit: Duration) -> Result<u8> {
-    let mut cmd = Command::new(program);
-    cmd.arg("-j")
-        .arg("-A")
-        .arg("-n")
-        .arg("standby")
-        .arg(block_dev);
+fn read_smart_with_limit(runner: &mut CommandRunner, program: &Path, block_dev: &Path, limit: Duration)
+    -> Result<u8>
+{
+    let args = [
+        OsStr::new("-j"),
+        OsStr::new("-A"),
+        OsStr::new("-n"),
+        OsStr::new("standby"),
+        block_dev.as_os_str(),
+    ];
 
-    let (status, stdout) = run_with_timeout(&mut cmd, RunLimits { time: limit, output: DISK_TOOL_OUTPUT_CAP })?;
+    let (status, stdout) = runner.run(program, &args, RunLimits { time: limit, output: DISK_TOOL_OUTPUT_CAP })?;
 
-    smart_reading(status, block_dev, serde_json::from_str(&stdout))
+    smart_reading(status, block_dev, &stdout)
 }
 
-/// Turn smartctl's exit status and its parsed JSON output into a reading. A
-/// failing exit status takes precedence over a JSON parse error.
-fn smart_reading(
-    status: ExitStatus,
-    block_dev: &Path,
-    result: serde_json::Result<serde_json::Value>,
-) -> Result<u8> {
+/// Turn smartctl's exit status and its JSON output into a reading. A failing
+/// exit status takes precedence over output that does not parse, including
+/// output that is not UTF-8.
+fn smart_reading(status: ExitStatus, block_dev: &Path, stdout: &[u8]) -> Result<u8> {
     match status.code() {
         // smartctl will return status code 2 when a drive is in standby
         Some(0) | Some(2) => {},
         _ => return Err(Error::Command { command: "smartctl".into(), status }),
     }
 
-    let root = result
+    let root = serde_json::from_slice(stdout)
         .map_err(|e| Error::SmartParse { block_dev: block_dev.to_owned(), source: e })?;
 
     parse_smart_output(block_dev, &root)
@@ -87,8 +91,10 @@ fn parse_smart_output(block_dev: &Path, root: &serde_json::Value) -> Result<u8> 
     Ok(temperature)
 }
 
-fn parse_hdparm_output(block_dev: &Path, stdout: &mut dyn Read) -> Result<u8> {
-    let mut reader = BufReader::new(stdout);
+/// Find the temperature in hdparm's output, read line by line. Lines after
+/// the temperature line are not read, so they need not be UTF-8.
+fn parse_hdparm_output(block_dev: &Path, stdout: &[u8]) -> Result<u8> {
+    let mut reader = stdout;
     let mut line = String::new();
 
     loop {
@@ -123,18 +129,19 @@ fn parse_hdparm_output(block_dev: &Path, stdout: &mut dyn Read) -> Result<u8> {
 /// fails if hdparm does not print the temperature line, hdparm prints the bad
 /// sense data line, hdparm does not exit within [`DISK_TOOL_TIMEOUT`], or if
 /// the reported temperature does not fit in a [`u8`].
-fn parse_hdparm_source<T: AsRef<Path>>(block_dev: T) -> Result<u8> {
-    read_hdparm_with_limit(Path::new("hdparm"), block_dev.as_ref(), DISK_TOOL_TIMEOUT)
+fn parse_hdparm_source(runner: &mut CommandRunner, block_dev: &Path) -> Result<u8> {
+    read_hdparm_with_limit(runner, Path::new("hdparm"), block_dev, DISK_TOOL_TIMEOUT)
 }
 
 /// Get the temperature of a drive via `program`, an hdparm, waiting at most
 /// `limit` for it to exit
-fn read_hdparm_with_limit(program: &Path, block_dev: &Path, limit: Duration) -> Result<u8> {
-    let mut cmd = Command::new(program);
-    cmd.arg("-H").arg(block_dev);
+fn read_hdparm_with_limit(runner: &mut CommandRunner, program: &Path, block_dev: &Path, limit: Duration)
+    -> Result<u8>
+{
+    let args = [OsStr::new("-H"), block_dev.as_os_str()];
 
-    let (status, stdout) = run_with_timeout(&mut cmd, RunLimits { time: limit, output: DISK_TOOL_OUTPUT_CAP })?;
-    let result = parse_hdparm_output(block_dev, &mut stdout.as_bytes());
+    let (status, stdout) = runner.run(program, &args, RunLimits { time: limit, output: DISK_TOOL_OUTPUT_CAP })?;
+    let result = parse_hdparm_output(block_dev, &stdout);
 
     if status.code() != Some(0) {
         return Err(Error::Command { command: program.to_owned(), status });
@@ -147,17 +154,21 @@ fn read_hdparm_with_limit(program: &Path, block_dev: &Path, limit: Duration) -> 
 /// --format=csv,noheader,nounits` for one GPU. The output must be one record
 /// of ASCII digits, the temperature in degrees Celsius, followed by at most
 /// one line ending.
-fn parse_nvidia_output(gpu: &str, stdout: &str) -> Result<u8> {
-    let bad_data = || Error::NvidiaBadData { gpu: gpu.to_owned(), output: stdout.to_owned() };
-    let record = stdout.strip_suffix("\r\n")
-        .or_else(|| stdout.strip_suffix('\n'))
+fn parse_nvidia_output(gpu: &str, stdout: &[u8]) -> Result<u8> {
+    let bad_data = || Error::NvidiaBadData {
+        gpu: gpu.to_owned(),
+        output: String::from_utf8_lossy(stdout).into_owned(),
+    };
+    let record = stdout.strip_suffix(b"\r\n")
+        .or_else(|| stdout.strip_suffix(b"\n"))
         .unwrap_or(stdout);
 
-    if record.is_empty() || !record.bytes().all(|b| b.is_ascii_digit()) {
+    if record.is_empty() || !record.iter().all(u8::is_ascii_digit) {
         return Err(bad_data());
     }
 
-    let temperature = record
+    let temperature = str::from_utf8(record)
+        .map_err(|_| bad_data())?
         .parse::<u32>()
         .map_err(|_| bad_data())?
         .try_into()
@@ -166,239 +177,19 @@ fn parse_nvidia_output(gpu: &str, stdout: &str) -> Result<u8> {
     Ok(temperature)
 }
 
-/// Longest wait for one nvidia-smi run
-const NVIDIA_SMI_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How often [`run_with_timeout`] checks whether the child has exited
-const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
-
-/// Longest wait for a killed child to be reaped
-const KILL_GRACE: Duration = Duration::from_millis(500);
-
-/// Most bytes of nvidia-smi output read
-const NVIDIA_OUTPUT_CAP: u64 = 4096;
-
-/// The bounds on one run of a command by [`run_with_timeout`]
-#[derive(Clone, Copy)]
-struct RunLimits {
-    /// Longest wait for the command to exit and close its output
-    time: Duration,
-    /// Most bytes of output read; longer output is an error
-    output: u64,
-}
-
-/// Wait at most `grace` for `child` to exit and reap it. Returns `None` if the
-/// child has not exited by then.
-fn wait_bounded(child: &mut Child, grace: Duration) -> Option<ExitStatus> {
-    let deadline = Instant::now() + grace;
-
-    loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            return Some(status);
-        }
-
-        let now = Instant::now();
-        if now >= deadline {
-            return None;
-        }
-
-        thread::sleep(CHILD_POLL_INTERVAL.min(deadline - now));
-    }
-}
-
-/// Kill `child`, a run of `command`, and reap it within [`KILL_GRACE`]. A
-/// killed process can stay in uninterruptible sleep, as nvidia-smi does in a
-/// hung driver, so a child that outlives the grace is handed to a detached
-/// thread to reap and the caller never waits on it.
-fn stop_child(mut child: Child, command: &str) {
-    // Kill fails if the child has already exited, which is harmless
-    let _ = child.kill();
-
-    if wait_bounded(&mut child, KILL_GRACE).is_some() {
-        return;
-    }
-
-    warn!("{} did not exit within {:?} of being killed and may be stuck; reaping it in the background \
-        and not starting it again until it exits", command, KILL_GRACE);
-
-    reap_in_background(child, command.to_owned());
-}
-
-/// The commands, by [`command_identity`], whose last run outlived its kill and
-/// has not been reaped. Such a command is not started again, so a program
-/// that hangs leaves at most one stuck process however often it is read.
-struct StuckCommands(Mutex<BTreeSet<String>>);
-
-impl StuckCommands {
-    fn commands(&self) -> MutexGuard<'_, BTreeSet<String>> {
-        // Each change to the set is one call that cannot panic halfway, so a
-        // poisoned lock still guards a whole set
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn contains(&self, command: &str) -> bool {
-        self.commands().contains(command)
-    }
-
-    fn insert(&self, command: String) {
-        self.commands().insert(command);
-    }
-
-    fn remove(&self, command: &str) {
-        self.commands().remove(command);
-    }
-}
-
-static STUCK_COMMANDS: StuckCommands = StuckCommands(Mutex::new(BTreeSet::new()));
-
-/// Name a command by its program and arguments
-fn command_identity(cmd: &Command) -> String {
-    iter::once(cmd.get_program())
-        .chain(cmd.get_args())
-        .map(|part| format!("{:?}", part))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Reap `child`, a run of `command`, on a detached thread, and mark `command`
-/// as stuck until then
-fn reap_in_background(mut child: Child, command: String) {
-    STUCK_COMMANDS.insert(command.clone());
-
-    let reaper_command = command.clone();
-    let reaper = thread::Builder::new().spawn(move || {
-        let _ = child.wait();
-        STUCK_COMMANDS.remove(&reaper_command);
-    });
-
-    if let Err(e) = reaper {
-        // Nothing would ever free the command, so it may run again
-        STUCK_COMMANDS.remove(&command);
-        warn!("Failed to start a thread to reap {}: {}", command, e);
-    }
-}
-
-/// Read `pipe` on a detached thread and send the result on the returned
-/// channel. Output longer than `cap` bytes is an error. The thread blocks for
-/// as long as any process holds the pipe open, which can outlast the child,
-/// so the caller waits on the channel with a deadline.
-fn spawn_output_reader(pipe: ChildStdout, cap: u64) -> io::Result<Receiver<io::Result<String>>> {
-    let (sender, receiver) = mpsc::channel();
-
-    thread::Builder::new().spawn(move || {
-        // The receiver is gone once the caller has timed out
-        let _ = sender.send(read_capped(pipe, cap));
-    })?;
-
-    Ok(receiver)
-}
-
-/// Read all of `pipe`, failing once it yields more than `cap` bytes. One byte
-/// past the cap is read so that a cut output, whose prefix may still parse,
-/// is never returned.
-fn read_capped(pipe: impl Read, cap: u64) -> io::Result<String> {
-    let mut output = Vec::new();
-    pipe.take(cap.saturating_add(1)).read_to_end(&mut output)?;
-
-    if output.len() as u64 > cap {
-        return Err(io::Error::new(io::ErrorKind::InvalidData,
-            format!("output is longer than {} bytes", cap)));
-    }
-
-    String::from_utf8(output).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-}
-
-/// Run a command with piped stdout and return its exit status and its output,
-/// which must be at most `limits.output` bytes. If the command has not exited
-/// and closed its output within `limits.time`, [`Error::CommandTimeout`] is
-/// returned; a child still running then is killed. The call returns within
-/// about `limits.time` plus [`KILL_GRACE`] in every case. While an earlier run
-/// of the same program with the same arguments is stuck after its kill, the
-/// command is not started and [`Error::CommandStillRunning`] is returned.
-fn run_with_timeout(cmd: &mut Command, limits: RunLimits) -> Result<(ExitStatus, String)> {
-    let command = command_identity(cmd);
-
-    if STUCK_COMMANDS.contains(&command) {
-        return Err(Error::CommandStillRunning { command });
-    }
-
-    let limit = limits.time;
-    let program = PathBuf::from(cmd.get_program());
-    let io_error = |e| Error::Io { path: program.clone(), source: e };
-    let timeout = || Error::CommandTimeout {
-        command: program.display().to_string(),
-        seconds: limit.as_secs(),
-    };
-    let deadline = Instant::now()
-        .checked_add(limit)
-        .ok_or_else(|| io_error(io::Error::new(io::ErrorKind::InvalidInput,
-            format!("time limit {:?} is too long", limit))))?;
-
-    let mut child = cmd
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(io_error)?;
-
-    let reader = child.stdout.take()
-        .ok_or_else(|| io::Error::other("stdout is not piped"))
-        .and_then(|pipe| spawn_output_reader(pipe, limits.output));
-    let output = match reader {
-        Ok(receiver) => receiver,
-        Err(e) => {
-            stop_child(child, &command);
-            return Err(io_error(e));
-        }
-    };
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let stdout = receive_output(&output, deadline)
-                    .ok_or_else(timeout)?
-                    .map_err(io_error)?;
-                return Ok((status, stdout));
-            }
-            Ok(None) => {},
-            Err(e) => {
-                stop_child(child, &command);
-                return Err(io_error(e));
-            }
-        }
-
-        let now = Instant::now();
-        if now >= deadline {
-            stop_child(child, &command);
-            return Err(timeout());
-        }
-
-        thread::sleep(CHILD_POLL_INTERVAL.min(deadline - now));
-    }
-}
-
-/// Wait until `deadline` for the output reader's result. Returns `None` if
-/// the deadline passes first, which happens when a descendant of the child
-/// still holds the pipe open.
-fn receive_output(output: &Receiver<io::Result<String>>, deadline: Instant)
-    -> Option<io::Result<String>>
-{
-    match output.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        Ok(result) => Some(result),
-        Err(RecvTimeoutError::Timeout) => None,
-        Err(RecvTimeoutError::Disconnected) =>
-            Some(Err(io::Error::other("output reader stopped without a result"))),
-    }
-}
-
 /// Get the temperature of one NVIDIA GPU via nvidia-smi, waiting at most
 /// `limit` for nvidia-smi to exit. `gpu` is a PCI bus id or a GPU UUID.
-fn read_nvidia_with_limit(program: &Path, gpu: &str, limit: Duration) -> Result<u8> {
-    let mut cmd = Command::new(program);
-    cmd.arg("-i")
-        .arg(gpu)
-        .arg("--query-gpu=temperature.gpu")
-        .arg("--format=csv,noheader,nounits");
+fn read_nvidia_with_limit(runner: &mut CommandRunner, program: &Path, gpu: &str, limit: Duration)
+    -> Result<u8>
+{
+    let args = [
+        OsStr::new("-i"),
+        OsStr::new(gpu),
+        OsStr::new("--query-gpu=temperature.gpu"),
+        OsStr::new("--format=csv,noheader,nounits"),
+    ];
 
-    let (status, stdout) = run_with_timeout(&mut cmd, RunLimits { time: limit, output: NVIDIA_OUTPUT_CAP })?;
+    let (status, stdout) = runner.run(program, &args, RunLimits { time: limit, output: NVIDIA_OUTPUT_CAP })?;
 
     if status.code() != Some(0) {
         return Err(Error::Command { command: program.to_owned(), status });
@@ -411,8 +202,8 @@ fn read_nvidia_with_limit(program: &Path, gpu: &str, limit: Duration) -> Result<
 /// if nvidia-smi exits with a non-zero status, does not exit within
 /// [`NVIDIA_SMI_TIMEOUT`], or does not print a temperature that fits in a
 /// [`u8`].
-fn read_nvidia_source(program: &Path, gpu: &str) -> Result<u8> {
-    read_nvidia_with_limit(program, gpu, NVIDIA_SMI_TIMEOUT)
+fn read_nvidia_source(runner: &mut CommandRunner, gpu: &str) -> Result<u8> {
+    read_nvidia_with_limit(runner, Path::new("nvidia-smi"), gpu, NVIDIA_SMI_TIMEOUT)
 }
 
 /// Get the temperature from a plain-text file (typically a sysfs path). The
@@ -480,16 +271,36 @@ fn double_to_temp(value: f64) -> Option<u8> {
     Some(value as u8)
 }
 
-/// Read one source that is not an IPMI sensor
-pub fn read_source(source: &Source) -> Result<u8> {
-    match source {
-        // read_zone_sources reads IPMI sensors in one batch and never passes
-        // one here
-        Source::Ipmi { sensor } => Err(Error::SensorNotFound(sensor.clone())),
-        Source::File { path } => parse_file_source(path),
-        Source::Smart { block_dev } => parse_smart_source(block_dev),
-        Source::Hdparm { block_dev } => parse_hdparm_source(block_dev),
-        Source::Nvidia { gpu } => read_nvidia_source(Path::new("nvidia-smi"), gpu),
+/// The readers of one zone's sources. Each source that runs a program has
+/// its own [`CommandRunner`], so a program stuck after its kill blocks only
+/// its own source. Each zone loop owns one, so zones share no runner.
+#[derive(Default)]
+pub struct ZoneReaders {
+    /// By source index, as in [`Zone::sources`]; made on a source's first read
+    runners: Vec<CommandRunner>,
+}
+
+impl ZoneReaders {
+    /// Read `source`, the source at `index` of the zone, which is not an IPMI
+    /// sensor
+    pub fn read(&mut self, index: usize, source: &Source) -> Result<u8> {
+        match source {
+            // read_zone_sources reads IPMI sensors in one batch and never
+            // passes one here
+            Source::Ipmi { sensor } => Err(Error::SensorNotFound(sensor.clone())),
+            Source::File { path } => parse_file_source(path),
+            Source::Smart { block_dev } => parse_smart_source(self.runner(index), Path::new(block_dev)),
+            Source::Hdparm { block_dev } => parse_hdparm_source(self.runner(index), Path::new(block_dev)),
+            Source::Nvidia { gpu } => read_nvidia_source(self.runner(index), gpu),
+        }
+    }
+
+    fn runner(&mut self, index: usize) -> &mut CommandRunner {
+        if self.runners.len() <= index {
+            self.runners.resize_with(index + 1, CommandRunner::default);
+        }
+
+        &mut self.runners[index]
     }
 }
 
@@ -626,10 +437,12 @@ fn exhaust_query(
     Ok(())
 }
 
-/// Read one source with `reader`, taking a wait from `waits` before each retry
+/// Read the source at `index` with `reader`, taking a wait from `waits`
+/// before each retry
 fn read_with_retries(
+    index: usize,
     source: &SourceConfig,
-    reader: &dyn Fn(&Source) -> Result<u8>,
+    reader: &mut dyn FnMut(usize, &Source) -> Result<u8>,
     waits: &mut Waits,
 ) -> Result<SourceReading> {
     let mut attempts = 0;
@@ -637,7 +450,7 @@ fn read_with_retries(
     loop {
         attempts += 1;
 
-        let error = match reader(&source.kind) {
+        let error = match reader(index, &source.kind) {
             Ok(temp) => return Ok(SourceReading::Temp(temp)),
             Err(e) => e,
         };
@@ -652,7 +465,8 @@ fn read_with_retries(
 }
 
 /// Read every source of `zone` once, retrying only a source that failed.
-/// `reader` reads each source that is not an IPMI sensor, in source order;
+/// `reader` reads each source that is not an IPMI sensor, in source order,
+/// and is given the source's index in `zone.sources` with it;
 /// then the IPMI sensors are read last, as one `query_ipmi` call per attempt,
 /// so that their readings are fresh when the duty is computed.
 ///
@@ -668,7 +482,7 @@ pub fn read_zone_sources(
     zone: &Zone,
     failed_flags: &[bool],
     query_ipmi: &mut dyn FnMut() -> Result<HashMap<String, Option<SensorReading>>>,
-    reader: &dyn Fn(&Source) -> Result<u8>,
+    reader: &mut dyn FnMut(usize, &Source) -> Result<u8>,
 ) -> Result<Vec<SourceReading>> {
     let mut waits = zone.retry_iter();
     let mut readings = vec![None; zone.sources.len()];
@@ -685,7 +499,7 @@ pub fn read_zone_sources(
             &mut waits
         };
 
-        readings[index] = Some(read_with_retries(source, reader, source_waits)?);
+        readings[index] = Some(read_with_retries(index, source, reader, source_waits)?);
     }
 
     read_ipmi_sources(zone, failed_flags, query_ipmi, &mut waits, &mut readings)?;
@@ -700,30 +514,17 @@ mod tests {
     use {
         std::{
             cell::RefCell,
-            collections::{BTreeSet, HashMap},
-            env,
-            fs,
+            collections::HashMap,
             io,
-            os::unix::{fs::PermissionsExt, process::ExitStatusExt},
+            os::unix::process::ExitStatusExt,
             path::{Path, PathBuf},
-            process::{self, Child, Command, ExitStatus, Stdio},
-            sync::{
-                atomic::{AtomicUsize, Ordering},
-                Mutex,
-                MutexGuard,
-            },
-            thread,
+            process::ExitStatus,
             time::{Duration, Instant},
         },
         serde_json::json,
         super::{
-            KILL_GRACE,
             NVIDIA_OUTPUT_CAP,
-            RunLimits,
-            STUCK_COMMANDS,
-            StuckCommands,
-            command_identity,
-            reap_in_background,
+            ZoneReaders,
             ipmi_sensor_temp,
             parse_file_source,
             parse_hdparm_output,
@@ -733,11 +534,26 @@ mod tests {
             read_nvidia_with_limit,
             read_smart_with_limit,
             read_zone_sources,
-            run_with_timeout,
             smart_reading,
-            wait_bounded,
         },
         crate::{
+            command::{
+                CommandRunner,
+                KILL_GRACE,
+                RunLimits,
+                testing::{
+                    blocking,
+                    poll_until,
+                    script_lock,
+                    sleeping_body,
+                    spawn_sleeper,
+                    wait_until_gone,
+                    write_script,
+                    written_pid,
+                    KillOnDrop,
+                    TempDir,
+                },
+            },
             config::{
                 Aggregation,
                 Interval,
@@ -771,35 +587,7 @@ mod tests {
     }
 
     fn smart_status_reading(code: i32, output: &str) -> Result<u8, Error> {
-        smart_reading(exit_status(code), Path::new(BLOCK_DEV), serde_json::from_str(output))
-    }
-
-    /// Directory under the system temp dir that is removed when dropped
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            static COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-            let name = format!("ipmi-fan-control-test-{}-{}",
-                process::id(), COUNTER.fetch_add(1, Ordering::SeqCst));
-            let path = env::temp_dir().join(name);
-            fs::create_dir(&path).unwrap();
-
-            Self(path)
-        }
-
-        fn write(&self, name: &str, contents: &str) -> PathBuf {
-            let path = self.0.join(name);
-            fs::write(&path, contents).unwrap();
-            path
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
+        smart_reading(exit_status(code), Path::new(BLOCK_DEV), output.as_bytes())
     }
 
     fn file_reading(contents: &str) -> Result<u8, Error> {
@@ -809,7 +597,7 @@ mod tests {
     }
 
     fn hdparm_reading(output: &str) -> Result<u8, Error> {
-        parse_hdparm_output(Path::new(BLOCK_DEV), &mut output.as_bytes())
+        parse_hdparm_output(Path::new(BLOCK_DEV), output.as_bytes())
     }
 
     #[test]
@@ -916,7 +704,7 @@ mod tests {
     }
 
     fn assert_nvidia_bad_data(stdout: &str) {
-        let result = parse_nvidia_output(GPU, stdout);
+        let result = parse_nvidia_output(GPU, stdout.as_bytes());
 
         assert!(matches!(&result,
             Err(Error::NvidiaBadData { gpu, output }) if gpu == GPU && output == stdout),
@@ -925,7 +713,7 @@ mod tests {
 
     #[test]
     fn nvidia_temperature_line() {
-        assert_eq!(parse_nvidia_output(GPU, "67\n").unwrap(), 67);
+        assert_eq!(parse_nvidia_output(GPU, b"67\n").unwrap(), 67);
     }
 
     #[test]
@@ -945,7 +733,7 @@ mod tests {
 
     #[test]
     fn nvidia_bad_data_message_names_gpu_and_trimmed_output() {
-        let message = parse_nvidia_output(GPU, "[N/A]\n").unwrap_err().to_string();
+        let message = parse_nvidia_output(GPU, b"[N/A]\n").unwrap_err().to_string();
 
         assert_eq!(message, r#"nvidia-smi reported bad data for GPU: 00000000:81:00.0: "[N/A]""#);
     }
@@ -953,7 +741,7 @@ mod tests {
     #[test]
     fn nvidia_record_with_or_without_one_line_ending_gives_reading() {
         for stdout in ["67", "67\n", "67\r\n"] {
-            assert_eq!(parse_nvidia_output(GPU, stdout).unwrap(), 67, "{:?}", stdout);
+            assert_eq!(parse_nvidia_output(GPU, stdout.as_bytes()).unwrap(), 67, "{:?}", stdout);
         }
     }
 
@@ -976,7 +764,7 @@ mod tests {
 
     #[test]
     fn nvidia_temperature_above_u8_exceeds_bounds() {
-        let result = parse_nvidia_output(GPU, "300\n");
+        let result = parse_nvidia_output(GPU, b"300\n");
 
         assert!(matches!(result, Err(Error::ReadingExceedsBounds)), "{:?}", result);
     }
@@ -984,263 +772,75 @@ mod tests {
     /// Limit for a script run that must finish, far above any scheduling delay
     const FINISH_LIMIT: Duration = Duration::from_secs(10);
 
-    /// Limit for a script run that must time out. It is long enough for the
-    /// script to write its pid file before the limit passes.
+    /// Limit for a script run that must time out
     const TIMEOUT_LIMIT: Duration = Duration::from_secs(1);
 
-    /// Grace for the tests of `wait_bounded` on a child that does not exit
-    const SHORT_GRACE: Duration = Duration::from_millis(200);
-
-    /// Longest a test waits for a script's file or a child's state to appear
-    const APPEAR_WAIT: Duration = Duration::from_secs(5);
-
     /// Time a bounded call may take beyond its bound on a loaded host
-    const RETURN_SLACK: Duration = Duration::from_secs(2);
+    const RETURN_SLACK: Duration = Duration::from_secs(5);
 
-    // Serialises the tests that spawn a process. A fork in another test
-    // thread can inherit a script's write descriptor for a moment, and exec
-    // of the script then fails with ETXTBSY.
-    static SCRIPT_LOCK: Mutex<()> = Mutex::new(());
-
-    fn script_lock() -> MutexGuard<'static, ()> {
-        SCRIPT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Poll `ready` until it gives a value or [`APPEAR_WAIT`] passes
-    fn poll_until<T>(mut ready: impl FnMut() -> Option<T>) -> Option<T> {
-        let deadline = Instant::now() + APPEAR_WAIT;
-
-        loop {
-            if let Some(value) = ready() {
-                return Some(value);
-            }
-            if Instant::now() >= deadline {
-                return None;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    /// Wait for a script to write a pid to `path` and return it
-    fn wait_for_pid(path: &Path) -> Option<String> {
-        poll_until(|| {
-            let contents = fs::read_to_string(path).ok()?;
-            let pid = contents.trim();
-            (!pid.is_empty()).then(|| pid.to_owned())
-        })
-    }
-
-    /// Wait until the process `pid` has no /proc entry. A zombie still has
-    /// one, so this also waits for the process to be reaped.
-    fn wait_until_gone(pid: &str) -> bool {
-        let entry = Path::new("/proc").join(pid);
-        poll_until(|| (!entry.exists()).then_some(())).is_some()
-    }
-
-    /// Kills the process whose pid a script wrote to a file, when dropped. A
-    /// script that never wrote the file leaves nothing to kill.
-    struct KillOnDrop(PathBuf);
-
-    impl Drop for KillOnDrop {
-        fn drop(&mut self) {
-            let Some(pid) = wait_for_pid(&self.0) else {
-                return;
-            };
-            let _guard = script_lock();
-            let _ = Command::new("sh")
-                .args(["-c", "kill -9 \"$1\"", "sh", &pid])
-                .stderr(Stdio::null())
-                .status();
-            wait_until_gone(&pid);
-        }
-    }
-
-    /// Owns a child and kills and reaps it when dropped, so a failed
-    /// assertion leaves no process behind
-    struct ChildGuard(Child);
-
-    impl Drop for ChildGuard {
-        fn drop(&mut self) {
-            // Both calls do nothing to a child that has already been reaped
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-
-    /// Spawn a child that runs until killed
-    fn spawn_sleeper() -> ChildGuard {
-        let child = Command::new("sleep")
-            .arg("30")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-
-        ChildGuard(child)
-    }
-
-    #[test]
-    fn wait_bounded_gives_up_on_live_child() {
-        let _guard = script_lock();
-        let mut child = spawn_sleeper();
-
-        let start = Instant::now();
-        let status = wait_bounded(&mut child.0, SHORT_GRACE);
-        let elapsed = start.elapsed();
-
-        assert!(status.is_none(), "{:?}", status);
-        assert!(elapsed >= SHORT_GRACE, "returned after {:?}", elapsed);
-        assert!(elapsed < SHORT_GRACE + RETURN_SLACK, "returned after {:?}", elapsed);
-    }
-
-    #[test]
-    fn wait_bounded_returns_once_child_exits() {
-        let _guard = script_lock();
-        let mut child = ChildGuard(Command::new("sh")
-            .args(["-c", "exit 4"])
-            .spawn()
-            .unwrap());
-
-        let grace = Duration::from_secs(10);
-        let start = Instant::now();
-        let status = wait_bounded(&mut child.0, grace);
-        let elapsed = start.elapsed();
-
-        assert_eq!(status.and_then(|s| s.code()), Some(4));
-        assert!(elapsed < grace / 2, "returned after {:?}", elapsed);
-    }
-
-    /// A fake nvidia-smi script and the outcome of reading it
+    /// A fake program and the outcome of reading it
     struct ScriptRun {
         script: PathBuf,
         result: Result<u8, Error>,
-        /// Time of the read alone, without the wait for [`SCRIPT_LOCK`]
+        /// Time of the read alone, without the wait for the script lock
         elapsed: Duration,
+        /// The runner that ran the script
+        runner: CommandRunner,
     }
 
-    /// Write `body` as an executable script `name` in `dir`
-    fn write_script(dir: &TempDir, name: &str, body: &str) -> PathBuf {
-        let script = dir.write(name, &format!("#!/bin/sh\n{}\n", body));
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        script
-    }
-
-    /// Run `body` as a fake program `name` in `dir` and read it with `read`
-    fn script_reading(dir: &TempDir, name: &str, body: &str, read: impl FnOnce(&Path) -> Result<u8, Error>)
-        -> ScriptRun
-    {
+    /// Run `body` as a fake program `name` in `dir` and read it with `read`, on
+    /// a runner of its own, as the zone loop reads a source
+    fn script_reading(
+        dir: &TempDir,
+        name: &str,
+        body: &str,
+        read: impl FnOnce(&mut CommandRunner, &Path) -> Result<u8, Error>,
+    ) -> ScriptRun {
         let _guard = script_lock();
         let script = write_script(dir, name, body);
+        let mut runner = CommandRunner::default();
 
         let start = Instant::now();
-        let result = read(&script);
-        ScriptRun { script, result, elapsed: start.elapsed() }
+        let result = blocking(|| read(&mut runner, &script));
+        ScriptRun { script, result, elapsed: start.elapsed(), runner }
     }
 
     /// Run `body` as a fake nvidia-smi script in `dir`
     fn nvidia_script_reading(dir: &TempDir, body: &str, limit: Duration) -> ScriptRun {
-        script_reading(dir, "nvidia-smi", body, |script| read_nvidia_with_limit(script, GPU, limit))
+        script_reading(dir, "nvidia-smi", body, |runner, script| read_nvidia_with_limit(runner, script, GPU, limit))
     }
 
     /// Run `body` as a fake smartctl script in `dir`
     fn smart_script_reading(dir: &TempDir, body: &str, limit: Duration) -> ScriptRun {
-        script_reading(dir, "smartctl", body, |script| read_smart_with_limit(script, Path::new(BLOCK_DEV), limit))
+        script_reading(dir, "smartctl", body,
+            |runner, script| read_smart_with_limit(runner, script, Path::new(BLOCK_DEV), limit))
     }
 
     /// Run `body` as a fake hdparm script in `dir`
     fn hdparm_script_reading(dir: &TempDir, body: &str, limit: Duration) -> ScriptRun {
-        script_reading(dir, "hdparm", body, |script| read_hdparm_with_limit(script, Path::new(BLOCK_DEV), limit))
+        script_reading(dir, "hdparm", body,
+            |runner, script| read_hdparm_with_limit(runner, script, Path::new(BLOCK_DEV), limit))
+    }
+
+    fn assert_timed_out(run: &ScriptRun) {
+        assert!(matches!(&run.result,
+            Err(Error::CommandTimeout { command, .. }) if Path::new(command) == run.script),
+            "{:?}", run.result);
     }
 
     /// Assert that a script that recorded its pid in `pid_file` and then slept
-    /// timed out, and that its process is gone
-    fn assert_timed_out_and_killed(run: &ScriptRun, pid_file: &Path) {
+    /// timed out within its bound, and that its process is gone. A script
+    /// scheduled late may be killed before it records its pid; the runner then
+    /// still shows that its child exited.
+    fn assert_timed_out_and_killed(run: &mut ScriptRun, pid_file: &Path) {
         assert_timed_out(run);
         assert!(run.elapsed < TIMEOUT_LIMIT + KILL_GRACE + RETURN_SLACK, "returned after {:?}", run.elapsed);
+        assert!(poll_until(|| run.runner.release_exited().then_some(())).is_some(),
+            "the killed child is still kept");
 
-        let pid = wait_for_pid(pid_file).expect("the script wrote no pid before it was killed");
-        assert!(wait_until_gone(&pid), "pid {} still exists", pid);
-    }
-
-    /// Body of a script that records its pid in `pid_file` and sleeps until
-    /// killed. exec keeps the shell's pid, so the pid is the sleeping process.
-    fn sleeping_body(pid_file: &Path) -> String {
-        format!("echo $$ > '{}'\nexec sleep 30", pid_file.display())
-    }
-
-    #[test]
-    fn stuck_command_is_not_started_again_until_reaped() {
-        let dir = TempDir::new();
-        let marker = dir.0.join("ran");
-        let pid_file = dir.0.join("pid");
-        let limits = RunLimits { time: FINISH_LIMIT, output: NVIDIA_OUTPUT_CAP };
-        // Declared before the lock guard, so that a failed assertion releases
-        // the lock before this takes it to kill the stand-in
-        let stray = KillOnDrop(pid_file.clone());
-        let guard = script_lock();
-        let script = write_script(&dir, "tool", &format!("touch '{}'", marker.display()));
-        let command = |arg: &str| {
-            let mut cmd = Command::new(&script);
-            cmd.arg(arg);
-            cmd
-        };
-
-        // SIGKILL cannot be ignored, so a live sleep stands in for a run of
-        // `tool stuck` that outlived its kill
-        let stuck = Command::new("sleep").arg("30").stdout(Stdio::null()).spawn().unwrap();
-        fs::write(&pid_file, stuck.id().to_string()).unwrap();
-        let identity = command_identity(&command("stuck"));
-        reap_in_background(stuck, identity.clone());
-
-        let result = run_with_timeout(&mut command("stuck"), limits);
-
-        assert!(matches!(&result, Err(Error::CommandStillRunning { command }) if *command == identity),
-            "{:?}", result);
-        assert!(!marker.exists(), "the stuck command was started again");
-
-        let (status, _) = run_with_timeout(&mut command("other"), limits).unwrap();
-        assert!(status.success());
-        assert!(marker.exists(), "a command with other arguments did not run");
-        fs::remove_file(&marker).unwrap();
-
-        // Kill the stand-in; the reaper then frees the command
-        drop(guard);
-        drop(stray);
-        assert!(poll_until(|| (!STUCK_COMMANDS.contains(&identity)).then_some(())).is_some(),
-            "the reaped command is still marked as stuck");
-
-        let _guard = script_lock();
-        let (status, _) = run_with_timeout(&mut command("stuck"), limits).unwrap();
-        assert!(status.success());
-        assert!(marker.exists(), "the reaped command did not run again");
-    }
-
-    #[test]
-    fn stuck_commands_survive_a_poisoned_lock() {
-        let stuck = StuckCommands(Mutex::new(BTreeSet::new()));
-        stuck.insert("\"nvidia-smi\"".to_owned());
-
-        thread::scope(|scope| {
-            let poisoner = scope.spawn(|| {
-                let _commands = stuck.commands();
-                panic!("poison the lock");
-            });
-            assert!(poisoner.join().is_err());
-        });
-        assert!(stuck.0.is_poisoned());
-
-        assert!(stuck.contains("\"nvidia-smi\""));
-        stuck.remove("\"nvidia-smi\"");
-        assert!(!stuck.contains("\"nvidia-smi\""));
-    }
-
-    #[test]
-    fn command_identity_names_program_and_arguments() {
-        let mut cmd = Command::new("nvidia-smi");
-        cmd.args(["-i", "0000:81:00.0"]);
-
-        assert_eq!(command_identity(&cmd), r#""nvidia-smi" "-i" "0000:81:00.0""#);
+        if let Some(pid) = written_pid(pid_file) {
+            assert!(wait_until_gone(&pid), "pid {} still exists", pid);
+        }
     }
 
     #[test]
@@ -1263,12 +863,23 @@ mod tests {
     }
 
     #[test]
+    fn smart_script_non_utf8_output_fails_to_parse() {
+        let dir = TempDir::new();
+        let body = r#"printf '{ "temperature": { "current": 41 }, "name": "\377" }\n'"#;
+        let run = smart_script_reading(&dir, body, FINISH_LIMIT);
+
+        assert!(matches!(&run.result,
+            Err(Error::SmartParse { block_dev, .. }) if block_dev == Path::new(BLOCK_DEV)),
+            "{:?}", run.result);
+    }
+
+    #[test]
     fn smart_script_timeout_kills_child() {
         let dir = TempDir::new();
         let pid_file = dir.0.join("pid");
-        let run = smart_script_reading(&dir, &sleeping_body(&pid_file), TIMEOUT_LIMIT);
+        let mut run = smart_script_reading(&dir, &sleeping_body(&pid_file), TIMEOUT_LIMIT);
 
-        assert_timed_out_and_killed(&run, &pid_file);
+        assert_timed_out_and_killed(&mut run, &pid_file);
     }
 
     #[test]
@@ -1278,6 +889,15 @@ mod tests {
             "[ \"$*\" = \"-H {}\" ] || exit 3\nprintf '\\n{}:\\n drive temperature (celsius) is:  33\\n'",
             BLOCK_DEV, BLOCK_DEV);
         let run = hdparm_script_reading(&dir, &body, FINISH_LIMIT);
+
+        assert_eq!(run.result.unwrap(), 33);
+    }
+
+    #[test]
+    fn hdparm_script_non_utf8_after_temperature_line_gives_reading() {
+        let dir = TempDir::new();
+        let body = "printf '\\n/dev/sda:\\n drive temperature (celsius) is:  33\\n\\377\\376\\n'";
+        let run = hdparm_script_reading(&dir, body, FINISH_LIMIT);
 
         assert_eq!(run.result.unwrap(), 33);
     }
@@ -1296,15 +916,9 @@ mod tests {
     fn hdparm_script_timeout_kills_child() {
         let dir = TempDir::new();
         let pid_file = dir.0.join("pid");
-        let run = hdparm_script_reading(&dir, &sleeping_body(&pid_file), TIMEOUT_LIMIT);
+        let mut run = hdparm_script_reading(&dir, &sleeping_body(&pid_file), TIMEOUT_LIMIT);
 
-        assert_timed_out_and_killed(&run, &pid_file);
-    }
-
-    fn assert_timed_out(run: &ScriptRun) {
-        assert!(matches!(&run.result,
-            Err(Error::CommandTimeout { command, .. }) if Path::new(command) == run.script),
-            "{:?}", run.result);
+        assert_timed_out_and_killed(&mut run, &pid_file);
     }
 
     #[test]
@@ -1316,6 +930,16 @@ mod tests {
         let run = nvidia_script_reading(&dir, &body, FINISH_LIMIT);
 
         assert_eq!(run.result.unwrap(), 71);
+    }
+
+    #[test]
+    fn nvidia_script_non_utf8_output_is_bad_data() {
+        let dir = TempDir::new();
+        let run = nvidia_script_reading(&dir, "printf '7\\377\\n'", FINISH_LIMIT);
+
+        assert!(matches!(&run.result,
+            Err(Error::NvidiaBadData { gpu, output }) if gpu == GPU && output == "7\u{FFFD}\n"),
+            "{:?}", run.result);
     }
 
     fn assert_output_over_cap(run: &ScriptRun) {
@@ -1354,17 +978,6 @@ mod tests {
     }
 
     #[test]
-    fn unrepresentable_limit_is_error() {
-        let _guard = script_lock();
-        let result = run_with_timeout(&mut Command::new("true"), RunLimits { time: Duration::MAX, output: NVIDIA_OUTPUT_CAP });
-
-        assert!(matches!(&result,
-            Err(Error::Io { path, source })
-                if path == Path::new("true") && source.kind() == io::ErrorKind::InvalidInput),
-            "{:?}", result);
-    }
-
-    #[test]
     fn nvidia_script_failure_is_command_error() {
         let dir = TempDir::new();
         let run = nvidia_script_reading(&dir, "exit 9", FINISH_LIMIT);
@@ -1383,29 +996,43 @@ mod tests {
         // The script exits at once, but the background sleep keeps its stdout open
         let body = format!("sleep 30 &\necho $! > '{}'\necho 71", pid_file.display());
 
-        let run = nvidia_script_reading(&dir, &body, TIMEOUT_LIMIT);
+        let mut run = nvidia_script_reading(&dir, &body, TIMEOUT_LIMIT);
 
         assert_timed_out(&run);
-        assert!(run.elapsed < TIMEOUT_LIMIT + RETURN_SLACK, "returned after {:?}", run.elapsed);
+        assert!(run.elapsed < TIMEOUT_LIMIT + KILL_GRACE + RETURN_SLACK, "returned after {:?}", run.elapsed);
+        assert!(run.runner.release_exited(), "the exited script is still kept");
     }
 
     #[test]
     fn nvidia_script_timeout_kills_child() {
         let dir = TempDir::new();
         let pid_file = dir.0.join("pid");
-        // exec keeps the shell's pid, so the recorded pid is the sleeping process
-        let body = format!("echo $$ > '{}'\nexec sleep 30", pid_file.display());
+        let mut run = nvidia_script_reading(&dir, &sleeping_body(&pid_file), TIMEOUT_LIMIT);
 
-        let run = nvidia_script_reading(&dir, &body, TIMEOUT_LIMIT);
+        assert_timed_out_and_killed(&mut run, &pid_file);
+    }
 
-        assert_timed_out(&run);
-        assert!(run.elapsed < TIMEOUT_LIMIT + KILL_GRACE + RETURN_SLACK,
-            "returned after {:?}", run.elapsed);
+    #[test]
+    fn kept_child_blocks_only_the_program_of_its_own_source() {
+        let dir = TempDir::new();
+        let marker = dir.0.join("ran");
+        let _guard = script_lock();
+        let script = write_script(&dir, "tool", &format!("touch '{}'", marker.display()));
+        let limits = RunLimits { time: FINISH_LIMIT, output: NVIDIA_OUTPUT_CAP };
+        let mut readers = ZoneReaders::default();
 
-        // A child that outlived the kill grace is reaped by a detached thread,
-        // so its /proc entry may take a moment longer to go away
-        let pid = wait_for_pid(&pid_file).expect("the script wrote no pid before it was killed");
-        assert!(wait_until_gone(&pid), "pid {} still exists", pid);
+        // Dropped inside the runtime, so the kept child is killed and reaped there
+        blocking(move || {
+            readers.runner(0).keep(spawn_sleeper(), &script);
+
+            let blocked = readers.runner(0).run(&script, &[], limits);
+            assert!(matches!(&blocked, Err(Error::CommandStillRunning { .. })), "{:?}", blocked);
+            assert!(!marker.exists(), "source 0 started its program beside its kept child");
+
+            let (status, _) = readers.runner(1).run(&script, &[], limits).unwrap();
+            assert!(status.success());
+            assert!(marker.exists(), "source 1 did not run its program");
+        });
     }
 
     /// A zone with no wait between retries
@@ -1517,7 +1144,7 @@ mod tests {
             queries += 1;
             Ok(sensor_map(sensors))
         };
-        let result = read_zone_sources(zone, failed_last, &mut query, &|s| reader.read(s));
+        let result = read_zone_sources(zone, failed_last, &mut query, &mut |_, s| reader.read(s));
 
         (result, queries)
     }
@@ -1536,7 +1163,7 @@ mod tests {
     /// Read `zone` as the zone loop does, after the polls `state` has seen
     fn poll(zone: &Zone, state: &mut ZoneState, reader: &FakeReader) -> Vec<SourceReading> {
         let failed_last = state.failed_sources();
-        let readings = read_zone_sources(zone, &failed_last, &mut || Ok(HashMap::new()), &|s| reader.read(s))
+        let readings = read_zone_sources(zone, &failed_last, &mut || Ok(HashMap::new()), &mut |_, s| reader.read(s))
             .unwrap();
         state.next_duty(zone, &readings);
 
@@ -1597,7 +1224,7 @@ mod tests {
             Err(query_error())
         };
 
-        let readings = read_zone_sources(&zone, &[true], &mut query, &|_| panic!("no file source")).unwrap();
+        let readings = read_zone_sources(&zone, &[true], &mut query, &mut |_, _| panic!("no file source")).unwrap();
 
         assert!(matches!(&readings[..], [Failed(_)]), "{:?}", readings);
         assert_eq!(queries, 1);
@@ -1610,7 +1237,7 @@ mod tests {
         let mut queries = 0;
 
         let readings = read_zone_sources(&zone, &[true, false], &mut changing_query(&maps, &mut queries),
-            &|_| panic!("no file source")).unwrap();
+            &mut |_, _| panic!("no file source")).unwrap();
 
         assert_eq!(readings, [Temp(60), Temp(50)]);
         assert_eq!(queries, 2);
@@ -1624,15 +1251,31 @@ mod tests {
             events.borrow_mut().push("query");
             Ok(sensor_map(&[(CPU, celsius(50))]))
         };
-        let reader = |_: &Source| {
+        let mut reader = |_: usize, _: &Source| {
             events.borrow_mut().push("disk");
             Ok(35)
         };
 
-        let readings = read_zone_sources(&zone, &[false, false], &mut query, &reader).unwrap();
+        let readings = read_zone_sources(&zone, &[false, false], &mut query, &mut reader).unwrap();
 
         assert_eq!(readings, [Temp(50), Temp(35)]);
         assert_eq!(events.into_inner(), ["disk", "query"]);
+    }
+
+    #[test]
+    fn reader_is_given_the_index_of_each_source() {
+        let zone = zone(vec![ipmi(CPU, IGNORE), file("gpu", IGNORE), file("disk", IGNORE)], 1);
+        let reader = FakeReader::new(&[("gpu", 1, 70), ("disk", 0, 35)]);
+        let mut calls = Vec::new();
+        let mut query = || Ok(sensor_map(&[(CPU, celsius(50))]));
+
+        let readings = read_zone_sources(&zone, &[false, false, false], &mut query, &mut |index, source| {
+            calls.push(index);
+            reader.read(source)
+        }).unwrap();
+
+        assert_eq!(readings, [Temp(50), Temp(70), Temp(35)]);
+        assert_eq!(calls, [1, 1, 2]);
     }
 
     #[test]
@@ -1667,7 +1310,7 @@ mod tests {
         let mut queries = 0;
 
         let readings = read_zone_sources(&zone, &[false, false], &mut changing_query(&maps, &mut queries),
-            &|s| reader.read(s)).unwrap();
+            &mut |_, s| reader.read(s)).unwrap();
 
         assert!(matches!(&readings[..], [Failed(_), Temp(35)]), "{:?}", readings);
         assert_eq!(queries, 1);
@@ -1684,7 +1327,7 @@ mod tests {
         let mut queries = 0;
 
         let readings = read_zone_sources(&zone, &[false, false], &mut changing_query(&maps, &mut queries),
-            &|_| panic!("no file source")).unwrap();
+            &mut |_, _| panic!("no file source")).unwrap();
 
         assert_eq!(readings, [Temp(50), Temp(55)]);
         assert_eq!(queries, 2);
@@ -1785,7 +1428,7 @@ mod tests {
             Err(query_error())
         };
 
-        let result = read_zone_sources(&zone, &[false, false], &mut query, &|_| panic!("no file source"));
+        let result = read_zone_sources(&zone, &[false, false], &mut query, &mut |_, _| panic!("no file source"));
 
         assert_retries_failed(&result, 3, "\"(ipmi)\": BMC busy");
         assert_eq!(queries, 3);
@@ -1797,7 +1440,7 @@ mod tests {
         let reader = FakeReader::new(&[("disk", 0, 35)]);
         let mut query = || Err(query_error());
 
-        let readings = read_zone_sources(&zone, &[false, false, false], &mut query, &|s| reader.read(s)).unwrap();
+        let readings = read_zone_sources(&zone, &[false, false, false], &mut query, &mut |_, s| reader.read(s)).unwrap();
         let failed = Failed("Failed all 2 attempt(s); last attempt error: \"(ipmi)\": BMC busy".to_owned());
 
         assert_eq!(readings, [failed.clone(), failed, Temp(35)]);
@@ -1815,7 +1458,7 @@ mod tests {
             Ok(sensor_map(&[(CPU, celsius(50))]))
         };
 
-        let readings = read_zone_sources(&zone, &[false], &mut query, &|_| panic!("no file source")).unwrap();
+        let readings = read_zone_sources(&zone, &[false], &mut query, &mut |_, _| panic!("no file source")).unwrap();
 
         assert_eq!(readings, [Temp(50)]);
         assert_eq!(queries, 2);
