@@ -283,6 +283,9 @@ pub enum Aggregation {
     },
 }
 
+/// A zone may also be written as a TOML array, whose values serde reads in the
+/// order the fields are declared. Add a new field after the existing ones, so
+/// that a config in that form keeps loading.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Zone {
@@ -302,9 +305,6 @@ pub struct Zone {
     /// has `steps`, so the zone curve is never used.
     #[serde(default)]
     pub steps: Option<Vec<Step>>,
-    /// The name of an entry of `curves`, which sets `steps`
-    #[serde(default)]
-    pub curve: Option<String>,
     /// How the duties of the zone's curves combine into one
     #[serde(default)]
     pub duty_aggregation: Aggregation,
@@ -312,6 +312,9 @@ pub struct Zone {
     /// follows
     #[serde(default)]
     pub hysteresis: u8,
+    /// The name of an entry of `curves`, which sets `steps`
+    #[serde(default)]
+    pub curve: Option<String>,
     /// The hysteresis of the named curve that set `steps`; `None` means
     /// `hysteresis` applies. Not a config key.
     #[serde(skip)]
@@ -1665,6 +1668,17 @@ mod tests {
         let message = parse_error(&with_gpu_curve(&zone_toml(&[("sources", sources)]), GPU_STEPS, ""));
 
         assert!(message.contains("duplicate field `curve`"), "{}", message);
+    }
+
+    #[test]
+    fn accepts_positional_zone() {
+        let contents = r#"zones = [["default", 1, 2, 0, [0], [{ type = "file", path = "/dev/null" }], { type = "maximum" }, [{ temp = 40, dcycle = 70 }], { type = "maximum" }, 0]]"#;
+        let config = parse(contents).unwrap();
+        let zone = &config.zones[0];
+
+        assert!(matches!(zone.duty_aggregation, Aggregation::Maximum));
+        assert_eq!(zone.hysteresis, 0);
+        assert!(zone.curve.is_none());
     }
 
     #[test]
