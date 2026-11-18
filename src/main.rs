@@ -7,6 +7,7 @@ mod fan;
 mod freeipmi;
 mod source;
 mod ipmi;
+mod session;
 
 use {
     std::{
@@ -18,9 +19,6 @@ use {
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
-            Mutex,
-            MutexGuard,
-            PoisonError,
         },
     },
     clap::Parser,
@@ -30,10 +28,10 @@ use {
         time::sleep,
     },
 
-    config::{Config, load_config, SessionType, Zone},
+    config::{Config, load_config, Zone},
     curve::{Transition, ZoneState},
     error::{Error, Result},
-    ipmi::{FanMode, Ipmi},
+    session::IpmiSession,
     source::{read_zone_sources, ZoneReaders},
 };
 
@@ -64,68 +62,6 @@ async fn interrupted() -> io::Result<()> {
     }
 
     Ok(())
-}
-
-/// Lock `mutex`, also when a thread panicked while holding it. A panic in one
-/// zone task must not stop the shutdown path from setting the fans to 100%.
-fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-struct IpmiSession {
-    /// Session name (for logging only)
-    name: String,
-    /// IPMI session
-    ipmi: Arc<Mutex<Ipmi>>,
-    /// Original fan mode
-    orig_fan_mode: FanMode,
-    /// Set these zones to dcycle 100% before restoring original fan mode
-    restore_zones: Vec<u8>,
-}
-
-impl IpmiSession {
-    pub fn new<N, R>(name: N, st: &SessionType, restore_zones: R) -> Result<Self>
-    where
-        N: AsRef<str>,
-        R: IntoIterator<Item = u8>,
-    {
-        let mut ipmi = Ipmi::new(st)?;
-        let orig_fan_mode = ipmi.get_fan_mode()?;
-
-        info!("[{}] Original fan mode: {:?}", name.as_ref(), orig_fan_mode);
-
-        if orig_fan_mode != FanMode::Full {
-            info!("[{}] Setting fan mode to: {:?}", name.as_ref(), FanMode::Full);
-            ipmi.set_fan_mode(FanMode::Full)?;
-        }
-
-        Ok(Self {
-            name: name.as_ref().to_owned(),
-            ipmi: Arc::new(Mutex::new(ipmi)),
-            orig_fan_mode,
-            restore_zones: restore_zones.into_iter().collect(),
-        })
-    }
-}
-
-impl Drop for IpmiSession {
-    fn drop(&mut self) {
-        let mut ipmi_lock = lock_or_recover(&self.ipmi);
-
-        for z in &self.restore_zones {
-            info!("[{}] Setting zone {} duty cycle to 100%", self.name, z);
-            if let Err(e) = ipmi_lock.set_duty_cycle(*z, 100) {
-                error!("[{}] Failed to set duty cycle: {}", self.name, e);
-            }
-        }
-
-        if self.orig_fan_mode != FanMode::Full {
-            info!("[{}] Restoring fan mode to: {:?}", self.name, self.orig_fan_mode);
-            if let Err(e) = ipmi_lock.set_fan_mode(self.orig_fan_mode) {
-                error!("[{}] Failed to restore fan mode: {}", self.name, e);
-            }
-        }
-    }
 }
 
 struct MainApp {
@@ -230,7 +166,7 @@ impl MainApp {
         zone_config: Arc<Zone>,
     ) -> Result<()> {
         info!("[{}] Starting loop for IPMI zones {:?}",
-              session.name, zone_config.ipmi_zones);
+              session.name(), zone_config.ipmi_zones);
 
         let mut state = ZoneState::new(&zone_config);
         let mut readers = ZoneReaders::default();
@@ -258,22 +194,22 @@ impl MainApp {
     ) -> Result<()> {
         trace!("Querying sources for zones {:?}", zone_config.ipmi_zones);
 
-        let mut query_ipmi = || Ok(lock_or_recover(&session.ipmi).get_temperature_readings()?);
+        let mut query_ipmi = || session.lock().get_temperature_readings();
         let failed_last = state.failed_sources();
         let readings = read_zone_sources(zone_config, &failed_last, &mut query_ipmi,
             &mut |index, source| readers.read(index, source))?;
         let update = state.next_duty(zone_config, &readings);
         let dcycle_new = update.duty;
 
-        Self::log_transitions(&session.name, zone_config, &update.transitions);
+        Self::log_transitions(session.name(), zone_config, &update.transitions);
 
-        let mut ipmi_lock = lock_or_recover(&session.ipmi);
+        let mut ipmi_lock = session.lock();
 
         for z in &zone_config.ipmi_zones {
             let dcycle_cur = ipmi_lock.get_duty_cycle(*z)?;
 
             debug!("[{}] Zone {}: smoothed_temps={:?}C, curve_temps={:?}C, dcycle_cur={}%, dcycle_new={}%",
-                   session.name, z, update.smoothed_temps, update.curve_temps, dcycle_cur, dcycle_new);
+                   session.name(), z, update.smoothed_temps, update.curve_temps, dcycle_cur, dcycle_new);
 
             if dcycle_new != dcycle_cur {
                 ipmi_lock.set_duty_cycle(*z, dcycle_new)?;
@@ -363,34 +299,5 @@ async fn main() {
             }
             process::exit(1);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use {
-        std::{
-            sync::{Arc, Mutex},
-            thread,
-        },
-        super::lock_or_recover,
-    };
-
-    #[test]
-    fn lock_recovers_a_poisoned_mutex() {
-        let mutex = Arc::new(Mutex::new(1u8));
-        let holder = mutex.clone();
-
-        let panicked = thread::spawn(move || {
-            let _guard = holder.lock().unwrap();
-            panic!("panic while holding the lock");
-        }).join();
-
-        assert!(panicked.is_err());
-        assert!(mutex.is_poisoned());
-
-        let mut guard = lock_or_recover(&mutex);
-        *guard += 1;
-        assert_eq!(*guard, 2);
     }
 }

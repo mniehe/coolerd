@@ -1,7 +1,13 @@
 use {
-    std::panic::{catch_unwind, AssertUnwindSafe},
-    log::error,
-    crate::error::{Error, Result},
+    std::{
+        panic::{catch_unwind, AssertUnwindSafe},
+        sync::Arc,
+    },
+    log::{error, info},
+    crate::{
+        error::{Error, Result},
+        session::IpmiSession,
+    },
 };
 
 /// What one fan did with a duty cycle, in percent, for the debug log
@@ -81,6 +87,51 @@ impl Drop for FanGuard {
     }
 }
 
+/// The duty cycle that leaves a Supermicro zone safe
+const SUPERMICRO_RELEASE_DUTY: u8 = 100;
+
+/// One Supermicro IPMI fan zone on a shared session. The session switches the
+/// board to full fan mode when it opens and restores the saved mode when it
+/// drops, after the guards that hold its zones.
+pub struct SupermicroZone {
+    session: Arc<IpmiSession>,
+    zone: u8,
+}
+
+impl SupermicroZone {
+    pub fn new(session: Arc<IpmiSession>, zone: u8) -> Self {
+        Self { session, zone }
+    }
+}
+
+impl Fan for SupermicroZone {
+    fn describe(&self) -> String {
+        format!("supermicro zone {} on session {}", self.zone, self.session.name())
+    }
+
+    fn take_control(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn set_duty(&mut self, duty: u8) -> Result<Applied> {
+        let mut port = self.session.lock();
+        let before = port.get_duty_cycle(self.zone)?;
+
+        if before == duty {
+            return Ok(Applied { before: Some(before), sent: None });
+        }
+
+        port.set_duty_cycle(self.zone, duty)?;
+
+        Ok(Applied { before: Some(before), sent: Some(duty) })
+    }
+
+    fn release(&mut self) -> Result<()> {
+        info!("[{}] Setting zone {} duty cycle to {}%", self.session.name(), self.zone, SUPERMICRO_RELEASE_DUTY);
+        self.session.lock().set_duty_cycle(self.zone, SUPERMICRO_RELEASE_DUTY)
+    }
+}
+
 #[cfg(test)]
 pub mod fake {
     use {
@@ -155,12 +206,22 @@ pub mod fake {
 #[cfg(test)]
 mod tests {
     use {
+        std::sync::Arc,
         super::{
             fake::{CallLog, FakeFan, Op},
             Applied,
+            Fan,
             FanGuard,
+            SupermicroZone,
         },
-        crate::error::{Error, Result},
+        crate::{
+            error::{Error, Result},
+            ipmi::FanMode,
+            session::{
+                fake::{BoardLog, FakeBoard, PortCall},
+                IpmiSession,
+            },
+        },
     };
 
     fn log_of(calls: &CallLog) -> Vec<(&'static str, Op)> {
@@ -249,5 +310,50 @@ mod tests {
 
         assert_eq!(applied, [Applied { before: None, sent: Some(60) }; 2]);
         assert_eq!(log_of(&calls)[2..], [("a", Op::SetDuty), ("b", Op::SetDuty)]);
+    }
+
+    /// The calls a session makes when it opens on a board in standard mode
+    const SESSION_OPEN: [PortCall; 2] = [PortCall::GetFanMode, PortCall::SetFanMode(FanMode::Full)];
+
+    fn session_on(board: FakeBoard) -> Arc<IpmiSession> {
+        Arc::new(IpmiSession::with_port("test", Box::new(board), [0]).unwrap())
+    }
+
+    #[test]
+    fn supermicro_zone_writes_only_a_changed_duty() {
+        let calls = BoardLog::default();
+        let mut board = FakeBoard::new(FanMode::Standard, &calls);
+        board.duties.insert(0, 40);
+        let mut zone = SupermicroZone::new(session_on(board), 0);
+
+        let changed = zone.set_duty(60).unwrap();
+        let unchanged = zone.set_duty(60).unwrap();
+
+        assert_eq!(changed, Applied { before: Some(40), sent: Some(60) });
+        assert_eq!(unchanged, Applied { before: Some(60), sent: None });
+        assert_eq!(calls.lock().unwrap()[SESSION_OPEN.len()..], [
+            PortCall::GetDutyCycle(0),
+            PortCall::SetDutyCycle(0, 60),
+            PortCall::GetDutyCycle(0),
+        ]);
+    }
+
+    #[test]
+    fn released_zone_runs_full_before_the_session_restores_the_mode() {
+        let calls = BoardLog::default();
+
+        {
+            let session = session_on(FakeBoard::new(FanMode::Standard, &calls));
+            let mut guard = FanGuard::new();
+            guard.add(Box::new(SupermicroZone::new(session.clone(), 0))).unwrap();
+        }
+
+        assert_eq!(calls.lock().unwrap()[SESSION_OPEN.len()..], [
+            // The guard's release
+            PortCall::SetDutyCycle(0, 100),
+            // The session's own drop
+            PortCall::SetDutyCycle(0, 100),
+            PortCall::SetFanMode(FanMode::Standard),
+        ]);
     }
 }

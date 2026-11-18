@@ -8,7 +8,9 @@ use {
     crate::{
         bindings,
         config::SessionType,
+        error,
         freeipmi::{self, LfiSession, LimSession, SensorReading},
+        session::IpmiPort,
     },
 };
 
@@ -185,6 +187,28 @@ impl Ipmi {
     pub fn get_temperature_readings(&mut self)
         -> Result<HashMap<String, Option<SensorReading>>> {
         read_all_sensors(&mut self.lim)
+    }
+}
+
+impl IpmiPort for Ipmi {
+    fn get_fan_mode(&mut self) -> error::Result<FanMode> {
+        Ok(Ipmi::get_fan_mode(self)?)
+    }
+
+    fn set_fan_mode(&mut self, mode: FanMode) -> error::Result<()> {
+        Ok(Ipmi::set_fan_mode(self, mode)?)
+    }
+
+    fn get_duty_cycle(&mut self, zone: u8) -> error::Result<u8> {
+        Ok(Ipmi::get_duty_cycle(self, zone)?)
+    }
+
+    fn set_duty_cycle(&mut self, zone: u8, dcycle: u8) -> error::Result<()> {
+        Ok(Ipmi::set_duty_cycle(self, zone, dcycle)?)
+    }
+
+    fn get_temperature_readings(&mut self) -> error::Result<HashMap<String, Option<SensorReading>>> {
+        Ok(Ipmi::get_temperature_readings(self)?)
     }
 }
 
