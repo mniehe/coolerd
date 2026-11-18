@@ -212,6 +212,131 @@ fn failure_floor(on_failure: &OnFailure) -> u8 {
     }
 }
 
+/// Points that map a temperature to a duty cycle, and the degrees a
+/// temperature must fall before the duty follows
+#[derive(Clone, Debug)]
+pub struct Curve {
+    pub steps: Vec<Step>,
+    pub hysteresis: u8,
+}
+
+impl Curve {
+    pub fn duty_for(&self, temp: u8) -> u8 {
+        duty_for_temp(&self.steps, temp)
+    }
+}
+
+/// The sources a curve maps, as indices into the zone's `sources`
+#[derive(Clone, Debug)]
+pub enum Selection {
+    One(usize),
+    /// Joined into one temperature by the aggregation, rounded down
+    Joined(Vec<usize>, Aggregation),
+}
+
+impl Selection {
+    fn indices(&self) -> &[usize] {
+        match self {
+            Self::One(index) => std::slice::from_ref(index),
+            Self::Joined(indices, _) => indices,
+        }
+    }
+}
+
+/// One curve and the sources whose temperature it maps
+#[derive(Clone, Debug)]
+pub struct Binding {
+    pub sources: Selection,
+    pub curve: Curve,
+}
+
+/// What a binding keeps between polls: one state per selected source, in
+/// selection order, and the curve's held temperature
+pub struct BindingState {
+    sources: Vec<SourceState>,
+    held: HeldTemp,
+}
+
+/// What one binding gives in one poll
+pub struct Contribution {
+    /// `None` when no selected source has a reading
+    duty: Option<u8>,
+    /// The highest failure floor of the selected sources that failed
+    floor: u8,
+    /// The reading of each selected source after smoothing, in selection
+    /// order; `None` for a source that failed
+    smoothed: Vec<Option<u8>>,
+    /// The temperature the curve mapped, when it mapped one
+    curve_temp: Option<u8>,
+    transitions: Vec<Transition>,
+}
+
+impl Binding {
+    /// A fresh state for this binding, with the smoothing of each selected
+    /// source as `zone` gives it
+    pub fn new_state(&self, zone: &Zone) -> BindingState {
+        let sources = self.sources.indices().iter()
+            .map(|&index| {
+                // A missing source never reads; any capacity serves
+                let samples = zone.sources.get(index).map_or(1, |s| s.smoothing_samples);
+
+                SourceState { smoother: Smoother::new(samples), curve: HeldTemp(None), failed: false }
+            })
+            .collect();
+
+        BindingState { sources, held: HeldTemp(None) }
+    }
+
+    /// Smooth the reading of each selected source, join the readings and map
+    /// the joined temperature through the curve. A failed source takes no
+    /// part, forgets its stored readings and sets the binding's floor; the
+    /// curve keeps its held temperature while no source reads.
+    pub fn step(&self, zone: &Zone, state: &mut BindingState, readings: &[SourceReading]) -> Contribution {
+        let mut temps = Vec::new();
+        let mut smoothed = Vec::new();
+        let mut transitions = Vec::new();
+        let mut floor = 0;
+
+        for (&index, source_state) in self.sources.indices().iter().zip(&mut state.sources) {
+            let (Some(source), Some(reading)) = (zone.sources.get(index), readings.get(index)) else {
+                // A binding built for another zone has no reading to map
+                smoothed.push(None);
+                floor = FULL_DUTY;
+                continue;
+            };
+
+            transitions.extend(source_state.transition(index, reading));
+
+            match reading {
+                SourceReading::Temp(temp) => {
+                    let temp = source_state.smoother.push(*temp);
+                    smoothed.push(Some(temp));
+                    temps.push(temp);
+                }
+                SourceReading::Failed(_) => {
+                    // A recovered source starts from fresh readings
+                    source_state.smoother.clear();
+                    smoothed.push(None);
+                    floor = floor.max(failure_floor(&source.on_failure));
+                }
+            }
+        }
+
+        let joined = match &self.sources {
+            Selection::One(_) => temps.first().copied(),
+            Selection::Joined(_, aggregation) => aggregate(&temps, aggregation, Rounding::Down),
+        };
+
+        let Some(temp) = joined else {
+            return Contribution { duty: None, floor, smoothed, curve_temp: None, transitions };
+        };
+
+        let temp = state.held.update(temp, self.curve.hysteresis);
+
+        Contribution { duty: Some(self.curve.duty_for(temp)), floor, smoothed, curve_temp: Some(temp), transitions }
+    }
+}
+
 /// The held temperatures of a zone's curves and the failed sources between
 /// polls
 pub struct ZoneState {
@@ -325,7 +450,11 @@ mod tests {
         super::{
             aggregate,
             duty_for_temp,
+            Binding,
+            Contribution,
+            Curve,
             Rounding,
+            Selection,
             Smoother,
             SourceReading::{self, Failed, Temp},
             Transition,
@@ -751,6 +880,88 @@ mod tests {
         let zone = zone(&ZONE_STEPS, vec![plain(), curved(&GPU_STEPS)]);
 
         assert_eq!(duties(&zone, &[&[30]]), [100]);
+    }
+
+    /// A binding of `sources` to `steps` with `hysteresis`
+    fn binding(sources: Selection, steps: &[Step], hysteresis: u8) -> Binding {
+        Binding { sources, curve: Curve { steps: steps.to_vec(), hysteresis } }
+    }
+
+    /// Step `binding` once per poll of `zone` and collect each contribution
+    fn contributions(binding: &Binding, zone: &Zone, polls: &[Vec<SourceReading>]) -> Vec<Contribution> {
+        let mut state = binding.new_state(zone);
+
+        polls.iter().map(|readings| binding.step(zone, &mut state, readings)).collect()
+    }
+
+    #[test]
+    fn binding_holds_its_duty_through_a_fall_smaller_than_its_hysteresis() {
+        let zone = zone(&[], vec![plain()]);
+        let binding = binding(Selection::One(0), &HOLD_STEPS, 3);
+        let steps = contributions(&binding, &zone, &[temps(&[60]), temps(&[58])]);
+
+        // 60 C on the curve 40 C 40% to 80 C 100% gives 70
+        assert_eq!(steps[0].duty, Some(70));
+        assert_eq!(steps[1].duty, Some(70));
+        assert_eq!(steps[1].curve_temp, Some(60));
+    }
+
+    #[test]
+    fn binding_drops_its_duty_on_a_fall_equal_to_its_hysteresis() {
+        let zone = zone(&[], vec![plain()]);
+        let binding = binding(Selection::One(0), &HOLD_STEPS, 3);
+        let steps = contributions(&binding, &zone, &[temps(&[60]), temps(&[57])]);
+
+        // 57 C gives 65.5, truncated to 65
+        assert_eq!(steps[1].duty, Some(65));
+        assert_eq!(steps[1].curve_temp, Some(57));
+    }
+
+    #[test]
+    fn joined_binding_with_maximum_maps_the_hotter_source() {
+        let zone = zone(&[], vec![plain(), plain()]);
+        let binding = binding(Selection::Joined(vec![0, 1], Aggregation::Maximum), &HOLD_STEPS, 0);
+        let step = &contributions(&binding, &zone, &[temps(&[50, 70])])[0];
+
+        assert_eq!(step.curve_temp, Some(70));
+        assert_eq!(step.duty, Some(85));
+        assert_eq!(step.smoothed, [Some(50), Some(70)]);
+    }
+
+    #[test]
+    fn failed_dcycle_source_gives_no_duty_and_its_floor() {
+        let zone = zone(&[], vec![failing(plain(), GPU_FLOOR)]);
+        let binding = binding(Selection::One(0), &HOLD_STEPS, 0);
+        let step = &contributions(&binding, &zone, &[vec![failed()]])[0];
+
+        assert_eq!(step.duty, None);
+        assert_eq!(step.floor, 80);
+        assert_eq!(step.smoothed, [None]);
+        assert_eq!(step.transitions, [Transition::Failed { source: 0, error: "timed out".to_owned() }]);
+    }
+
+    #[test]
+    fn failed_ignore_source_gives_no_duty_and_no_floor() {
+        let zone = zone(&[], vec![failing(plain(), OnFailure::Ignore {})]);
+        let binding = binding(Selection::One(0), &HOLD_STEPS, 0);
+        let step = &contributions(&binding, &zone, &[vec![failed()]])[0];
+
+        assert_eq!(step.duty, None);
+        assert_eq!(step.floor, 0);
+        assert_eq!(step.curve_temp, None);
+        assert_eq!(step.smoothed, [None]);
+        assert_eq!(step.transitions, [Transition::Failed { source: 0, error: "timed out".to_owned() }]);
+    }
+
+    #[test]
+    fn binding_selects_its_source_by_index_in_the_zone() {
+        // The binding of source 1 sees 70, not source 0's 40
+        let zone = zone(&[], vec![plain(), plain()]);
+        let binding = binding(Selection::One(1), &HOLD_STEPS, 0);
+        let step = &contributions(&binding, &zone, &[temps(&[40, 70])])[0];
+
+        assert_eq!(step.curve_temp, Some(70));
+        assert_eq!(step.smoothed, [Some(70)]);
     }
 
     /// Push each reading into a smoother and collect the means
