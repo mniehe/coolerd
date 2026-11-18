@@ -457,24 +457,48 @@ mod tests {
     const QUERY_ACTION: &str = "get temperature sensor readings";
     const ADVANCE_ACTION: &str = "get next sensor reading";
 
-    /// A sensor iteration over fixed entries that counts its advances. Reading
-    /// past the last entry panics.
+    /// One call to a sensor iteration, with the position of the entry it was
+    /// made on
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Call {
+        Query,
+        Name(usize),
+        Reading(usize),
+        Advance(usize),
+    }
+
+    /// The calls of a query that reads every one of `entries` entries in order:
+    /// its name, then its reading, then the advance past it
+    fn full_trace(entries: usize) -> Vec<Call> {
+        let mut calls = vec![Call::Query];
+
+        for position in 0..entries {
+            calls.extend([Call::Name(position), Call::Reading(position), Call::Advance(position)]);
+        }
+
+        calls
+    }
+
+    /// A sensor iteration over fixed entries that records every call made on
+    /// it. Reading past the last entry panics.
     struct FakeSensors {
         entries: Vec<SensorEntry>,
         query_fails: bool,
         failing_advance: Option<usize>,
         position: usize,
-        advances: usize,
+        calls: Vec<Call>,
     }
 
     impl FakeSensors {
         fn new(entries: Vec<SensorEntry>) -> Self {
-            Self { entries, query_fails: false, failing_advance: None, position: 0, advances: 0 }
+            Self { entries, query_fails: false, failing_advance: None, position: 0, calls: Vec::new() }
         }
     }
 
     impl SensorIterator for FakeSensors {
         fn start_query(&mut self) -> Result<usize, freeipmi::Error> {
+            self.calls.push(Call::Query);
+
             if self.query_fails {
                 return Err(lim_error(QUERY_ACTION));
             }
@@ -483,19 +507,23 @@ mod tests {
         }
 
         fn current_name(&mut self) -> Result<String, freeipmi::Error> {
+            self.calls.push(Call::Name(self.position));
+
             self.entries[self.position].0.as_ref()
                 .cloned()
                 .map_err(|_| lim_error("read sensor name"))
         }
 
         fn current_reading(&mut self) -> Result<Option<SensorReading>, freeipmi::Error> {
+            self.calls.push(Call::Reading(self.position));
+
             self.entries[self.position].1.as_ref()
                 .copied()
                 .map_err(|_| lim_error("read sensor units"))
         }
 
         fn advance(&mut self) -> Result<(), freeipmi::Error> {
-            self.advances += 1;
+            self.calls.push(Call::Advance(self.position));
 
             if self.failing_advance == Some(self.position) {
                 return Err(lim_error(ADVANCE_ACTION));
@@ -529,11 +557,11 @@ mod tests {
             ("System Temp", Some(30)),
             ("Peripheral Temp", None),
         ]));
-        assert_eq!(sensors.advances, 3);
+        assert_eq!(sensors.calls, full_trace(3));
     }
 
     #[test]
-    fn traversal_advances_once_per_entry_past_bad_entries() {
+    fn traversal_reads_name_and_reading_of_every_entry_past_bad_entries() {
         let mut sensors = FakeSensors::new(vec![
             good("CPU Temp", celsius(45)),
             (Err(lim_error("read sensor name")), Ok(celsius(99))),
@@ -543,7 +571,13 @@ mod tests {
 
         let readings = read_all_sensors(&mut sensors).unwrap();
 
-        assert_eq!(sensors.advances, 4);
+        assert_eq!(sensors.calls, vec![
+            Call::Query,
+            Call::Name(0), Call::Reading(0), Call::Advance(0),
+            Call::Name(1), Call::Reading(1), Call::Advance(1),
+            Call::Name(2), Call::Reading(2), Call::Advance(2),
+            Call::Name(3), Call::Reading(3), Call::Advance(3),
+        ]);
         assert_eq!(temps(&readings), HashMap::from([
             ("CPU Temp", Some(45)),
             ("System Temp", Some(30)),
@@ -562,7 +596,7 @@ mod tests {
         let error = freeipmi_error(read_all_sensors(&mut sensors));
 
         assert_eq!(error, lim_error(ADVANCE_ACTION));
-        assert_eq!(sensors.advances, 2);
+        assert_eq!(sensors.calls, full_trace(2));
     }
 
     #[test]
@@ -573,6 +607,6 @@ mod tests {
         let error = freeipmi_error(read_all_sensors(&mut sensors));
 
         assert_eq!(error, lim_error(QUERY_ACTION));
-        assert_eq!(sensors.advances, 0);
+        assert_eq!(sensors.calls, vec![Call::Query]);
     }
 }
