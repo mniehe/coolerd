@@ -98,6 +98,11 @@ pub enum Error {
     },
     #[error("Zone monitor loop panicked: {0}")]
     LoopPanicked(#[source] JoinError),
+    #[error("{fan}: {source}")]
+    Fan {
+        fan: String,
+        source: Box<Self>,
+    },
 }
 
 pub type Result<T, E = Error> = result::Result<T, E>;

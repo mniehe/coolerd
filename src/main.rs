@@ -3,6 +3,7 @@ mod command;
 mod config;
 mod curve;
 mod error;
+mod fan;
 mod freeipmi;
 mod source;
 mod ipmi;
