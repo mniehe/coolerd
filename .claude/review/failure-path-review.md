@@ -21,14 +21,15 @@ termination owner.
   cause in a `source` field.
 - `src/source.rs`: each source returns `Result<u8>`. A spawned program's exit
   status and its output are both checked. `read_zone_sources` retries the
-  zone's sources and reports each one as a reading or a failure.
+  zone's sources. A source whose `on_failure` is `exit` returns its error at
+  once and ends the read; any other source is reported as a reading or a
+  failure.
 - `src/command.rs`: `CommandRunner` returns `CommandTimeout` when a program
   passes its limit and `CommandStillRunning` while a killed program has not
   exited.
-- `src/curve.rs`: a source's `on_failure` decides what its failure does:
-  `exit` ends the zone loop, `ignore` drops the source, `dcycle` sets a duty
-  floor. `ZoneState::next_duty` reports each change as a `Transition`, which
-  `zone_loop` logs.
+- `src/curve.rs`: a failed source that did not end the read is dropped from
+  the duty (`ignore`) or sets a duty floor (`dcycle`). `ZoneState::next_duty`
+  reports each change as a `Transition`, which the zone loop logs.
 - `src/main.rs`: `zone_loop` returns the first error that `on_failure` does
   not absorb, `run` aborts the other loops through a `JoinSet`, and
   `main` exits 1 after `MainApp` drops. `IpmiSession::drop` is the cleanup:

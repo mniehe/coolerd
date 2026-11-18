@@ -19,8 +19,8 @@ hunks alone.
   `aggregate` joins temperatures (rounding down) and duties (rounding up),
   and `ZoneState::next_duty` applies smoothing, hysteresis and the failure
   floor. Read a change there together with the config keys it serves.
-- `src/main.rs`: `zone_loop` reads the sources, calls `next_duty` and writes
-  the duty. Read a duty change together with `IpmiSession::drop`.
+- `src/main.rs`: `zone_loop` calls `update_duty_cycle`, which reads the
+  sources, calls `next_duty` and writes the duty. Read a duty change together with `IpmiSession::drop`.
 - `src/ipmi.rs`: the only caller of raw commands.
 
 ## Lenses, in priority order
