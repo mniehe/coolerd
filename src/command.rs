@@ -2,6 +2,7 @@ use {
     std::{
         ffi::OsStr,
         io,
+        iter,
         path::Path,
         process::{ExitStatus, Stdio},
         time::{Duration, Instant},
@@ -62,7 +63,7 @@ impl CommandRunner {
         -> Result<(ExitStatus, Vec<u8>)>
     {
         if !self.release_exited() {
-            return Err(Error::CommandStillRunning { command: program.display().to_string() });
+            return Err(Error::CommandStillRunning { command: command_text(program, args) });
         }
 
         let io_error = |e| Error::Io { path: program.to_owned(), source: e };
@@ -150,6 +151,16 @@ impl CommandRunner {
     pub fn keep(&mut self, child: Child, program: &Path) {
         self.after_kill(child, None, program);
     }
+}
+
+/// Name a run by its program and arguments, each quoted, so that the log
+/// says which disk or GPU it was for
+fn command_text(program: &Path, args: &[&OsStr]) -> String {
+    iter::once(program.as_os_str())
+        .chain(args.iter().copied())
+        .map(|part| format!("{:?}", part))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Read all of `pipe`, failing once it yields more than `cap` bytes. One byte
@@ -520,7 +531,7 @@ mod tests {
             let result = runner.run(&script, &[], limits(FINISH_LIMIT));
 
             assert!(matches!(&result,
-                Err(Error::CommandStillRunning { command }) if Path::new(command) == script),
+                Err(Error::CommandStillRunning { command }) if *command == format!("{:?}", script)),
                 "{:?}", result);
             assert!(!marker.exists(), "the program was started beside its kept child");
 
@@ -534,6 +545,22 @@ mod tests {
             assert!(status.success());
             assert!(marker.exists(), "the program did not run once its kept child exited");
         });
+    }
+
+    #[test]
+    fn still_running_error_names_the_program_and_its_arguments() {
+        let gpu = "00000000:81:00.0";
+        let mut runner = CommandRunner::default();
+
+        let result = blocking(move || {
+            runner.keep(spawn_sleeper(), Path::new("nvidia-smi"));
+            runner.run(Path::new("nvidia-smi"), &[OsStr::new("-i"), OsStr::new(gpu)], limits(FINISH_LIMIT))
+        });
+
+        let expected = r#""nvidia-smi" "-i" "00000000:81:00.0""#;
+        assert!(matches!(&result, Err(Error::CommandStillRunning { command }) if command == expected),
+            "{:?}", result);
+        assert!(result.unwrap_err().to_string().ends_with(expected));
     }
 
     #[test]
