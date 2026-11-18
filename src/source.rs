@@ -883,9 +883,13 @@ mod tests {
             |runner, script| read_hdparm_with_limit(runner, script, Path::new(BLOCK_DEV), limit))
     }
 
+    /// Assert that the run timed out. The error names the quoted script and
+    /// then its arguments.
     fn assert_timed_out(run: &ScriptRun) {
+        let program = format!("{:?} ", run.script);
+
         assert!(matches!(&run.result,
-            Err(Error::CommandTimeout { command, .. }) if Path::new(command) == run.script),
+            Err(Error::CommandTimeout { command, .. }) if command.starts_with(&program)),
             "{:?}", run.result);
     }
 

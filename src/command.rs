@@ -98,7 +98,7 @@ impl CommandRunner {
             Err(_) => {
                 self.stop(child, program).await;
                 Err(Error::CommandTimeout {
-                    command: program.display().to_string(),
+                    command: command_text(program, args),
                     seconds: limits.time.as_secs(),
                 })
             }
@@ -409,7 +409,7 @@ mod tests {
         let (status, stdout) = output.unwrap();
         assert!(status.success());
         assert_eq!(stdout, b"hi\n");
-        assert!(matches!(&timed_out, Err(Error::CommandTimeout { command, .. }) if command == "sleep"),
+        assert!(matches!(&timed_out, Err(Error::CommandTimeout { command, .. }) if command == r#""sleep" "30""#),
             "{:?}", timed_out);
     }
 
@@ -433,7 +433,7 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(matches!(&result,
-            Err(Error::CommandTimeout { command, seconds: 1 }) if Path::new(command) == script),
+            Err(Error::CommandTimeout { command, seconds: 1 }) if *command == format!("{:?}", script)),
             "{:?}", result);
         assert!(elapsed < TIMEOUT_LIMIT + KILL_GRACE + RETURN_SLACK, "returned after {:?}", elapsed);
         // The killed child exits and is reaped, so the runner keeps nothing
@@ -442,6 +442,18 @@ mod tests {
         if let Some(pid) = written_pid(&pid_file) {
             assert!(wait_until_gone(&pid), "pid {} still exists", pid);
         }
+    }
+
+    #[test]
+    fn timeout_error_names_the_program_and_its_arguments() {
+        let _guard = script_lock();
+        let result = blocking(|| CommandRunner::default()
+            .run(Path::new("sleep"), &[OsStr::new("30")], limits(TIMEOUT_LIMIT)));
+
+        let expected = r#""sleep" "30""#;
+        assert!(matches!(&result, Err(Error::CommandTimeout { command, seconds: 1 }) if command == expected),
+            "{:?}", result);
+        assert_eq!(result.unwrap_err().to_string(), format!("Timed out after 1 second(s): {}", expected));
     }
 
     fn run_script(body: &str) -> Result<(std::process::ExitStatus, Vec<u8>), Error> {

@@ -73,7 +73,7 @@ pub enum Error {
         command: PathBuf,
         status: ExitStatus,
     },
-    #[error("Timed out after {seconds} second(s): {command:?}")]
+    #[error("Timed out after {seconds} second(s): {command}")]
     CommandTimeout {
         command: String,
         seconds: u64,
