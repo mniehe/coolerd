@@ -1,6 +1,6 @@
 use {
     std::{
-        collections::HashMap,
+        collections::{HashMap, HashSet},
         env,
         result,
     },
@@ -208,10 +208,12 @@ type SensorEntry = (
 /// Build the map of sensor readings from the entries of one iteration. An entry
 /// whose name or reading failed is left out with a warning, so that one bad
 /// sensor does not discard the others. A source that needs a left-out sensor
-/// fails as if the sensor were missing.
+/// fails as if the sensor were missing. Of two good entries with one name, the
+/// last one wins.
 fn collect_sensor_readings(entries: impl IntoIterator<Item = SensorEntry>)
     -> HashMap<String, Option<SensorReading>> {
     let mut result = HashMap::new();
+    let mut failed_names = HashSet::new();
 
     for (name, reading) in entries {
         match (name, reading) {
@@ -220,11 +222,18 @@ fn collect_sensor_readings(entries: impl IntoIterator<Item = SensorEntry>)
             }
             (Ok(name), Err(e)) => {
                 warn!("Skipping IPMI sensor {:?}: failed to read its reading: {}", name, e);
+                failed_names.insert(name);
             }
             (Err(e), _) => {
                 warn!("Skipping an IPMI sensor: failed to read its name: {}", e);
             }
         }
+    }
+
+    // FreeIPMI does not deduplicate sensor names, so a good entry must not
+    // hide a failed one of the same name from the source's failure policy
+    for name in &failed_names {
+        result.remove(name);
     }
 
     result
@@ -302,5 +311,41 @@ mod tests {
         ]);
 
         assert_eq!(temps(&readings), HashMap::from([("CPU Temp", Some(45))]));
+    }
+
+    #[test]
+    fn name_that_failed_after_a_good_entry_is_absent() {
+        let readings = collect_sensor_readings(vec![
+            good("CPU Temp", celsius(28)),
+            good("System Temp", celsius(30)),
+            (Ok("CPU Temp".to_owned()), Err(lim_error("read sensor units"))),
+        ]);
+
+        assert_eq!(temps(&readings), HashMap::from([("System Temp", Some(30))]));
+    }
+
+    #[test]
+    fn name_that_failed_before_a_good_entry_is_absent() {
+        let readings = collect_sensor_readings(vec![
+            (Ok("CPU Temp".to_owned()), Err(lim_error("read sensor units"))),
+            good("System Temp", celsius(30)),
+            good("CPU Temp", celsius(28)),
+        ]);
+
+        assert_eq!(temps(&readings), HashMap::from([("System Temp", Some(30))]));
+    }
+
+    #[test]
+    fn last_of_two_good_entries_with_one_name_wins() {
+        let readings = collect_sensor_readings(vec![
+            good("CPU Temp", celsius(28)),
+            good("System Temp", celsius(30)),
+            good("CPU Temp", celsius(45)),
+        ]);
+
+        assert_eq!(temps(&readings), HashMap::from([
+            ("CPU Temp", Some(45)),
+            ("System Temp", Some(30)),
+        ]));
     }
 }
