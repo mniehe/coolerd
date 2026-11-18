@@ -2,7 +2,7 @@
 
 ipmi-fan-control is a Rust daemon that sets the case-fan duty cycle on
 Supermicro motherboards over IPMI. It reads temperatures from IPMI sensors,
-files, `smartctl` and `hdparm`, maps them through a per-zone curve, and writes
+files, `smartctl`, `hdparm` and `nvidia-smi`, maps them through a curve, and writes
 the duty with Supermicro OEM raw commands through libfreeipmi. This repository
 is a fork of the archived `chenxiaolong/ipmi-fan-control`, so nothing goes
 upstream. It runs on a real server through the NixOS module in `nix/`.
@@ -64,9 +64,11 @@ worktree other than `flake.lock` and the dependency tables of `Cargo.toml`.
 
 ```
 /src
-  main.rs       # CLI, zone loops, curve interpolation, aggregation, shutdown path
+  main.rs       # CLI, IPMI session, zone loops, shutdown path
+  curve.rs      # Pure duty logic: curve, aggregation, hysteresis, smoothing, failure floor
   config.rs     # TOML config types (serde) and validation in load_config
-  source.rs     # Temperature sources: ipmi, file, smartctl, hdparm
+  source.rs     # Temperature sources (ipmi, file, smartctl, hdparm, nvidia) and their retries
+  command.rs    # CommandRunner: runs an external program under a time and an output limit
   ipmi.rs       # Supermicro OEM commands: fan mode, duty cycle, sensor readings
   freeipmi.rs   # Safe wrappers over the libfreeipmi and libipmimonitoring FFI
   bindings.rs   # Includes the bindgen output; never edited by hand
@@ -122,13 +124,18 @@ here. Behaviour is proved by tests of pure functions.
   `zones[0].steps[1].dcycle: reason`.
 - A source that runs an external program keeps the spawn apart from the
   parsing of its output, as `parse_hdparm_output` does, so a test can cover
-  the parsing without the binary.
+  the parsing without the binary. It runs the program through `CommandRunner`
+  in `src/command.rs` with a named time limit and output limit, because a
+  program that hangs would otherwise hold the zone at its last duty.
 - A change to the config format updates `config.sample.toml` and `README.md`
   in the same change, because the sample is the only reference users have. It
   also updates the `settings` example in `nix/module.nix` when it alters a key
   or a value that the example shows.
 - A program the daemon spawns must be on the unit's PATH. Add it to
   `runtimeDeps` in `nix/module.nix` and to the dependency list in `README.md`.
+  A program that must match the host's driver, as `nvidia-smi` must, is not
+  taken from `pkgs`: the host passes its package through the `extraPackages`
+  option.
 - Raw IPMI bytes are named constants in `src/ipmi.rs`. A new one carries a
   comment that says where the value comes from, because no test can check it.
 - Each `unsafe` block carries a comment that says why it is sound, as the
@@ -183,6 +190,8 @@ the fans slow, or breaks the deployed unit:
 
 - `src/ipmi.rs` and `src/freeipmi.rs`
 - `build.rs` and `wrapper.h`
-- the duty calculation and the shutdown path in `src/main.rs`
+- `src/curve.rs`, which holds the duty calculation
+- `src/command.rs`
+- the zone loop and the shutdown path in `src/main.rs`
 - `nix/**`
 - `.claude/review/review.yaml`

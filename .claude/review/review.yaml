@@ -6,7 +6,7 @@ tools:
 tags:
   ipmi: [src/ipmi.rs, src/freeipmi.rs, src/bindings.rs, build.rs, wrapper.h]
   duty: [src/main.rs, src/curve.rs]
-  sources: [src/source.rs]
+  sources: [src/source.rs, src/command.rs]
   config: [src/config.rs, config.sample.toml]
   nix: [nix/**, flake.nix, flake.lock]
   build: [Cargo.toml, Cargo.lock, .github/**, .claude/review/review.yaml]

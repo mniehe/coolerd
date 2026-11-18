@@ -9,9 +9,10 @@ names the physical or privilege consequence.
 
 - The config file is written by the machine's administrator and is trusted
   for intent, not for correctness: every value is validated in `load_config`.
-- Output of spawned programs (`smartctl`, `hdparm` and later sources) and the
-  contents of sensor files are untrusted text. They are parsed in
-  `src/source.rs`.
+- Output of spawned programs (`smartctl`, `hdparm`, `nvidia-smi`) and the
+  contents of sensor files are untrusted bytes. They are parsed in
+  `src/source.rs`. `src/command.rs` bounds how long a program may run and how
+  much output is read.
 - `src/freeipmi.rs` is the FFI boundary. `src/ipmi.rs` builds the raw
   Supermicro OEM request bytes.
 - `nix/module.nix` sets the unit's user, groups, PATH, udev rule and ambient

@@ -10,10 +10,17 @@ hunks alone.
 - `src/config.rs`: serde types with `deny_unknown_fields` and all validation
   in `load_config`. Read a new key together with its validation, its default
   and `config.sample.toml`.
-- `src/source.rs`: one function per source type and the dispatch in
-  `get_source_readings`. Readings are `u8` degrees Celsius.
-- `src/main.rs`: `zone_loop`, the curve interpolation and the aggregation.
-  Read a duty change together with `IpmiSession::drop`.
+- `src/source.rs`: one reader per source type, the dispatch in
+  `ZoneReaders::read`, and the retries in `read_zone_sources`. Readings are
+  `u8` degrees Celsius.
+- `src/command.rs`: `CommandRunner` runs each external program under a time
+  limit and an output limit. Each source owns one runner.
+- `src/curve.rs`: the pure duty logic. `duty_for_temp` is the curve,
+  `aggregate` joins temperatures (rounding down) and duties (rounding up),
+  and `ZoneState::next_duty` applies smoothing, hysteresis and the failure
+  floor. Read a change there together with the config keys it serves.
+- `src/main.rs`: `zone_loop` reads the sources, calls `next_duty` and writes
+  the duty. Read a duty change together with `IpmiSession::drop`.
 - `src/ipmi.rs`: the only caller of raw commands.
 
 ## Lenses, in priority order
