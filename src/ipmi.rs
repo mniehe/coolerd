@@ -4,7 +4,7 @@ use {
         env,
         result,
     },
-    log::trace,
+    log::{trace, warn},
     crate::{
         bindings,
         config::SessionType,
@@ -177,25 +177,130 @@ impl Ipmi {
         Ok(())
     }
 
-    /// Get readings for all temperature sensors. If an error occurs, no partial
-    /// results will be returned. If a temperature sensor has no reading, then
-    /// the value in the result will be [`None`].
+    /// Get readings for all temperature sensors. If the query or the iteration
+    /// fails, no partial results will be returned. A sensor whose name or
+    /// reading cannot be read is left out, as [`collect_sensor_readings`]
+    /// describes. If a temperature sensor has no reading, then the value in the
+    /// result will be [`None`].
     pub fn get_temperature_readings(&mut self)
         -> Result<HashMap<String, Option<SensorReading>>> {
         let num_sensors = self.lim.temperature_sensor_readings()?;
         trace!("Number of sensors: {}", num_sensors);
 
-        let mut result = HashMap::new();
+        let mut entries = Vec::with_capacity(num_sensors);
 
         for _ in 0..num_sensors {
-            result.insert(
-                self.lim.read_sensor_name()?,
-                self.lim.read_sensor()?,
-            );
+            entries.push((self.lim.read_sensor_name(), self.lim.read_sensor()));
 
             self.lim.iterator_next()?;
         }
 
-        Ok(result)
+        Ok(collect_sensor_readings(entries))
+    }
+}
+
+/// The name and the reading of one sensor of a sensor reading iteration
+type SensorEntry = (
+    result::Result<String, freeipmi::Error>,
+    result::Result<Option<SensorReading>, freeipmi::Error>,
+);
+
+/// Build the map of sensor readings from the entries of one iteration. An entry
+/// whose name or reading failed is left out with a warning, so that one bad
+/// sensor does not discard the others. A source that needs a left-out sensor
+/// fails as if the sensor were missing.
+fn collect_sensor_readings(entries: impl IntoIterator<Item = SensorEntry>)
+    -> HashMap<String, Option<SensorReading>> {
+    let mut result = HashMap::new();
+
+    for (name, reading) in entries {
+        match (name, reading) {
+            (Ok(name), Ok(reading)) => {
+                result.insert(name, reading);
+            }
+            (Ok(name), Err(e)) => {
+                warn!("Skipping IPMI sensor {:?}: failed to read its reading: {}", name, e);
+            }
+            (Err(e), _) => {
+                warn!("Skipping an IPMI sensor: failed to read its name: {}", e);
+            }
+        }
+    }
+
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        std::collections::HashMap,
+        super::{collect_sensor_readings, SensorEntry},
+        crate::freeipmi::{self, SensorReading, SensorUnits, SensorValue},
+    };
+
+    fn celsius(temp: u32) -> Option<SensorReading> {
+        Some(SensorReading { value: SensorValue::Uint32(temp), units: SensorUnits::Celsius })
+    }
+
+    fn lim_error(action: &'static str) -> freeipmi::Error {
+        freeipmi::Error::Lim { action, message: "sensor reading failed" }
+    }
+
+    fn good(name: &str, reading: Option<SensorReading>) -> SensorEntry {
+        (Ok(name.to_owned()), Ok(reading))
+    }
+
+    /// The temperature of each sensor in `readings`, or `None` for a sensor
+    /// without a reading
+    fn temps(readings: &HashMap<String, Option<SensorReading>>) -> HashMap<&str, Option<u32>> {
+        readings.iter()
+            .map(|(name, reading)| {
+                let temp = reading.map(|r| match r.value {
+                    SensorValue::Uint32(t) => t,
+                    other => panic!("unexpected value {:?}", other),
+                });
+                (name.as_str(), temp)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn all_good_entries_are_kept() {
+        let readings = collect_sensor_readings(vec![
+            good("CPU Temp", celsius(45)),
+            good("System Temp", celsius(30)),
+            good("Peripheral Temp", None),
+        ]);
+
+        assert_eq!(temps(&readings), HashMap::from([
+            ("CPU Temp", Some(45)),
+            ("System Temp", Some(30)),
+            ("Peripheral Temp", None),
+        ]));
+    }
+
+    #[test]
+    fn entry_with_bad_reading_is_skipped_and_good_ones_are_kept() {
+        let readings = collect_sensor_readings(vec![
+            good("CPU Temp", celsius(45)),
+            (Ok("VRM Temp".to_owned()), Err(lim_error("read sensor units"))),
+            good("System Temp", celsius(30)),
+        ]);
+
+        assert_eq!(temps(&readings), HashMap::from([
+            ("CPU Temp", Some(45)),
+            ("System Temp", Some(30)),
+        ]));
+    }
+
+    #[test]
+    fn entry_with_bad_name_is_skipped() {
+        let readings = collect_sensor_readings(vec![
+            (Err(lim_error("read sensor name")), Ok(celsius(99))),
+            good("CPU Temp", celsius(45)),
+            (Err(lim_error("read sensor name")), Err(lim_error("read sensor value type"))),
+        ]);
+
+        assert_eq!(temps(&readings), HashMap::from([("CPU Temp", Some(45))]));
     }
 }
