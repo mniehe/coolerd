@@ -1,0 +1,40 @@
+tools:
+  build: nix develop -c cargo build
+  lint: nix develop -c cargo clippy -- -D warnings
+  test: nix develop -c cargo test
+
+tags:
+  ipmi: [src/ipmi.rs, src/freeipmi.rs, src/bindings.rs, build.rs, wrapper.h]
+  duty: [src/main.rs, src/curve.rs]
+  sources: [src/source.rs, src/command.rs]
+  config: [src/config.rs, config.sample.toml]
+  nix: [nix/**, flake.nix, flake.lock]
+  build: [Cargo.toml, Cargo.lock, .github/**, .claude/review/review.yaml]
+  llm: [AGENTS.md, CLAUDE.md, .claude/review/*.md, .claude/review/review.yaml]
+
+dimensions:
+  - name: correctness
+    criteria: correctness.md
+    always: true
+  - name: safety
+    criteria: safety.md
+    tags: [ipmi, duty, sources, nix, build]
+  - name: failure-paths
+    criteria: failure-path-review.md
+    signals: [packages_touched>0]
+  - name: qa
+    criteria: qa.md
+    signals: [code_without_tests, tests_changed]
+  - name: prompt
+    criteria: prompt.md
+    tags: [llm]
+
+max_dimensions: 5
+
+verify_notes: |
+  Run every cargo command through `nix develop -c`; a bare cargo cannot build
+  here. Never run the built binary, ipmitool, or anything that can reach a
+  BMC: the daemon takes over fan control on start. Never run `cargo fmt`; the
+  tree is not rustfmt output. Do not change flake.lock or Cargo.lock. Tests
+  of external commands use fake scripts, never the real smartctl, hdparm or
+  nvidia-smi.

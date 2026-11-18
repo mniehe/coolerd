@@ -43,6 +43,11 @@ pub enum Error {
         sensor: String,
         value: SensorValue,
     },
+    #[error("Sensor value is not a temperature from 0 to 255: {sensor}: {value:?}")]
+    SensorValueOutOfRange {
+        sensor: String,
+        value: SensorValue,
+    },
     #[error("Sensor reading not available: {0}")]
     SensorNoReading(String),
     #[error("Temperature reading out of bounds")]
@@ -58,10 +63,24 @@ pub enum Error {
     HdparmNoData(PathBuf),
     #[error("hdparm reported bad data: {0:?}")]
     HdparmBadData(PathBuf),
+    #[error("nvidia-smi reported bad data for GPU: {gpu}: {:?}", .output.trim())]
+    NvidiaBadData {
+        gpu: String,
+        output: String,
+    },
     #[error("Failed to run: {command:?}: {status}")]
     Command {
         command: PathBuf,
         status: ExitStatus,
+    },
+    #[error("Timed out after {seconds} second(s): {command}")]
+    CommandTimeout {
+        command: String,
+        seconds: u64,
+    },
+    #[error("Not started, because its last run has not exited since it was killed: {command}")]
+    CommandStillRunning {
+        command: String,
     },
     #[error("Failed all {attempts} attempt(s); last attempt error: {source}")]
     RetriesFailed {
@@ -70,6 +89,8 @@ pub enum Error {
     },
     #[error("IPMI error: {0}")]
     Ipmi(#[from] ipmi::Error),
+    #[error("Not a regular file: {0:?}")]
+    NotRegularFile(PathBuf),
     #[error("{path:?}: {source}")]
     Io {
         path: PathBuf,
@@ -77,15 +98,6 @@ pub enum Error {
     },
     #[error("Zone monitor loop panicked: {0}")]
     LoopPanicked(#[source] JoinError),
-}
-
-impl From<retry::Error<Self>> for Error {
-    fn from(value: retry::Error<Self>) -> Self {
-        Self::RetriesFailed {
-            attempts: value.tries,
-            source: Box::new(value.error),
-        }
-    }
 }
 
 pub type Result<T, E = Error> = result::Result<T, E>;

@@ -25,9 +25,21 @@ ipmi_zones = [0, 1]
 # default interval is 1 second.
 interval = 1
 
-# Number of retries to query temperature source. If temperature readings are
-# still not successfully queried after all attempts, then the program will fail
-# and exit. The default is 2 retries (3 attempts in total).
+# Number of retries to query temperature sources in each update. The sources
+# that are not `ipmi` are read first, in the order below, and the ipmi sources
+# last, in one IPMI query. Only a source that fails is read again; earlier
+# versions read every source again. All sources of the zone share these
+# retries, so a source that uses them up leaves none for the sources read after
+# it. A source that failed in the previous update gets one attempt and no
+# retries until it reads again. A source that still fails after the last retry
+# is handled by its `on_failure` (see the sources below); by default, the
+# program exits. The default is 2 retries (3 attempts in total).
+#
+# This bounds the number of waits in an update, not its duration. smartctl and
+# hdparm are stopped after 30 seconds and nvidia-smi after 5 seconds. If a
+# stopped program does not exit, its source does not start it again until the
+# old process is gone; until then that source fails at once. Other sources
+# still run, including sources that run the same program.
 #retries = 2
 
 # Number of milliseconds to wait before retrying when querying a temperature
@@ -45,6 +57,9 @@ sources = [
   # * Units must be milli-degrees Celsius (1/1000 °C)
   # * No characters other than numbers and whitespace are permitted
   #
+  # The path must be a regular file after symlinks are followed; a FIFO,
+  # directory or device fails the source without being read.
+  #
   # The thermal_zone sysfs paths on Linux satisfy these conditions.
   # { type = "file", path = "/sys/class/thermal/thermal_zone1/temp" },
 
@@ -53,7 +68,8 @@ sources = [
   #
   #   smartctl -j -A -n standby <block_dev>
   #
-  # and requires smartmontools >= 7.0 to be installed.
+  # and requires smartmontools >= 7.0 to be installed. If smartctl does not
+  # exit within 30 seconds, it is killed and the reading fails.
   # { type = "smart", block_dev = "/dev/disk/by-id/ata-ST6000VN001-2BB186_ZR12WE0S" },
   # { type = "smart", block_dev = "/dev/disk/by-id/ata-ST6000VN0033-2EE110_ZAD8N3FM" },
   # { type = "smart", block_dev = "/dev/disk/by-id/ata-ST6000VN0033-2EE110_ZAD8R2G3" },
@@ -61,15 +77,76 @@ sources = [
 
   # "hdparm -H" source. This is specific to some Hitachi/HGST/WD drives and
   # allows the HDD temperature to be queried even when the drive is spun down.
-  # This requires hdparm to be installed.
+  # This requires hdparm to be installed. If hdparm does not exit within 30
+  # seconds, it is killed and the reading fails.
   # { type = "hdparm", block_dev = "/dev/disk/by-id/..." },
+
+  # NVIDIA GPU source. This internally runs:
+  #
+  #   nvidia-smi -i <gpu> --query-gpu=temperature.gpu --format=csv,noheader,nounits
+  #
+  # and requires nvidia-smi from the installed NVIDIA driver. If nvidia-smi
+  # does not exit within 5 seconds, it is killed and the reading fails.
+  #
+  # Select the card by its PCI bus id or its UUID. A GPU index such as `0` is
+  # rejected, because the index order can change between boots. To list the
+  # bus ids and UUIDs, run:
+  #
+  #   nvidia-smi --query-gpu=pci.bus_id,uuid --format=csv
+  # { type = "nvidia", gpu = "00000000:81:00.0" },
+  # { type = "nvidia", gpu = "GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" },
+
+  # Any source can carry its own `steps`, with the same rules as the zone's
+  # `steps` below, except that the list must be non-empty. Such a source maps
+  # its temperature through its own curve and does not feed the zone
+  # temperature. This suits a GPU, which runs hotter than a CPU and needs a
+  # curve of its own.
+  #
+  # Any source can also carry `on_failure`, which decides what the zone does
+  # when the source still fails after its retries:
+  #
+  # * { type = "exit" }: The program exits, which sets the fans to 100% and
+  #   restores the original fan mode. This is the default.
+  # * { type = "ignore" }: The source is left out until it reads again, and
+  #   the other sources drive the fans. A hot device that cannot be read then
+  #   no longer raises the fans, so use this only for a source that another
+  #   source covers.
+  # * { type = "dcycle", dcycle = 80 }: The source is left out, and the zone
+  #   runs at 80% or more until the source reads again. Use this for a device
+  #   that produces much heat, such as a GPU.
+  #
+  # A zone in which no source has a reading runs at 100%. A failing source is
+  # still tried once in every update.
+  # { type = "nvidia", gpu = "00000000:81:00.0", steps = [{ temp = 60, dcycle = 40 }, { temp = 90, dcycle = 100 }], on_failure = { type = "dcycle", dcycle = 80 } },
+
+  # Any source can also carry `smoothing_samples`, a number from 1 to 255. The
+  # source then feeds the mean of its last `smoothing_samples` readings,
+  # rounded down, in place of each reading, so a short spike moves the fans
+  # less. The mean comes before `aggregation`, the source's own `steps` and
+  # `hysteresis`. The default is 1, which uses each reading as it is. A failed
+  # read drops the stored readings, so the source starts again from fresh
+  # readings.
+  #
+  # The count is in updates, so the mean covers about `smoothing_samples`
+  # times `interval` seconds: 3 with an interval of 1 is about 3 seconds. This
+  # also delays the response to real heat. The mean holds only the readings
+  # since the start or since the source last failed, so the first reading
+  # after either acts at once. After a sustained rise, the
+  # `smoothing_samples`-th hot reading pushes out the last cooler one, and the
+  # duty cycle can reach its target sooner if the mean crosses the top step
+  # first. Use it for a sensor whose readings jump, not for a device that
+  # heats quickly.
+  # { type = "ipmi", sensor = "System Temp", smoothing_samples = 3 },
 ]
 
-# Method of aggregating the temperatures from all of the sources. By default,
-# the maximum temperature is used. It is also possible to use the average
-# temperature. In case there are lower-bound outliers in the temperature
-# readings, the `top` parameter can be set to only consider the `n` highest
-# temperatures.
+# Method of aggregating the temperatures of the sources without their own
+# `steps` into the zone temperature. By default, the maximum temperature is
+# used. It is also possible to use the average temperature, which divides by
+# the number of temperatures used and rounds down. In case there are
+# lower-bound outliers in the temperature readings, the `top` parameter can be
+# set to only consider the `n` highest temperatures. When every source has its
+# own `steps`, this is not used to compute the duty cycle, but it is still
+# validated.
 #aggregation = { type = "maximum" }
 #aggregation = { type = "average" }
 #aggregation = { type = "average", top = 3 }
@@ -93,10 +170,32 @@ sources = [
 # Note that these rules mean that having a single step will result in a fixed
 # fan speed. Also, the list must be sorted, `temp` must be strictly increasing,
 # and `dcycle` must be increasing.
+#
+# These steps map the zone temperature. When every source has its own `steps`,
+# the zone has no temperature, so this list and `aggregation` are not used to
+# compute the duty cycle, and this list may be omitted. They are still
+# validated when given. Otherwise this list is required, and when some sources
+# have `steps` and others do not, it must be non-empty.
 steps = [
   { temp = 40, dcycle = 40 },
   { temp = 70, dcycle = 70 }
 ]
+
+# Method of combining the duty cycles of the zone's curves: the zone curve and
+# the curve of each source with `steps`. The default, maximum, uses the highest
+# duty cycle of any curve. Average takes the mean, rounded up, and `top` limits
+# it to the `n` highest duty cycles. Each curve counts once, however many
+# sources feed it. Average can give a duty cycle below the highest one a curve
+# asks for, so the source behind that curve may run hotter than its curve
+# intends.
+#duty_aggregation = { type = "maximum" }
+#duty_aggregation = { type = "average" }
+
+# Degrees Celsius a curve's temperature must fall before its duty cycle follows.
+# A rise is always followed at once, so the fans speed up without delay but do
+# not slow down for a fall of less than this. Each curve holds its own
+# temperature. The default is 0, which follows every reading.
+#hysteresis = 3
 
 # More fan zones can be added
 #[[zones]]

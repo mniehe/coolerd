@@ -39,6 +39,9 @@ jobs:
         run: |
           cargo clippy -- -D warnings
 
+      - name: Run tests
+        run: cargo test
+
       - name: Build in debug mode
         run: cargo build --verbose
 

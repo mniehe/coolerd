@@ -1,5 +1,7 @@
 mod bindings;
+mod command;
 mod config;
+mod curve;
 mod error;
 mod freeipmi;
 mod source;
@@ -7,7 +9,6 @@ mod ipmi;
 
 use {
     std::{
-        cmp::Reverse,
         collections::HashMap,
         env,
         io,
@@ -17,21 +18,22 @@ use {
             Arc,
             atomic::{AtomicBool, Ordering},
             Mutex,
+            MutexGuard,
+            PoisonError,
         },
-        u8,
     },
     clap::Parser,
     log::{debug, error, info, trace},
-    retry::retry_with_index,
     tokio::{
         task::{self, JoinSet},
         time::sleep,
     },
 
-    config::{Aggregation, Config, load_config, SessionType, Step, Zone},
+    config::{Config, load_config, SessionType, Zone},
+    curve::{Transition, ZoneState},
     error::{Error, Result},
     ipmi::{FanMode, Ipmi},
-    source::get_source_readings,
+    source::{read_zone_sources, ZoneReaders},
 };
 
 static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -61,6 +63,12 @@ async fn interrupted() -> io::Result<()> {
     }
 
     Ok(())
+}
+
+/// Lock `mutex`, also when a thread panicked while holding it. A panic in one
+/// zone task must not stop the shutdown path from setting the fans to 100%.
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 struct IpmiSession {
@@ -101,7 +109,7 @@ impl IpmiSession {
 
 impl Drop for IpmiSession {
     fn drop(&mut self) {
-        let mut ipmi_lock = self.ipmi.lock().unwrap();
+        let mut ipmi_lock = lock_or_recover(&self.ipmi);
 
         for z in &self.restore_zones {
             info!("[{}] Setting zone {} duty cycle to 100%", self.name, z);
@@ -185,7 +193,7 @@ impl MainApp {
                             if e.is_cancelled() {
                                 Ok(())
                             } else {
-                                Err(e).map_err(Error::LoopPanicked)
+                                Err(Error::LoopPanicked(e))
                             }
                         },
                         // zone_loop's actual error return value
@@ -223,71 +231,48 @@ impl MainApp {
         info!("[{}] Starting loop for IPMI zones {:?}",
               session.name, zone_config.ipmi_zones);
 
+        let mut state = ZoneState::new(&zone_config);
+        let mut readers = ZoneReaders::default();
+
         loop {
             let s = session.clone();
             let z = zone_config.clone();
+            let st = &mut state;
+            let r = &mut readers;
 
             task::block_in_place(move || {
-                Self::update_duty_cycle(s, z.as_ref())
+                Self::update_duty_cycle(s, z.as_ref(), st, r)
             })?;
 
             sleep(zone_config.interval.to_duration()).await;
         }
     }
 
-    /// Update fan PWM duty cycle based on the CPU temperature
-    fn update_duty_cycle(session: Arc<IpmiSession>, zone_config: &Zone) -> Result<()> {
-        let temp = Self::get_temp(session.ipmi.clone(), zone_config)?;
+    /// Update fan PWM duty cycle from the zone's source readings and curves
+    fn update_duty_cycle(
+        session: Arc<IpmiSession>,
+        zone_config: &Zone,
+        state: &mut ZoneState,
+        readers: &mut ZoneReaders,
+    ) -> Result<()> {
+        trace!("Querying sources for zones {:?}", zone_config.ipmi_zones);
 
-        let result = zone_config.steps.binary_search_by(|s| s.temp.cmp(&temp));
-        // Index of first step >= the current temperature (if exists)
-        let above_index = match result {
-            Ok(i) => Some(i),
-            Err(i) if i == zone_config.steps.len() => None,
-            Err(i) => Some(i),
-        };
-        // Index of first step < the current temperature (if exists)
-        let below_index = match above_index {
-            Some(0) => None,
-            Some(i) => Some(i - 1),
-            None => None,
-        };
-        // If step above doesn't exist, use last step's dcycle or 100%
-        let above_step = match above_index {
-            Some(i) => zone_config.steps[i],
-            None => {
-                let dcycle = zone_config.steps.last()
-                    .map_or(100, |s| s.dcycle);
+        let mut query_ipmi = || Ok(lock_or_recover(&session.ipmi).get_temperature_readings()?);
+        let failed_last = state.failed_sources();
+        let readings = read_zone_sources(zone_config, &failed_last, &mut query_ipmi,
+            &mut |index, source| readers.read(index, source))?;
+        let update = state.next_duty(zone_config, &readings);
+        let dcycle_new = update.duty;
 
-                Step {
-                    temp,
-                    dcycle,
-                }
-            }
-        };
-        // If step below doesn't exist, use same step as step above
-        let below_step = match below_index {
-            Some(i) => zone_config.steps[i],
-            None => above_step,
-        };
+        Self::log_transitions(&session.name, zone_config, &update.transitions);
 
-        let dcycle_new = if below_step.temp == above_step.temp {
-            below_step.dcycle
-        } else {
-            // Linearly scale the dcycle
-            (u32::from(temp - below_step.temp)
-                * u32::from(above_step.dcycle - below_step.dcycle)
-                / u32::from(above_step.temp - below_step.temp)
-                + u32::from(below_step.dcycle)) as u8
-        };
-
-        let mut ipmi_lock = session.ipmi.lock().unwrap();
+        let mut ipmi_lock = lock_or_recover(&session.ipmi);
 
         for z in &zone_config.ipmi_zones {
             let dcycle_cur = ipmi_lock.get_duty_cycle(*z)?;
 
-            debug!("[{}] Zone {}: zone_temp={}C, dcycle_cur={}%, dcycle_new={}%",
-                   session.name, z, temp, dcycle_cur, dcycle_new);
+            debug!("[{}] Zone {}: smoothed_temps={:?}C, curve_temps={:?}C, dcycle_cur={}%, dcycle_new={}%",
+                   session.name, z, update.smoothed_temps, update.curve_temps, dcycle_cur, dcycle_new);
 
             if dcycle_new != dcycle_cur {
                 ipmi_lock.set_duty_cycle(*z, dcycle_new)?;
@@ -297,32 +282,25 @@ impl MainApp {
         Ok(())
     }
 
-    /// Get temperature sensor value in degrees Celsius using the zone's
-    /// data aggregation method.
-    fn get_temp(ipmi: Arc<Mutex<Ipmi>>, zone_config: &Zone) -> Result<u8> {
-        let mut readings = retry_with_index(zone_config.retry_iter(), move |i| {
-            trace!("Querying sources for zones {:?} (attempt {}/{})",
-                   zone_config.ipmi_zones, i, zone_config.retries.0 + 1);
-            get_source_readings(ipmi.clone(), &zone_config.sources)
-        })?;
-        readings.sort_by_key(|r| Reverse(*r));
+    /// Log a source that starts failing as an error and one that reads again
+    /// as information, once per change
+    fn log_transitions(session_name: &str, zone_config: &Zone, transitions: &[Transition]) {
+        let describe = |index: usize| {
+            zone_config.sources.get(index).map_or_else(
+                || format!("#{}", index),
+                |s| format!("{:?} (on_failure {:?})", s.kind, s.on_failure))
+        };
 
-        // The source list is guaranteed to never be empty so if no error
-        // occurs, there will always be an equal number of readings
-        match zone_config.aggregation {
-            Aggregation::Maximum => {
-                Ok(readings.first().copied().unwrap())
-            }
-            Aggregation::Average { top } => {
-                let n = top.unwrap_or(readings.len());
-
-                let sum = readings
-                    .into_iter()
-                    .take(n)
-                    .map(u32::from)
-                    .sum::<u32>();
-
-                Ok((sum as f32 / n as f32) as u8)
+        for transition in transitions {
+            match transition {
+                Transition::Failed { source, error } => {
+                    error!("[{}] Zones {:?}: source {} failed: {}",
+                           session_name, zone_config.ipmi_zones, describe(*source), error);
+                }
+                Transition::Recovered { source } => {
+                    info!("[{}] Zones {:?}: source {} reads again",
+                          session_name, zone_config.ipmi_zones, describe(*source));
+                }
             }
         }
     }
@@ -384,5 +362,34 @@ async fn main() {
             }
             process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        std::{
+            sync::{Arc, Mutex},
+            thread,
+        },
+        super::lock_or_recover,
+    };
+
+    #[test]
+    fn lock_recovers_a_poisoned_mutex() {
+        let mutex = Arc::new(Mutex::new(1u8));
+        let holder = mutex.clone();
+
+        let panicked = thread::spawn(move || {
+            let _guard = holder.lock().unwrap();
+            panic!("panic while holding the lock");
+        }).join();
+
+        assert!(panicked.is_err());
+        assert!(mutex.is_poisoned());
+
+        let mut guard = lock_or_recover(&mutex);
+        *guard += 1;
+        assert_eq!(*guard, 2);
     }
 }
