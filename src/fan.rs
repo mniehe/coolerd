@@ -5,6 +5,7 @@ use {
     },
     log::{error, info},
     crate::{
+        config::FanConfig,
         error::{Error, Result},
         session::IpmiSession,
     },
@@ -132,6 +133,19 @@ impl Fan for SupermicroZone {
     }
 }
 
+/// Build the fan that `config` names. This is the only place that turns a
+/// fan config into a fan. A Supermicro fan needs the zone's IPMI session.
+pub fn build_fan(config: &FanConfig, session: Option<&Arc<IpmiSession>>) -> Result<Box<dyn Fan>> {
+    match config {
+        FanConfig::Supermicro { zone } => {
+            let session = session
+                .ok_or_else(|| Error::FanWithoutSession(format!("supermicro zone {}", zone)))?;
+
+            Ok(Box::new(SupermicroZone::new(session.clone(), *zone)))
+        }
+    }
+}
+
 #[cfg(test)]
 pub mod fake {
     use {
@@ -208,6 +222,7 @@ mod tests {
     use {
         std::sync::Arc,
         super::{
+            build_fan,
             fake::{CallLog, FakeFan, Op},
             Applied,
             Fan,
@@ -215,6 +230,7 @@ mod tests {
             SupermicroZone,
         },
         crate::{
+            config::FanConfig,
             error::{Error, Result},
             ipmi::FanMode,
             session::{
@@ -336,6 +352,25 @@ mod tests {
             PortCall::SetDutyCycle(0, 60),
             PortCall::GetDutyCycle(0),
         ]);
+    }
+
+    #[test]
+    fn supermicro_fan_needs_a_session() {
+        let config = FanConfig::Supermicro { zone: 1 };
+
+        let error = build_fan(&config, None).err().expect("a supermicro fan without a session fails");
+
+        assert!(matches!(&error, Error::FanWithoutSession(fan) if fan == "supermicro zone 1"), "{:?}", error);
+    }
+
+    #[test]
+    fn supermicro_fan_is_built_on_its_session() {
+        let calls = BoardLog::default();
+        let session = session_on(FakeBoard::new(FanMode::Standard, &calls));
+
+        let fan = build_fan(&FanConfig::Supermicro { zone: 1 }, Some(&session)).unwrap();
+
+        assert_eq!(fan.describe(), "supermicro zone 1 on session test");
     }
 
     #[test]

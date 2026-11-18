@@ -103,6 +103,8 @@ pub enum Error {
         fan: String,
         source: Box<Self>,
     },
+    #[error("{0}: needs an IPMI session")]
+    FanWithoutSession(String),
 }
 
 pub type Result<T, E = Error> = result::Result<T, E>;

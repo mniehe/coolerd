@@ -31,6 +31,7 @@ use {
     config::{Config, FanConfig, load_config, Zone},
     curve::{Transition, ZoneState},
     error::{Error, Result},
+    fan::{build_fan, FanGuard},
     session::IpmiSession,
     source::{read_zone_sources, ZoneReaders},
 };
@@ -160,27 +161,33 @@ impl MainApp {
 
     /// Main loop for a zone. The loop runs forever while the future is being
     /// polled.
-    ///
-    /// All communication with the IPMI is behind a mutex to avoid needing
-    /// multiple IPMI sessions.
     async fn zone_loop(
         session: Arc<IpmiSession>,
         zone_config: Arc<Zone>,
     ) -> Result<()> {
-        info!("[{}] Starting loop for IPMI zones {:?}",
-              session.name(), zone_config.fan_list);
+        // Each Supermicro fan holds an Arc of the session, so this guard
+        // releases the zone's fans before the session's own drop restores the
+        // fan mode. A returned error, a panic and an abort of this task all
+        // drop the guard; an abort takes effect once the poll in progress
+        // returns.
+        let mut fans = FanGuard::new();
+
+        for fan_config in &zone_config.fan_list {
+            fans.add(build_fan(fan_config, Some(&session))?)?;
+        }
+
+        info!("[{}] Starting loop for fans {:?}", session.name(), fans.descriptions());
 
         let mut state = ZoneState::new(&zone_config);
         let mut readers = ZoneReaders::default();
 
         loop {
-            let s = session.clone();
-            let z = zone_config.clone();
             let st = &mut state;
             let r = &mut readers;
+            let f = &mut fans;
 
-            task::block_in_place(move || {
-                Self::update_duty_cycle(s, z.as_ref(), st, r)
+            task::block_in_place(|| {
+                Self::update_duty_cycle(&session, &zone_config, st, r, f)
             })?;
 
             sleep(zone_config.interval.to_duration()).await;
@@ -189,33 +196,28 @@ impl MainApp {
 
     /// Update fan PWM duty cycle from the zone's source readings and curves
     fn update_duty_cycle(
-        session: Arc<IpmiSession>,
+        session: &IpmiSession,
         zone_config: &Zone,
         state: &mut ZoneState,
         readers: &mut ZoneReaders,
+        fans: &mut FanGuard,
     ) -> Result<()> {
-        trace!("Querying sources for zones {:?}", zone_config.fan_list);
+        trace!("Querying sources for fans {:?}", fans.descriptions());
 
         let mut query_ipmi = || session.lock().get_temperature_readings();
         let failed_last = state.failed_sources();
         let readings = read_zone_sources(zone_config, &failed_last, &mut query_ipmi,
             &mut |index, source| readers.read(index, source))?;
         let update = state.next_duty(zone_config, &readings);
-        let dcycle_new = update.duty;
 
-        Self::log_transitions(session.name(), zone_config, &update.transitions);
+        Self::log_transitions(session.name(), &fans.descriptions(), zone_config, &update.transitions);
 
-        let mut ipmi_lock = session.lock();
+        let applied = fans.set_duty(update.duty)?;
 
-        for FanConfig::Supermicro { zone: z } in &zone_config.fan_list {
-            let dcycle_cur = ipmi_lock.get_duty_cycle(*z)?;
-
-            debug!("[{}] Zone {}: smoothed_temps={:?}C, curve_temps={:?}C, dcycle_cur={}%, dcycle_new={}%",
-                   session.name(), z, update.smoothed_temps, update.curve_temps, dcycle_cur, dcycle_new);
-
-            if dcycle_new != dcycle_cur {
-                ipmi_lock.set_duty_cycle(*z, dcycle_new)?;
-            }
+        for (fan, applied) in fans.descriptions().iter().zip(&applied) {
+            debug!("[{}] {}: smoothed_temps={:?}C, curve_temps={:?}C, dcycle_cur={}, dcycle_new={}%, dcycle_sent={}",
+                   session.name(), fan, update.smoothed_temps, update.curve_temps,
+                   percent(applied.before), update.duty, percent(applied.sent));
         }
 
         Ok(())
@@ -223,7 +225,7 @@ impl MainApp {
 
     /// Log a source that starts failing as an error and one that reads again
     /// as information, once per change
-    fn log_transitions(session_name: &str, zone_config: &Zone, transitions: &[Transition]) {
+    fn log_transitions(session_name: &str, fans: &[&str], zone_config: &Zone, transitions: &[Transition]) {
         let describe = |index: usize| {
             zone_config.sources.get(index).map_or_else(
                 || format!("#{}", index),
@@ -233,16 +235,21 @@ impl MainApp {
         for transition in transitions {
             match transition {
                 Transition::Failed { source, error } => {
-                    error!("[{}] Zones {:?}: source {} failed: {}",
-                           session_name, zone_config.fan_list, describe(*source), error);
+                    error!("[{}] Fans {:?}: source {} failed: {}",
+                           session_name, fans, describe(*source), error);
                 }
                 Transition::Recovered { source } => {
-                    info!("[{}] Zones {:?}: source {} reads again",
-                          session_name, zone_config.fan_list, describe(*source));
+                    info!("[{}] Fans {:?}: source {} reads again",
+                          session_name, fans, describe(*source));
                 }
             }
         }
     }
+}
+
+/// A duty cycle for the debug log, or `-` when there is none
+fn percent(duty: Option<u8>) -> String {
+    duty.map_or_else(|| "-".to_owned(), |d| format!("{}%", d))
 }
 
 fn bool_env(name: &str, default: bool) -> bool {
