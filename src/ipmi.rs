@@ -179,9 +179,9 @@ impl Ipmi {
 
     /// Get readings for all temperature sensors. If the query or the iteration
     /// fails, no partial results will be returned. A sensor whose name or
-    /// reading cannot be read is left out, as [`collect_sensor_readings`]
-    /// describes. If a temperature sensor has no reading, then the value in the
-    /// result will be [`None`].
+    /// reading cannot be read is left out, and a sensor with no reading maps to
+    /// [`None`], as [`collect_sensor_readings`] describes for sensors that
+    /// share a name.
     pub fn get_temperature_readings(&mut self)
         -> Result<HashMap<String, Option<SensorReading>>> {
         read_all_sensors(&mut self.lim)
@@ -244,18 +244,29 @@ type SensorEntry = (
     result::Result<Option<SensorReading>, freeipmi::Error>,
 );
 
-/// Build the map of sensor readings from the entries of one iteration. An entry
-/// whose name or reading failed is left out with a warning, so that one bad
-/// sensor does not discard the others. A source that needs a left-out sensor
-/// fails as if the sensor were missing. Of two good entries with one name, the
-/// last one wins.
+/// Build the map of sensor readings from the entries of one iteration, so that
+/// one bad sensor does not discard the others. FreeIPMI does not deduplicate
+/// sensor names, so the outcome for a name depends on every entry with that
+/// name, whatever their order:
+///
+/// - If any entry failed to read its reading, the name is left out with a
+///   warning, and a source that needs it fails as if the sensor were missing.
+/// - Otherwise, if any entry has no reading, the name maps to [`None`].
+/// - Otherwise, of two real readings, the last one wins.
+///
+/// An entry whose name failed to read is left out with a warning. It cannot be
+/// matched to a name, so it does not affect any entry that has one.
 fn collect_sensor_readings(entries: impl IntoIterator<Item = SensorEntry>)
     -> HashMap<String, Option<SensorReading>> {
     let mut result = HashMap::new();
+    let mut no_reading_names = HashSet::new();
     let mut failed_names = HashSet::new();
 
     for (name, reading) in entries {
         match (name, reading) {
+            (Ok(name), Ok(None)) => {
+                no_reading_names.insert(name);
+            }
             (Ok(name), Ok(reading)) => {
                 result.insert(name, reading);
             }
@@ -269,8 +280,13 @@ fn collect_sensor_readings(entries: impl IntoIterator<Item = SensorEntry>)
         }
     }
 
-    // FreeIPMI does not deduplicate sensor names, so a good entry must not
-    // hide a failed one of the same name from the source's failure policy
+    // A real reading of a duplicate must not hide that a sensor of the same
+    // name has none, nor that one failed. The removal runs last because a
+    // failure outranks a missing reading.
+    for name in no_reading_names {
+        result.insert(name, None);
+    }
+
     for name in &failed_names {
         result.remove(name);
     }
@@ -369,6 +385,56 @@ mod tests {
             (Ok("CPU Temp".to_owned()), Err(lim_error("read sensor units"))),
             good("System Temp", celsius(30)),
             good("CPU Temp", celsius(28)),
+        ]);
+
+        assert_eq!(temps(&readings), HashMap::from([("System Temp", Some(30))]));
+    }
+
+    #[test]
+    fn name_without_a_reading_before_a_real_one_stays_none() {
+        let readings = collect_sensor_readings(vec![
+            good("CPU Temp", None),
+            good("System Temp", celsius(30)),
+            good("CPU Temp", celsius(28)),
+        ]);
+
+        assert_eq!(temps(&readings), HashMap::from([
+            ("CPU Temp", None),
+            ("System Temp", Some(30)),
+        ]));
+    }
+
+    #[test]
+    fn name_without_a_reading_after_a_real_one_stays_none() {
+        let readings = collect_sensor_readings(vec![
+            good("CPU Temp", celsius(28)),
+            good("System Temp", celsius(30)),
+            good("CPU Temp", None),
+        ]);
+
+        assert_eq!(temps(&readings), HashMap::from([
+            ("CPU Temp", None),
+            ("System Temp", Some(30)),
+        ]));
+    }
+
+    #[test]
+    fn name_without_a_reading_that_failed_later_is_absent() {
+        let readings = collect_sensor_readings(vec![
+            good("CPU Temp", None),
+            good("System Temp", celsius(30)),
+            (Ok("CPU Temp".to_owned()), Err(lim_error("read sensor units"))),
+        ]);
+
+        assert_eq!(temps(&readings), HashMap::from([("System Temp", Some(30))]));
+    }
+
+    #[test]
+    fn name_that_failed_before_an_entry_without_a_reading_is_absent() {
+        let readings = collect_sensor_readings(vec![
+            (Ok("CPU Temp".to_owned()), Err(lim_error("read sensor units"))),
+            good("System Temp", celsius(30)),
+            good("CPU Temp", None),
         ]);
 
         assert_eq!(temps(&readings), HashMap::from([("System Temp", Some(30))]));
