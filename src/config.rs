@@ -830,6 +830,21 @@ mod tests {
     }
 
     #[test]
+    fn nul_error_names_the_first_bad_session_in_name_order() {
+        // Each parse builds a map with new hash keys, so an unsorted scan would
+        // name `bravo` first in about half of the runs
+        const RUNS: usize = 64;
+        let contents = format!("{}\n[sessions]\n{}\n{}\n",
+            zone_toml(&[("session", r#""alpha""#)]),
+            r#"bravo = { type = "remote", hostname = "bmc.lan", username = "admin", password = "sec\u0000ret" }"#,
+            r#"alpha = { type = "remote", hostname = "bmc.lan", username = "admin", password = "sec\u0000ret" }"#);
+
+        for _ in 0..RUNS {
+            assert_eq!(validation_reason(&contents), "sessions.alpha.password: must not contain a NUL byte");
+        }
+    }
+
+    #[test]
     fn accepts_flat_segment_and_full_duty() {
         let steps = "[{ temp = 40, dcycle = 40 }, { temp = 60, dcycle = 40 }, { temp = 80, dcycle = 100 }]";
         let config = parse(&zone_toml(&[("steps", steps)])).unwrap();
