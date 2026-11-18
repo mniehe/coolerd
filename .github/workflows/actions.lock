@@ -5,7 +5,7 @@ version: 'v0.0.3'
 workflows:
     '.github/workflows/ci.yml':
         - 'actions/checkout@v7.0.1'
-        - 'cachix/install-nix-action@v31.11.5'
+        - 'determinatesystems/determinate-nix-action@v3.24.2'
     '.github/workflows/release.yml':
         - 'actions/checkout@v7.0.1'
         - 'actions/create-release@latest'
@@ -26,8 +26,15 @@ dependencies:
         commit: 'sha1-e8f9f06c4b078e705bd2ea027f0926603fc9b4d5'
         owner_id: 44036562
         repo_id: 208154141
-    'cachix/install-nix-action@v31.11.5':
-        ref: 'v31.11.5'
-        commit: 'sha1-3dc140bfc76c49fbd4dd958429132e3746bcb086'
-        owner_id: 36824654
-        repo_id: 212301524
+    'determinatesystems/determinate-nix-action@v3.24.2':
+        ref: 'v3.24.2'
+        commit: 'sha1-16f94ba7aae399b9f9077c254b6719ec6de7e3e3'
+        owner_id: 80991770
+        repo_id: 983748827
+        uses:
+            - 'determinatesystems/nix-installer-action@9383ce2bf08796b65508822f5982f49151badc4e'
+    'determinatesystems/nix-installer-action@9383ce2bf08796b65508822f5982f49151badc4e':
+        ref: 'main'
+        commit: 'sha1-9383ce2bf08796b65508822f5982f49151badc4e'
+        owner_id: 80991770
+        repo_id: 588678074

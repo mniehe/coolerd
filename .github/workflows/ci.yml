@@ -59,7 +59,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Nix
-        uses: cachix/install-nix-action@v31.11.5
+        uses: DeterminateSystems/determinate-nix-action@v3.24.2
 
       - name: Check flake
         run: nix flake check --no-update-lock-file
