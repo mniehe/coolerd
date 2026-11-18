@@ -12,7 +12,7 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - name: Check out repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 
@@ -45,19 +45,22 @@ jobs:
       - name: Build in debug mode
         run: cargo build --verbose
 
-  build_source_packages:
-    name: Build source packages
-    runs-on: ubuntu-22.04
-    env:
-      CARGO_TERM_COLOR: always
+  nix:
+    name: Check and build flake
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Check out repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v7.0.1
         with:
-          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Build all source packages
-        run: |
-          sudo apt-get -y update
-          sudo apt-get -y install cargo debhelper devscripts dh-exec
-          ./dist/build_source_package.py -a
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31.11.5
+
+      - name: Check flake
+        run: nix flake check
+
+      - name: Build package
+        run: nix build .#default
