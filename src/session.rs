@@ -267,6 +267,49 @@ mod tests {
     }
 
     #[test]
+    fn drop_restores_the_board_after_a_panic_poisoned_the_port() {
+        let calls = BoardLog::default();
+        let session = IpmiSession::with_port("test", Box::new(FakeBoard::new(FanMode::Standard, &calls)), [0]).unwrap();
+
+        let panicked = thread::scope(|scope| {
+            scope.spawn(|| {
+                let _port = session.lock();
+                panic!("panic while holding the port");
+            }).join()
+        });
+
+        assert!(panicked.is_err());
+        assert!(session.port.is_poisoned());
+
+        drop(session);
+
+        assert!(log_of(&calls).ends_with(&[
+            PortCall::SetDutyCycle(0, 100),
+            PortCall::SetFanMode(FanMode::Standard),
+        ]), "{:?}", log_of(&calls));
+    }
+
+    #[test]
+    fn drop_sets_later_zones_and_the_mode_after_a_failed_zone_write() {
+        let calls = BoardLog::default();
+        let board = FakeBoard {
+            failing: Some(PortCall::SetDutyCycle(0, 100)),
+            ..FakeBoard::new(FanMode::Standard, &calls)
+        };
+        let session = IpmiSession::with_port("test", Box::new(board), [0, 1]).unwrap();
+
+        drop(session);
+
+        assert_eq!(log_of(&calls), [
+            PortCall::GetFanMode,
+            PortCall::SetFanMode(FanMode::Full),
+            PortCall::SetDutyCycle(0, 100),
+            PortCall::SetDutyCycle(1, 100),
+            PortCall::SetFanMode(FanMode::Standard),
+        ]);
+    }
+
+    #[test]
     fn board_in_full_mode_gets_no_mode_write() {
         let calls = BoardLog::default();
         let session = IpmiSession::with_port("test", Box::new(FakeBoard::new(FanMode::Full, &calls)), [0]).unwrap();
