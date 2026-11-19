@@ -312,8 +312,9 @@ fn read_hwmon_source(root: &HwmonRoot, chip: &str, input: u8) -> Result<u8> {
     }
 
     let path = device.join(format!("temp{}_input", input));
+    let raw = read_number(&path)?;
 
-    millidegrees_to_celsius(read_number(&path)?).ok_or(Error::ReadingExceedsBounds)
+    millidegrees_to_celsius(raw).ok_or(Error::HwmonValueOutOfRange { path, value: raw })
 }
 
 /// The readers of one zone's sources. Each source that runs a program has
@@ -1264,7 +1265,11 @@ mod tests {
 
         let reading = readers.read(0, &Source::Hwmon { chip: "k10temp".into(), input: 1 });
 
-        assert!(matches!(&reading, Err(Error::ReadingExceedsBounds)), "{:?}", reading);
+        let error = reading.err().expect("a negative reading fails");
+        assert!(matches!(&error, Error::HwmonValueOutOfRange { path, value: -128000 }
+                if path.ends_with("hwmon3/temp1_input")), "{:?}", error);
+        let text = error.to_string();
+        assert!(text.contains("temp1_input") && text.contains("-128000"), "{}", text);
     }
 
     #[test]
