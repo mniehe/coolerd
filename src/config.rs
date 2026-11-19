@@ -610,6 +610,15 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
                 });
             }
 
+            if let Source::Hwmon { chip, .. } = &source.kind {
+                if chip.is_empty() {
+                    return Err(Error::ConfigValidation {
+                        path: path.to_owned(),
+                        reason: format!("zones[{}].sources[{}].chip: must not be empty", i, j),
+                    });
+                }
+            }
+
             if let Source::Nvidia { gpu } = &source.kind {
                 if !is_gpu_uuid(gpu) && !is_pci_bus_id(gpu) {
                     return Err(Error::ConfigValidation {
@@ -742,6 +751,12 @@ fn listed_fans(fans: &[FanConfig], i: usize) -> Result<Vec<(String, FanConfig)>,
         // The kernel numbers PWM channels from 1
         if let FanConfig::Hwmon { pwm: 0, .. } = fan {
             return Err(format!("zones[{}].fans[{}].pwm: must be greater than 0", i, k));
+        }
+
+        if let FanConfig::Hwmon { chip, .. } = fan {
+            if chip.is_empty() {
+                return Err(format!("zones[{}].fans[{}].chip: must not be empty", i, k));
+            }
         }
     }
 
@@ -1358,6 +1373,13 @@ mod tests {
         let fans = r#"[{ type = "hwmon", chip = "nct6798", pwm = 1 }, { type = "hwmon", chip = "nct6798", pwm = 0 }]"#;
 
         assert_eq!(validation_reason(&hwmon_zone_toml(None, fans)), "zones[0].fans[1].pwm: must be greater than 0");
+    }
+
+    #[test]
+    fn rejects_hwmon_fan_with_empty_chip() {
+        let fans = r#"[{ type = "hwmon", chip = "nct6798", pwm = 1 }, { type = "hwmon", chip = "", pwm = 2 }]"#;
+
+        assert_eq!(validation_reason(&hwmon_zone_toml(None, fans)), "zones[0].fans[1].chip: must not be empty");
     }
 
     #[test]
@@ -2109,6 +2131,14 @@ mod tests {
 
         assert_eq!(validation_reason(&zone_toml(&[("sources", sources)])),
             "zones[0].sources[1].input: must be greater than 0");
+    }
+
+    #[test]
+    fn rejects_hwmon_source_with_empty_chip() {
+        let sources = r#"[{ type = "ipmi", sensor = "CPU Temp" }, { type = "hwmon", chip = "", input = 1 }]"#;
+
+        assert_eq!(validation_reason(&zone_toml(&[("sources", sources)])),
+            "zones[0].sources[1].chip: must not be empty");
     }
 
     /// Build a zone whose second source is an nvidia source with `gpu`
