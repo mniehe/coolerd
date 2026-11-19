@@ -1,12 +1,15 @@
 use {
     std::{
+        fs,
         panic::{catch_unwind, AssertUnwindSafe},
+        path::{Path, PathBuf},
         sync::Arc,
     },
     log::{error, info},
     crate::{
         config::FanConfig,
         error::{Error, Result},
+        hwmon::{HwmonRoot, read_number, write_number},
         session::IpmiSession,
     },
 };
@@ -133,9 +136,142 @@ impl Fan for SupermicroZone {
     }
 }
 
+/// The `pwm<N>_enable` value that puts a channel under manual control, from
+/// the kernel's hwmon sysfs interface (Documentation/hwmon/sysfs-interface.rst)
+const PWM_ENABLE_MANUAL: u32 = 1;
+
+/// The highest `pwm<N>` value, which is full speed
+const PWM_FULL: u32 = 255;
+
+/// The channel state saved at take-over
+struct Taken {
+    /// The chip's canonical directory, resolved once at take-over
+    device: PathBuf,
+    /// `pwm<N>_enable` as it was before the take-over
+    saved_enable: u32,
+}
+
+/// One PWM channel of a hwmon chip, found by the text of the chip's `name`
+/// file. Take-over saves the channel's mode and switches it to manual; release
+/// runs it at full speed and gives the saved mode back.
+pub struct HwmonPwm {
+    root: HwmonRoot,
+    chip: String,
+    pwm: u8,
+    taken: Option<Taken>,
+}
+
+impl HwmonPwm {
+    pub fn new(root: HwmonRoot, chip: String, pwm: u8) -> Self {
+        Self { root, chip, pwm, taken: None }
+    }
+
+    fn pwm_path(&self, device: &Path) -> PathBuf {
+        device.join(format!("pwm{}", self.pwm))
+    }
+
+    fn enable_path(&self, device: &Path) -> PathBuf {
+        device.join(format!("pwm{}_enable", self.pwm))
+    }
+}
+
+/// Read an attribute that must hold a number from 0 to `max`
+fn read_unsigned(path: &Path, max: u32) -> Result<u32> {
+    let value = read_number(path)?;
+
+    u32::try_from(value).ok()
+        .filter(|raw| *raw <= max)
+        .ok_or_else(|| Error::HwmonValueOutOfRange { path: path.to_owned(), value })
+}
+
+/// The raw PWM value of `duty` percent, rounded up so the fan never runs
+/// slower than asked
+fn duty_to_raw(duty: u8) -> u32 {
+    (u32::from(duty) * PWM_FULL).div_ceil(100).min(PWM_FULL)
+}
+
+/// The percentage of a raw PWM value from 0 to [`PWM_FULL`], rounded up
+fn raw_to_percent(raw: u32) -> u8 {
+    u8::try_from((raw * 100).div_ceil(PWM_FULL)).unwrap_or(u8::MAX)
+}
+
+impl Fan for HwmonPwm {
+    fn describe(&self) -> String {
+        format!("hwmon {} pwm{}", self.chip, self.pwm)
+    }
+
+    /// Resolve the chip once, save the channel's mode, then switch it to
+    /// manual at full speed. The mode is saved before any write, so a release
+    /// after a failed write gives it back.
+    fn take_control(&mut self) -> Result<()> {
+        if self.taken.is_some() {
+            return Ok(());
+        }
+
+        let resolved = self.root.resolve(&self.chip)?;
+        let device = fs::canonicalize(&resolved)
+            .map_err(|e| Error::Io { path: resolved, source: e })?;
+        let enable_path = self.enable_path(&device);
+        let pwm_path = self.pwm_path(&device);
+        let saved_enable = read_unsigned(&enable_path, u32::MAX)?;
+
+        info!("[{}] Taking over {:?}, saved pwm{}_enable {}", self.chip, device, self.pwm, saved_enable);
+        self.taken = Some(Taken { device, saved_enable });
+
+        write_number(&enable_path, PWM_ENABLE_MANUAL)?;
+        write_number(&pwm_path, PWM_FULL)
+    }
+
+    fn set_duty(&mut self, duty: u8) -> Result<Applied> {
+        let taken = self.taken.as_ref().ok_or_else(|| Error::FanNotTaken(self.describe()))?;
+        let path = self.pwm_path(&taken.device);
+        let target = duty_to_raw(duty);
+        let raw = read_unsigned(&path, PWM_FULL)?;
+        let before = Some(raw_to_percent(raw));
+
+        if raw == target {
+            return Ok(Applied { before, sent: None });
+        }
+
+        write_number(&path, target)?;
+
+        Ok(Applied { before, sent: Some(raw_to_percent(target)) })
+    }
+
+    /// Run the channel at full speed while it is still manual, then give the
+    /// saved mode back. A saved manual mode would latch the last duty, so the
+    /// channel then stays at full speed. Both writes are tried; the first
+    /// error is returned and a second one is logged.
+    fn release(&mut self) -> Result<()> {
+        let Some(taken) = self.taken.take() else {
+            return Ok(());
+        };
+
+        info!("[{}] Setting pwm{} to {} and restoring pwm{}_enable {}",
+              self.chip, self.pwm, PWM_FULL, self.pwm, taken.saved_enable);
+
+        let full = write_number(&self.pwm_path(&taken.device), PWM_FULL);
+        let restore = if taken.saved_enable == PWM_ENABLE_MANUAL {
+            Ok(())
+        } else {
+            write_number(&self.enable_path(&taken.device), taken.saved_enable)
+        };
+
+        match (full, restore) {
+            (Err(first), Err(second)) => {
+                error!("Failed to restore pwm{}_enable of {}: {}", self.pwm, self.chip, second);
+                Err(first)
+            }
+            (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+}
+
 /// Build the fan that `config` names. This is the only place that turns a
-/// fan config into a fan. A Supermicro fan needs the zone's IPMI session.
-pub fn build_fan(config: &FanConfig, session: Option<&Arc<IpmiSession>>) -> Result<Box<dyn Fan>> {
+/// fan config into a fan. A Supermicro fan needs the zone's IPMI session; a
+/// hwmon fan finds its chip under `hwmon`.
+pub fn build_fan(config: &FanConfig, session: Option<&Arc<IpmiSession>>, hwmon: &HwmonRoot) -> Result<Box<dyn Fan>> {
     match config {
         FanConfig::Supermicro { zone } => {
             let session = session
@@ -143,6 +279,7 @@ pub fn build_fan(config: &FanConfig, session: Option<&Arc<IpmiSession>>) -> Resu
 
             Ok(Box::new(SupermicroZone::new(session.clone(), *zone)))
         }
+        FanConfig::Hwmon { chip, pwm } => Ok(Box::new(HwmonPwm::new(hwmon.clone(), chip.clone(), *pwm))),
     }
 }
 
@@ -220,18 +357,21 @@ pub mod fake {
 #[cfg(test)]
 mod tests {
     use {
-        std::sync::Arc,
+        std::{fs, path::PathBuf, sync::Arc},
         super::{
             build_fan,
             fake::{CallLog, FakeFan, Op},
             Applied,
             Fan,
             FanGuard,
+            HwmonPwm,
             SupermicroZone,
         },
         crate::{
+            command::testing::TempDir,
             config::FanConfig,
             error::{Error, Result},
+            hwmon::HwmonRoot,
             ipmi::FanMode,
             session::{
                 fake::{BoardLog, FakeBoard, PortCall},
@@ -381,7 +521,7 @@ mod tests {
     fn supermicro_fan_needs_a_session() {
         let config = FanConfig::Supermicro { zone: 1 };
 
-        let error = build_fan(&config, None).err().expect("a supermicro fan without a session fails");
+        let error = build_fan(&config, None, &HwmonRoot::default()).err().expect("a supermicro fan without a session fails");
 
         assert!(matches!(&error, Error::FanWithoutSession(fan) if fan == "supermicro zone 1"), "{:?}", error);
     }
@@ -391,7 +531,7 @@ mod tests {
         let calls = BoardLog::default();
         let session = session_on(FakeBoard::new(FanMode::Standard, &calls));
 
-        let fan = build_fan(&FanConfig::Supermicro { zone: 1 }, Some(&session)).unwrap();
+        let fan = build_fan(&FanConfig::Supermicro { zone: 1 }, Some(&session), &HwmonRoot::default()).unwrap();
 
         assert_eq!(fan.describe(), "supermicro zone 1 on session test");
     }
@@ -413,5 +553,259 @@ mod tests {
             PortCall::SetDutyCycle(0, 100),
             PortCall::SetFanMode(FanMode::Standard),
         ]);
+    }
+
+    /// A hwmon tree with chip `nvme` at `hwmon0` and chip `nct6798` at
+    /// `hwmon1`, whose `pwm2_enable` holds `enable` and `pwm2` holds `pwm`
+    struct Nct6798 {
+        dir: TempDir,
+    }
+
+    impl Nct6798 {
+        fn new(enable: &str, pwm: &str) -> Self {
+            let dir = TempDir::new();
+
+            for (entry, name) in [("hwmon0", "nvme"), ("hwmon1", "nct6798")] {
+                fs::create_dir(dir.0.join(entry)).unwrap();
+                fs::write(dir.0.join(entry).join("name"), format!("{}\n", name)).unwrap();
+            }
+
+            fs::write(dir.0.join("hwmon1/pwm2_enable"), enable).unwrap();
+            fs::write(dir.0.join("hwmon1/pwm2"), pwm).unwrap();
+
+            Self { dir }
+        }
+
+        fn path(&self, attribute: &str) -> PathBuf {
+            self.dir.0.join("hwmon1").join(attribute)
+        }
+
+        fn read(&self, attribute: &str) -> String {
+            fs::read_to_string(self.path(attribute)).unwrap()
+        }
+
+        fn write(&self, attribute: &str, value: &str) {
+            fs::write(self.path(attribute), value).unwrap();
+        }
+
+        fn fan(&self) -> HwmonPwm {
+            HwmonPwm::new(HwmonRoot::new(self.dir.0.clone()), "nct6798".into(), 2)
+        }
+    }
+
+    #[test]
+    fn hwmon_take_control_saves_the_mode_and_runs_full() {
+        let chip = Nct6798::new("5\n", "127\n");
+        let mut fan = chip.fan();
+
+        fan.take_control().unwrap();
+
+        assert_eq!(chip.read("pwm2_enable"), "1");
+        assert_eq!(chip.read("pwm2"), "255");
+    }
+
+    #[test]
+    fn hwmon_release_restores_the_saved_mode() {
+        let chip = Nct6798::new("5\n", "127\n");
+        let mut fan = chip.fan();
+        fan.take_control().unwrap();
+        fan.set_duty(20).unwrap();
+
+        fan.release().unwrap();
+
+        assert_eq!(chip.read("pwm2"), "255");
+        assert_eq!(chip.read("pwm2_enable"), "5");
+    }
+
+    #[test]
+    fn hwmon_set_duty_writes_only_a_changed_raw_value() {
+        let chip = Nct6798::new("5\n", "127\n");
+        let mut fan = chip.fan();
+        fan.take_control().unwrap();
+        chip.write("pwm2", "127\n");
+
+        let changed = fan.set_duty(50).unwrap();
+        assert_eq!(chip.read("pwm2"), "128");
+        // A write would replace the line ending as well
+        chip.write("pwm2", "128\n");
+        let unchanged = fan.set_duty(50).unwrap();
+
+        assert_eq!(changed, Applied { before: Some(50), sent: Some(51) });
+        assert_eq!(unchanged, Applied { before: Some(51), sent: None });
+        assert_eq!(chip.read("pwm2"), "128\n");
+    }
+
+    #[test]
+    fn hwmon_set_duty_scales_the_ends_of_the_range() {
+        let chip = Nct6798::new("5\n", "127\n");
+        let mut fan = chip.fan();
+        fan.take_control().unwrap();
+
+        fan.set_duty(0).unwrap();
+        assert_eq!(chip.read("pwm2"), "0");
+
+        fan.set_duty(100).unwrap();
+        assert_eq!(chip.read("pwm2"), "255");
+    }
+
+    #[test]
+    fn hwmon_release_from_manual_mode_leaves_full_speed() {
+        let chip = Nct6798::new("1\n", "90\n");
+        let mut fan = chip.fan();
+        fan.take_control().unwrap();
+        fan.set_duty(20).unwrap();
+
+        fan.release().unwrap();
+
+        assert_eq!(chip.read("pwm2"), "255");
+        assert_eq!(chip.read("pwm2_enable"), "1");
+    }
+
+    /// Replace `attribute` with a directory, so that a write to it fails for
+    /// any user
+    fn break_attribute(chip: &Nct6798, attribute: &str) {
+        fs::remove_file(chip.path(attribute)).unwrap();
+        fs::create_dir(chip.path(attribute)).unwrap();
+    }
+
+    #[test]
+    fn hwmon_release_runs_full_when_the_mode_cannot_be_restored() {
+        let chip = Nct6798::new("5\n", "127\n");
+        let mut fan = chip.fan();
+        fan.take_control().unwrap();
+        fan.set_duty(20).unwrap();
+        break_attribute(&chip, "pwm2_enable");
+
+        let result = fan.release();
+
+        assert!(matches!(&result, Err(Error::Io { path, .. }) if *path == chip.path("pwm2_enable")), "{:?}", result);
+        assert_eq!(chip.read("pwm2"), "255");
+    }
+
+    #[test]
+    fn hwmon_release_restores_the_mode_after_a_failed_full_write() {
+        let chip = Nct6798::new("5\n", "127\n");
+        let mut fan = chip.fan();
+        fan.take_control().unwrap();
+        break_attribute(&chip, "pwm2");
+
+        let result = fan.release();
+
+        assert!(matches!(&result, Err(Error::Io { path, .. }) if *path == chip.path("pwm2")), "{:?}", result);
+        assert_eq!(chip.read("pwm2_enable"), "5");
+    }
+
+    #[test]
+    fn hwmon_release_returns_the_first_of_two_errors() {
+        let chip = Nct6798::new("5\n", "127\n");
+        let mut fan = chip.fan();
+        fan.take_control().unwrap();
+        break_attribute(&chip, "pwm2");
+        break_attribute(&chip, "pwm2_enable");
+
+        let result = fan.release();
+
+        assert!(matches!(&result, Err(Error::Io { path, .. }) if *path == chip.path("pwm2")), "{:?}", result);
+    }
+
+    #[test]
+    fn hwmon_second_release_writes_nothing() {
+        let chip = Nct6798::new("5\n", "127\n");
+        let mut fan = chip.fan();
+        fan.take_control().unwrap();
+        fan.release().unwrap();
+        chip.write("pwm2", "90\n");
+        chip.write("pwm2_enable", "2\n");
+
+        fan.release().unwrap();
+
+        assert_eq!(chip.read("pwm2"), "90\n");
+        assert_eq!(chip.read("pwm2_enable"), "2\n");
+    }
+
+    #[test]
+    fn hwmon_take_control_of_an_absent_chip_writes_nothing() {
+        let chip = Nct6798::new("5\n", "127\n");
+        let mut fan = HwmonPwm::new(HwmonRoot::new(chip.dir.0.clone()), "it8686".into(), 2);
+
+        let error = fan.take_control().err().expect("no chip named it8686");
+        fan.release().unwrap();
+
+        assert!(matches!(&error, Error::HwmonChipNotFound { chip, .. } if chip == "it8686"), "{:?}", error);
+        assert_eq!(chip.read("pwm2_enable"), "5\n");
+        assert_eq!(chip.read("pwm2"), "127\n");
+    }
+
+    #[test]
+    fn hwmon_take_control_writes_nothing_when_the_mode_cannot_be_read() {
+        let chip = Nct6798::new("5\n", "127\n");
+        fs::remove_file(chip.path("pwm2_enable")).unwrap();
+        let mut fan = chip.fan();
+
+        let result = fan.take_control();
+        fan.release().unwrap();
+
+        assert!(matches!(&result, Err(Error::Io { .. })), "{:?}", result);
+        assert_eq!(chip.read("pwm2"), "127\n");
+        assert!(!chip.path("pwm2_enable").exists());
+    }
+
+    #[test]
+    fn hwmon_release_after_a_partial_take_control_restores_the_mode() {
+        let chip = Nct6798::new("5\n", "127\n");
+        break_attribute(&chip, "pwm2");
+        let mut fan = chip.fan();
+
+        let result = fan.take_control();
+        let switched = chip.read("pwm2_enable");
+        let released = fan.release();
+
+        assert!(matches!(&result, Err(Error::Io { path, .. }) if *path == chip.path("pwm2")), "{:?}", result);
+        assert_eq!(switched, "1");
+        assert!(released.is_err());
+        assert_eq!(chip.read("pwm2_enable"), "5");
+    }
+
+    #[test]
+    fn hwmon_fan_keeps_the_device_it_took_over() {
+        let chip = Nct6798::new("5\n", "127\n");
+        let mut fan = chip.fan();
+        fan.take_control().unwrap();
+        fs::remove_dir_all(chip.dir.0.join("hwmon1")).unwrap();
+        let moved = chip.dir.0.join("hwmon2");
+        fs::create_dir(&moved).unwrap();
+        fs::write(moved.join("name"), "nct6798\n").unwrap();
+        fs::write(moved.join("pwm2_enable"), "1\n").unwrap();
+        fs::write(moved.join("pwm2"), "77\n").unwrap();
+
+        let duty = fan.set_duty(50);
+        let released = fan.release();
+
+        assert!(matches!(&duty, Err(Error::Io { .. })), "{:?}", duty);
+        assert!(released.is_err());
+        assert_eq!(fs::read_to_string(moved.join("pwm2")).unwrap(), "77\n");
+        assert_eq!(fs::read_to_string(moved.join("pwm2_enable")).unwrap(), "1\n");
+    }
+
+    #[test]
+    fn hwmon_raw_value_above_full_is_an_error() {
+        let chip = Nct6798::new("5\n", "127\n");
+        let mut fan = chip.fan();
+        fan.take_control().unwrap();
+        chip.write("pwm2", "300\n");
+
+        let result = fan.set_duty(50);
+
+        assert!(matches!(&result, Err(Error::HwmonValueOutOfRange { value: 300, .. })), "{:?}", result);
+        assert_eq!(chip.read("pwm2"), "300\n");
+    }
+
+    #[test]
+    fn hwmon_fan_is_built_without_a_session() {
+        let config = FanConfig::Hwmon { chip: "nct6798".into(), pwm: 2 };
+
+        let fan = build_fan(&config, None, &HwmonRoot::default()).unwrap();
+
+        assert_eq!(fan.describe(), "hwmon nct6798 pwm2");
     }
 }

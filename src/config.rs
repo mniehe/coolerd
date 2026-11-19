@@ -297,6 +297,11 @@ pub enum FanConfig {
     Supermicro {
         zone: u8,
     },
+    /// PWM channel `pwm` of the hwmon chip whose `name` file holds `chip`
+    Hwmon {
+        chip: String,
+        pwm: u8,
+    },
 }
 
 /// A zone may also be written as a TOML array, whose values serde reads in the
@@ -721,6 +726,11 @@ fn listed_fans(fans: &[FanConfig], i: usize) -> Result<Vec<(String, FanConfig)>,
         if fans[..k].contains(fan) {
             return Err(format!("zones[{}].fans[{}]: listed twice", i, k));
         }
+
+        // The kernel numbers PWM channels from 1
+        if let FanConfig::Hwmon { pwm: 0, .. } = fan {
+            return Err(format!("zones[{}].fans[{}].pwm: must be greater than 0", i, k));
+        }
     }
 
     Ok(fans.iter().enumerate()
@@ -730,13 +740,19 @@ fn listed_fans(fans: &[FanConfig], i: usize) -> Result<Vec<(String, FanConfig)>,
 
 /// Check that no fan is driven by two zones, which would fight over its duty.
 /// A Supermicro fan is the same fan in two zones when both name the same zone
-/// number on the same session. The zones must have passed `zone_fans`.
+/// number on the same session. A hwmon fan is the same fan when both name the
+/// same chip and channel, whatever their sessions. The zones must have passed
+/// `zone_fans`.
 fn check_fan_owners(zones: &[Zone]) -> Result<(), String> {
     let mut owners = HashMap::new();
 
     for (i, zone) in zones.iter().enumerate() {
         for (key, fan) in keyed_fans(zone, i)? {
-            let owner = (zone.session.0.clone(), fan);
+            let session = match fan {
+                FanConfig::Supermicro { .. } => Some(zone.session.0.clone()),
+                FanConfig::Hwmon { .. } => None,
+            };
+            let owner = (session, fan);
 
             if let Some(first) = owners.get(&owner) {
                 return Err(format!("{}: already driven by zones[{}]", key, first));
@@ -1292,6 +1308,52 @@ mod tests {
 
         assert_eq!(config.zones[0].fan_list, supermicro(&[0]));
         assert_eq!(config.zones[1].fan_list, supermicro(&[0]));
+    }
+
+    /// A zone that reads a file and drives `fans`, on `session` when given
+    fn hwmon_zone_toml(session: Option<&str>, fans: &str) -> String {
+        let session = session.map_or_else(String::new, |s| format!("session = {:?}\n", s));
+
+        format!("[[zones]]\n{}fans = {}\nsources = [{{ type = \"file\", path = \"/sys/temp\" }}]\nsteps = [{{ temp = 40, dcycle = 40 }}]\n",
+            session, fans)
+    }
+
+    const NCT6798_PWM_2: &str = r#"[{ type = "hwmon", chip = "nct6798", pwm = 2 }]"#;
+
+    #[test]
+    fn accepts_hwmon_fan() {
+        let config = parse(&hwmon_zone_toml(None, NCT6798_PWM_2)).unwrap();
+
+        assert_eq!(config.zones[0].fan_list, [FanConfig::Hwmon { chip: "nct6798".into(), pwm: 2 }]);
+    }
+
+    #[test]
+    fn rejects_hwmon_pwm_zero() {
+        let fans = r#"[{ type = "hwmon", chip = "nct6798", pwm = 1 }, { type = "hwmon", chip = "nct6798", pwm = 0 }]"#;
+
+        assert_eq!(validation_reason(&hwmon_zone_toml(None, fans)), "zones[0].fans[1].pwm: must be greater than 0");
+    }
+
+    #[test]
+    fn rejects_hwmon_fan_driven_by_two_zones() {
+        let contents = format!("{}{}", hwmon_zone_toml(None, NCT6798_PWM_2), hwmon_zone_toml(None, NCT6798_PWM_2));
+
+        assert_eq!(validation_reason(&contents), "zones[1].fans[0]: already driven by zones[0]");
+    }
+
+    #[test]
+    fn rejects_hwmon_fan_driven_by_zones_of_two_sessions() {
+        let contents = format!("{}{}[sessions]\nbmc = {{ type = \"local\" }}\n",
+            hwmon_zone_toml(None, NCT6798_PWM_2), hwmon_zone_toml(Some("bmc"), NCT6798_PWM_2));
+
+        assert_eq!(validation_reason(&contents), "zones[1].fans[0]: already driven by zones[0]");
+    }
+
+    #[test]
+    fn accepts_two_pwm_channels_of_one_chip_in_two_zones() {
+        let other = r#"[{ type = "hwmon", chip = "nct6798", pwm = 3 }]"#;
+
+        assert!(parse(&format!("{}{}", hwmon_zone_toml(None, NCT6798_PWM_2), hwmon_zone_toml(None, other))).is_ok());
     }
 
     #[test]

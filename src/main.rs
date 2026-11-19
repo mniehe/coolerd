@@ -161,15 +161,16 @@ impl MainApp {
         // drop the guard; an abort takes effect once the poll in progress
         // returns.
         let mut fans = FanGuard::new();
+        let hwmon = HwmonRoot::default();
 
         for fan_config in &zone_config.fan_list {
-            fans.add(build_fan(fan_config, Some(&session))?)?;
+            fans.add(build_fan(fan_config, Some(&session), &hwmon)?)?;
         }
 
         info!("[{}] Starting loop for fans {:?}", session.name(), fans.descriptions());
 
         let mut state = ZoneState::new(&zone_config);
-        let mut readers = ZoneReaders::new(HwmonRoot::default());
+        let mut readers = ZoneReaders::new(hwmon);
 
         loop {
             let st = &mut state;
@@ -247,8 +248,9 @@ fn sessions_to_open(config: &Config) -> Vec<(String, Vec<u8>)> {
             .iter()
             .filter(|z| &z.session.0 == name)
             .flat_map(|z| &z.fan_list)
-            .map(|fan| match fan {
-                FanConfig::Supermicro { zone } => *zone,
+            .filter_map(|fan| match fan {
+                FanConfig::Supermicro { zone } => Some(*zone),
+                FanConfig::Hwmon { .. } => None,
             })
             .collect();
 

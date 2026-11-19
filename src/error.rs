@@ -121,6 +121,13 @@ pub enum Error {
         value: String,
         source: ParseIntError,
     },
+    #[error("Hwmon value out of range: {path:?}: {value}")]
+    HwmonValueOutOfRange {
+        path: PathBuf,
+        value: i64,
+    },
+    #[error("{0}: not taken over")]
+    FanNotTaken(String),
 }
 
 pub type Result<T, E = Error> = result::Result<T, E>;

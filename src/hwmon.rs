@@ -1,7 +1,7 @@
 use {
     std::{
-        fs::{self, File},
-        io::{self, Read},
+        fs::{self, File, OpenOptions},
+        io::{self, Read, Write},
         path::{Path, PathBuf},
     },
     crate::error::{Error, Result},
@@ -105,11 +105,25 @@ pub(crate) fn read_number(path: &Path) -> Result<i64> {
     })
 }
 
+/// Write `value` to a sysfs attribute. A missing attribute is an error and is
+/// not created, because a chip that went away must not gain a plain file.
+pub(crate) fn write_number(path: &Path, value: u32) -> Result<()> {
+    let io_error = |e| Error::Io { path: path.to_owned(), source: e };
+
+    OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .map_err(io_error)?
+        .write_all(value.to_string().as_bytes())
+        .map_err(io_error)
+}
+
 #[cfg(test)]
 mod tests {
     use {
         std::fs,
-        super::{ATTRIBUTE_CAP, HwmonRoot, read_number},
+        super::{ATTRIBUTE_CAP, HwmonRoot, read_number, write_number},
         crate::{command::testing::TempDir, error::Error},
     };
 
@@ -208,5 +222,26 @@ mod tests {
         let path = dir.0.join("pwm2");
 
         assert!(matches!(read_number(&path), Err(Error::Io { path: failed, .. }) if failed == path));
+    }
+
+    #[test]
+    fn write_replaces_the_whole_value() {
+        let dir = TempDir::new();
+        let path = dir.write("pwm2_enable", "255\n");
+
+        write_number(&path, 5).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "5");
+    }
+
+    #[test]
+    fn write_to_a_missing_attribute_fails_without_creating_it() {
+        let dir = TempDir::new();
+        let path = dir.0.join("pwm2");
+
+        let result = write_number(&path, 255);
+
+        assert!(matches!(&result, Err(Error::Io { path: failed, .. }) if *failed == path), "{:?}", result);
+        assert!(!path.exists());
     }
 }
