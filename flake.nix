@@ -113,6 +113,21 @@
           lib.any (a: !a.assertion && lib.hasInfix "services.ipmi-fan-control.hwmon.pwmChannels" a.message)
           badChipConfig.assertions;
 
+        # A host with two chips. Only its access script is read, so that the
+        # helper can be run against a tree where the second chip fails.
+        twoChipScript =
+          (evalHost {
+            services.ipmi-fan-control.hwmon.pwmChannels = {
+              nct6798 = [2];
+              it8792 = [1];
+            };
+          })
+          .config
+          .services
+          .ipmi-fan-control
+          .hwmon
+          .accessScript;
+
         hasPackage = name: packages: lib.any (p: lib.getName p == name) packages;
         unit = host: host.nixos.config.systemd.services.ipmi-fan-control;
         unitText = host: host.nixos.config.systemd.units."ipmi-fan-control.service".text;
@@ -138,12 +153,18 @@
 
         hwmonConfig = hosts.hwmon.nixos.config;
         accessScript = hwmonConfig.services.ipmi-fan-control.hwmon.accessScript;
-        # The file each add_target line of the access helper names, in order
-        grantedFiles = lib.concatMap (line: let
-          m = builtins.match "[[:space:]]*add_target \"\\$device/(pwm[0-9]+(_enable)?)\"" line;
-        in
-          lib.optional (m != null) (lib.head m))
-        (lib.splitString "\n" accessScript);
+        # The first capture of pattern on each line of script that matches it, in order
+        scriptMatches = pattern: script:
+          lib.concatMap (line: let
+            m = builtins.match pattern line;
+          in
+            lib.optional (m != null) (lib.head m))
+          (lib.splitString "\n" script);
+        # The file each add_target line of an access helper names
+        filesGranted = scriptMatches "[[:space:]]*add_target \"\\$device/(pwm[0-9]+(_enable)?)\"";
+        # The chip each find_chip call of an access helper names
+        chipsFound = scriptMatches "find_chip (.*)";
+        grantedFiles = filesGranted accessScript;
         execStartPre = host: lib.toList ((unit host).serviceConfig.ExecStartPre or []);
         # The helper with the + prefix, then the hwmon root and the service group
         runsAccessHelper = host: command: let
@@ -156,6 +177,7 @@
           && lib.elemAt words 1 == "/sys/class/hwmon"
           && lib.elemAt words 2 == lib.escapeShellArg (unit host).serviceConfig.Group;
         accessHelper = pkgs.writeShellScript "hwmon-access-helper" accessScript;
+        twoChipHelper = pkgs.writeShellScript "hwmon-access-helper-two-chips" twoChipScript;
 
         hostFailures = name: host:
           map (p: "${name}: ${lib.getName p} is not on the effective unit PATH") (missingFromPath host)
@@ -186,6 +208,9 @@
           "hwmon: boot.kernelModules does not contain nct6775"
           ++ lib.optional (!lib.hasInfix "find_chip ${lib.escapeShellArg "nct6798"}\n" accessScript || grantedFiles != ["pwm2" "pwm2_enable" "pwm12" "pwm12_enable"])
           "hwmon: the access helper does not grant exactly pwm2, pwm2_enable, pwm12 and pwm12_enable of nct6798"
+          # hwmon-access fails the chip found last; it must be nct6798
+          ++ lib.optional (chipsFound twoChipScript != map lib.escapeShellArg ["it8792" "nct6798"] || filesGranted twoChipScript != ["pwm1" "pwm1_enable" "pwm2" "pwm2_enable"])
+          "two chips: the access helper does not find it8792 and then nct6798, granting pwm1 and pwm1_enable and then pwm2 and pwm2_enable"
           ++ lib.optional (!lib.any (runsAccessHelper hosts.hwmon) (execStartPre hosts.hwmon))
           "hwmon: ExecStartPre does not run the access helper with the + prefix on /sys/class/hwmon and the service group"
           ++ lib.optional (lib.hasInfix "KERNEL==\"ipmi" hwmonConfig.services.udev.extraRules || lib.elem "ipmi" hwmonConfig.users.users.ipmi-fan-control.extraGroups || hwmonConfig.users.groups ? ipmi || hasIpmiModule hwmonConfig.boot.kernelModules)
@@ -204,7 +229,8 @@
 
           # Runs the hwmon host's access helper against fake hwmon trees; never /sys
           hwmon-access = pkgs.runCommand "hwmon-access" {} ''
-            helper=${accessHelper}
+            one_chip_helper=${accessHelper}
+            two_chip_helper=${twoChipHelper}
             group=$(id -g)
             failures=0
             umask 022
@@ -217,6 +243,7 @@
             start_case() {
               label="$1"
               root="$TMPDIR/$1"
+              helper=$one_chip_helper
               failures_before=$failures
               mkdir -p "$root"
             }
@@ -473,6 +500,27 @@
             run_helper "$root" "$group"
             expect_failure
             expect_stderr "$root/hwmon1/name: cannot read"
+            expect_unchanged "$root"
+            end_case
+
+            start_case l-two-chips
+            helper=$two_chip_helper
+            make_chip "$root/hwmon0" 'nct6798\n'
+            make_chip "$root/hwmon1" 'it8792\n'
+            expect_grants_to "$root/hwmon1/pwm1" "$root/hwmon1/pwm1_enable" "$root/hwmon0/pwm2" "$root/hwmon0/pwm2_enable"
+            end_case
+
+            # nct6798, the chip the helper handles last, fails after it8792 has passed
+            start_case m-two-chips-late-failure
+            helper=$two_chip_helper
+            make_chip "$root/hwmon0" 'nct6798\n'
+            make_chip "$root/hwmon1" 'it8792\n'
+            rm "$root/hwmon0/pwm2_enable"
+            run_helper "$root" "$group"
+            expect_failure
+            expect_stderr "$root/hwmon0/pwm2_enable:"
+            expect_mode "$root/hwmon1/pwm1" 644
+            expect_mode "$root/hwmon1/pwm1_enable" 644
             expect_unchanged "$root"
             end_case
 
