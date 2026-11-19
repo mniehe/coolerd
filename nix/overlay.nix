@@ -1,7 +1,7 @@
 final: prev: {
   coolerd = final.rustPlatform.buildRustPackage {
     pname = "coolerd";
-    version = "0.1.0"; # Update with your actual version
+    version = (final.lib.importTOML ../Cargo.toml).package.version;
 
     src = ../.;
 

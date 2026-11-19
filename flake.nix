@@ -372,6 +372,8 @@
           "overlay: ipmi-fan-control is not the coolerd derivation"
           ++ lib.optional ((pkgs.coolerd.meta.mainProgram or null) != "coolerd")
           "overlay: meta.mainProgram of coolerd is not coolerd"
+          ++ lib.optional (pkgs.coolerd.version != (lib.importTOML ./Cargo.toml).package.version)
+          "overlay: the coolerd version is not the version in Cargo.toml"
           ++ lib.optional (self.packages.${system}.ipmi-fan-control.drvPath != self.packages.${system}.default.drvPath)
           "packages: ipmi-fan-control is not the default package"
           ++ lib.optional (!checksPackage defaultCheck pkgs.coolerd)
