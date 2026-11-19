@@ -229,7 +229,7 @@
 
             make_pwm_files() {
               mkdir -p "$1"
-              for file in pwm1 pwm2 pwm2_enable pwm3 pwm12 pwm12_enable; do
+              for file in pwm1 pwm1_enable pwm2 pwm2_enable pwm3 pwm12 pwm12_enable; do
                 echo 0 > "$1/$file"
                 chmod 644 "$1/$file"
               done
@@ -239,6 +239,14 @@
             make_chip() {
               make_pwm_files "$1"
               printf '%b' "$2" > "$1/name"
+            }
+
+            # As make_chip, but the device directory lies outside the hwmon root
+            # and $1 is a symbolic link to it, as in /sys/class/hwmon
+            make_linked_chip() {
+              device="$TMPDIR/$label-devices/$(basename "$1")/hwmon"
+              make_chip "$device" "$2"
+              ln -s "$device" "$1"
             }
 
             run_helper() {
@@ -262,10 +270,23 @@
               fi
             }
 
+            expect_stderr() {
+              if ! grep -q -F -- "$1" "$TMPDIR/stderr"; then
+                fail "stderr does not contain: $1"
+              fi
+            }
+
             expect_mode() {
               actual=$(stat -c %a "$1")
               if [ "$actual" != "$2" ]; then
                 fail "$1 has mode $actual, expected $2"
+              fi
+            }
+
+            expect_group() {
+              actual=$(stat -c %g "$1")
+              if [ "$actual" != "$2" ]; then
+                fail "$1 has gid $actual, expected $2"
               fi
             }
 
@@ -278,23 +299,42 @@
             }
 
             expect_no_other_write() {
-              writable=$(find "$1" ! -type l -perm -0002)
+              writable=$(find -L "$1" ! -type l -perm -0002)
               if [ -n "$writable" ]; then
                 fail "writable by others: $writable"
               fi
             }
 
-            # The four listed files of nct6798 in hwmon0 gain group write, nothing else changes
-            expect_grants() {
+            # The mode of every path under the hwmon root, through its symbolic
+            # links, except the paths given as arguments
+            other_modes() {
+              excluded=()
+              for target in "$@"; do
+                excluded+=(! -path "$target")
+              done
+              find -L "$root" "''${excluded[@]}" -printf '%p %m\n' | sort
+            }
+
+            # The files given as arguments gain group write and the group, and
+            # no other path under the hwmon root changes its mode
+            expect_grants_to() {
+              other_modes "$@" > "$TMPDIR/before"
               run_helper "$root" "$group"
               expect_success
-              for file in pwm2 pwm2_enable pwm12 pwm12_enable; do
-                expect_mode "$root/hwmon0/$file" 664
+              for target in "$@"; do
+                expect_mode "$target" 664
+                expect_group "$target" "$group"
               done
-              expect_mode "$root/hwmon0/pwm1" 644
-              expect_mode "$root/hwmon0/pwm3" 644
-              expect_unchanged "$root/hwmon1"
+              other_modes "$@" > "$TMPDIR/after"
+              if ! cmp -s "$TMPDIR/before" "$TMPDIR/after"; then
+                fail "other modes changed: $(diff "$TMPDIR/before" "$TMPDIR/after" | tr '\n' ' ')"
+              fi
               expect_no_other_write "$root"
+            }
+
+            # The four listed files of nct6798 in hwmon0 gain group write, nothing else changes
+            expect_grants() {
+              expect_grants_to "$root/hwmon0/pwm2" "$root/hwmon0/pwm2_enable" "$root/hwmon0/pwm12" "$root/hwmon0/pwm12_enable"
             }
 
             start_case a
@@ -308,6 +348,7 @@
             make_chip "$root/hwmon1" 'nct6798\n'
             run_helper "$root" "$group"
             expect_failure
+            expect_stderr "hwmon chip nct6798:"
             expect_unchanged "$root"
             end_case
 
@@ -315,12 +356,14 @@
             make_chip "$root/hwmon0" 'k10temp\n'
             run_helper "$root" "$group"
             expect_failure
+            expect_stderr "hwmon chip nct6798:"
             expect_unchanged "$root"
             end_case
 
             start_case c-empty
             run_helper "$root" "$group"
             expect_failure
+            expect_stderr "hwmon chip nct6798:"
             end_case
 
             start_case d
@@ -328,6 +371,7 @@
             rm "$root/hwmon0/pwm12_enable"
             run_helper "$root" "$group"
             expect_failure
+            expect_stderr "$root/hwmon0/pwm12_enable:"
             expect_mode "$root/hwmon0/pwm2" 644
             expect_unchanged "$root"
             end_case
@@ -340,6 +384,7 @@
             ln -s "$TMPDIR/e-outside" "$root/hwmon0/pwm2"
             run_helper "$root" "$group"
             expect_failure
+            expect_stderr "$root/hwmon0/pwm2:"
             expect_mode "$TMPDIR/e-outside" 644
             expect_unchanged "$root"
             end_case
@@ -350,6 +395,7 @@
             mkdir -m 755 "$root/hwmon0/pwm2"
             run_helper "$root" "$group"
             expect_failure
+            expect_stderr "$root/hwmon0/pwm2:"
             expect_mode "$root/hwmon0/pwm2" 755
             expect_unchanged "$root"
             end_case
@@ -363,6 +409,7 @@
               chmod 000 "$root/hwmon1/name"
               run_helper "$root" "$group"
               expect_failure
+              expect_stderr "$root/hwmon1/name: cannot read"
               expect_unchanged "$root"
               end_case
             fi
@@ -385,6 +432,7 @@
             make_chip "$root/hwmon0" 'nct6798\nnct6798\n'
             run_helper "$root" "$group"
             expect_failure
+            expect_stderr "hwmon chip nct6798:"
             expect_unchanged "$root"
             end_case
 
@@ -394,10 +442,37 @@
             if [ "$status" -ne 2 ]; then
               fail "no arguments: expected exit 2, got $status"
             fi
+            expect_stderr "usage:"
             run_helper "$root" "$group" extra
             if [ "$status" -ne 2 ]; then
               fail "three arguments: expected exit 2, got $status"
             fi
+            expect_stderr "usage:"
+            expect_unchanged "$root"
+            end_case
+
+            start_case k-unknown-group
+            make_chip "$root/hwmon0" 'nct6798\n'
+            run_helper "$root" no-such-group-coolerd-check
+            expect_failure
+            expect_stderr "no-such-group-coolerd-check"
+            expect_unchanged "$root"
+            end_case
+
+            start_case n-class-symlinks
+            make_linked_chip "$root/hwmon0" 'nct6798\n'
+            make_linked_chip "$root/hwmon1" 'k10temp\n'
+            expect_grants
+            end_case
+
+            # A name that cannot be read even by root
+            start_case o-name-directory
+            make_chip "$root/hwmon0" 'nct6798\n'
+            make_pwm_files "$root/hwmon1"
+            mkdir "$root/hwmon1/name"
+            run_helper "$root" "$group"
+            expect_failure
+            expect_stderr "$root/hwmon1/name: cannot read"
             expect_unchanged "$root"
             end_case
 
