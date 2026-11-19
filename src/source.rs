@@ -19,7 +19,7 @@ use {
         curve::SourceReading,
         error::{Error, Result},
         freeipmi::{SensorReading, SensorUnits, SensorValue},
-        hwmon::{HwmonRoot, read_number},
+        hwmon::{HwmonRoot, read_number, read_optional_number},
     },
 };
 
@@ -301,9 +301,17 @@ fn millidegrees_to_celsius(raw: i64) -> Option<u8> {
 }
 
 /// Read input `input` of the hwmon chip named `chip`. The chip is found again
-/// on every read, so a chip that moves to another `hwmonN` keeps reading.
+/// on every read, so a chip that moves to another `hwmonN` keeps reading. A
+/// non-zero `temp<input>_fault` fails the read; a chip without one has none.
 fn read_hwmon_source(root: &HwmonRoot, chip: &str, input: u8) -> Result<u8> {
-    let path = root.resolve(chip)?.join(format!("temp{}_input", input));
+    let device = root.resolve(chip)?;
+    let fault_path = device.join(format!("temp{}_fault", input));
+
+    if read_optional_number(&fault_path)?.is_some_and(|fault| fault != 0) {
+        return Err(Error::HwmonFault { path: fault_path });
+    }
+
+    let path = device.join(format!("temp{}_input", input));
 
     millidegrees_to_celsius(read_number(&path)?).ok_or(Error::ReadingExceedsBounds)
 }
@@ -1226,6 +1234,26 @@ mod tests {
         let reading = readers.read(0, &Source::Hwmon { chip: "k10temp".into(), input: 2 });
 
         assert!(matches!(&reading, Err(Error::Io { path, .. }) if path.ends_with("hwmon3/temp2_input")), "{:?}", reading);
+    }
+
+    fn k10temp_reading_with_fault(fault: &str) -> Result<u8, Error> {
+        let dir = k10temp_tree("45500\n");
+        fs::write(dir.0.join("hwmon3/temp1_fault"), fault).unwrap();
+        let mut readers = ZoneReaders::new(HwmonRoot::new(dir.0.clone()));
+
+        readers.read(0, &Source::Hwmon { chip: "k10temp".into(), input: 1 })
+    }
+
+    #[test]
+    fn hwmon_source_fails_when_its_input_reports_a_fault() {
+        let reading = k10temp_reading_with_fault("1\n");
+
+        assert!(matches!(&reading, Err(Error::HwmonFault { path }) if path.ends_with("hwmon3/temp1_fault")), "{:?}", reading);
+    }
+
+    #[test]
+    fn hwmon_source_reads_when_its_input_reports_no_fault() {
+        assert_eq!(k10temp_reading_with_fault("0\n").unwrap(), 46);
     }
 
     #[test]

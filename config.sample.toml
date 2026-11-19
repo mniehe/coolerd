@@ -110,7 +110,9 @@ sources = [
   # `name` file holds `chip`, in milli-degrees Celsius, and rounds up to whole
   # degrees. A reading above 255 °C gives 255. A reading below 0 °C fails the
   # source, because an open probe reports a negative value; a real sub-zero
-  # temperature then fails the source as well. `input` starts at 1.
+  # temperature then fails the source as well. When the chip has a
+  # `temp<input>_fault` file and it holds a value other than 0, the source
+  # fails. `input` starts at 1.
   #
   # The chip is found by name on every read, never by its hwmonN number,
   # which can change between boots. A name that no chip or more than one chip

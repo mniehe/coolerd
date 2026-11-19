@@ -126,6 +126,10 @@ pub enum Error {
         path: PathBuf,
         value: i64,
     },
+    #[error("Hwmon input reports a fault: {path:?}")]
+    HwmonFault {
+        path: PathBuf,
+    },
     #[error("{0}: not taken over")]
     FanNotTaken(String),
     #[error("IPMI sensors need an IPMI session, and the zone has none")]

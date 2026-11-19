@@ -113,6 +113,16 @@ pub(crate) fn read_number(path: &Path) -> Result<i64> {
     })
 }
 
+/// Read a sysfs attribute that holds one decimal integer, or `None` when the
+/// attribute does not exist
+pub(crate) fn read_optional_number(path: &Path) -> Result<Option<i64>> {
+    match read_number(path) {
+        Ok(value) => Ok(Some(value)),
+        Err(Error::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Write `value` to a sysfs attribute. A missing attribute is an error and is
 /// not created, because a chip that went away must not gain a plain file.
 pub(crate) fn write_number(path: &Path, value: u32) -> Result<()> {
