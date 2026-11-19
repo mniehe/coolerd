@@ -355,6 +355,29 @@ mod tests {
     }
 
     #[test]
+    fn supermicro_zone_reports_a_failed_write() {
+        let calls = BoardLog::default();
+        let board = FakeBoard { failing: Some(PortCall::SetDutyCycle(0, 60)), ..FakeBoard::new(FanMode::Standard, &calls) };
+        let mut zone = SupermicroZone::new(session_on(board), 0);
+
+        let result = zone.set_duty(60);
+
+        assert!(matches!(result, Err(Error::Ipmi(_))), "{:?}", result);
+    }
+
+    #[test]
+    fn supermicro_zone_writes_nothing_after_a_failed_read() {
+        let calls = BoardLog::default();
+        let board = FakeBoard { failing: Some(PortCall::GetDutyCycle(0)), ..FakeBoard::new(FanMode::Standard, &calls) };
+        let mut zone = SupermicroZone::new(session_on(board), 0);
+
+        let result = zone.set_duty(60);
+
+        assert!(matches!(result, Err(Error::Ipmi(_))), "{:?}", result);
+        assert_eq!(calls.lock().unwrap()[SESSION_OPEN.len()..], [PortCall::GetDutyCycle(0)]);
+    }
+
+    #[test]
     fn supermicro_fan_needs_a_session() {
         let config = FanConfig::Supermicro { zone: 1 };
 
