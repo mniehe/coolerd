@@ -74,23 +74,11 @@ impl MainApp {
     fn new(config: Config) -> Result<Self> {
         let mut sessions = HashMap::new();
 
-        for (name, st) in &config.sessions.0 {
-            let restore_zones: Vec<_> = config.zones
-                .iter()
-                .filter(|z| &z.session.0 == name)
-                .flat_map(|z| &z.fan_list)
-                .map(|fan| match fan {
-                    FanConfig::Supermicro { zone } => *zone,
-                })
-                .collect();
+        for (name, restore_zones) in sessions_to_open(&config) {
+            let st = &config.sessions.0[&name].0;
+            let session = IpmiSession::new(&name, st, restore_zones)?;
 
-            // Don't waste resources if nothing would use the session
-            if restore_zones.is_empty() {
-                continue;
-            }
-
-            sessions.insert(name.clone(), Arc::new(
-                IpmiSession::new(name, &st.0, restore_zones)?));
+            sessions.insert(name, Arc::new(session));
         }
 
         Ok(Self {
@@ -247,6 +235,32 @@ impl MainApp {
     }
 }
 
+/// Each session that a zone's Supermicro fan uses, in the order of
+/// `config.sessions`, with the IPMI zones its drop sets to 100%
+fn sessions_to_open(config: &Config) -> Vec<(String, Vec<u8>)> {
+    let mut sessions = Vec::new();
+
+    for name in config.sessions.0.keys() {
+        let restore_zones: Vec<_> = config.zones
+            .iter()
+            .filter(|z| &z.session.0 == name)
+            .flat_map(|z| &z.fan_list)
+            .map(|fan| match fan {
+                FanConfig::Supermicro { zone } => *zone,
+            })
+            .collect();
+
+        // Don't waste resources if nothing would use the session
+        if restore_zones.is_empty() {
+            continue;
+        }
+
+        sessions.push((name.clone(), restore_zones));
+    }
+
+    sessions
+}
+
 /// A duty cycle for the debug log, or `-` when there is none
 fn percent(duty: Option<u8>) -> String {
     duty.map_or_else(|| "-".to_owned(), |d| format!("{}%", d))
@@ -308,5 +322,51 @@ async fn main() {
             }
             process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        std::path::Path,
+        super::sessions_to_open,
+        crate::config::{Config, parse_config},
+    };
+
+    fn parse(contents: &str) -> Config {
+        parse_config(contents, Path::new("/etc/ipmi-fan-control.toml")).unwrap()
+    }
+
+    /// `sessions_to_open` sorted by session name, because sessions are a map
+    fn sorted_sessions(config: &Config) -> Vec<(String, Vec<u8>)> {
+        let mut sessions = sessions_to_open(config);
+        sessions.sort();
+        sessions
+    }
+
+    #[test]
+    fn each_session_restores_only_its_own_zones() {
+        let config = parse(concat!(
+            "[[zones]]\n",
+            "ipmi_zones = [0]\n",
+            "sources = [{ type = \"ipmi\", sensor = \"CPU Temp\" }]\n",
+            "steps = [{ temp = 40, dcycle = 40 }]\n",
+            "[[zones]]\n",
+            "session = \"bmc\"\n",
+            "fans = [{ type = \"supermicro\", zone = 1 }]\n",
+            "sources = [{ type = \"ipmi\", sensor = \"CPU Temp\" }]\n",
+            "steps = [{ temp = 40, dcycle = 40 }]\n",
+            "[sessions]\n",
+            "bmc = { type = \"remote\", hostname = \"bmc.lan\", username = \"admin\", password = \"secret\" }\n",
+        ));
+
+        assert_eq!(sorted_sessions(&config), [("bmc".to_owned(), vec![1]), ("default".to_owned(), vec![0])]);
+    }
+
+    #[test]
+    fn sample_config_opens_one_session() {
+        let config = parse(include_str!("../config.sample.toml"));
+
+        assert_eq!(sessions_to_open(&config), [("default".to_owned(), vec![0, 1])]);
     }
 }
