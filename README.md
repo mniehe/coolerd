@@ -213,3 +213,33 @@ services.ipmi-fan-control.extraPackages = [(lib.getBin config.hardware.nvidia.pa
 ```
 
 _Note_: The attribute that holds `nvidia-smi` depends on the host's driver package. `config.hardware.nvidia.package` is the driver that `hardware.nvidia` installs; a host that installs the driver another way must name that package instead.
+
+### hwmon fans and hosts without IPMI
+
+Three options serve a host that drives `hwmon` fans:
+
+* `enableIpmi`, default `true`. When it is set, the module loads the `ipmi_devintf`, `ipmi_si` and `ipmi_msghandler` kernel modules, creates the `ipmi` group, adds the service user to it, and adds a udev rule that gives the group the IPMI device. Set it to `false` on a host with no IPMI device. The module still puts freeipmi on the service's `PATH`.
+* `hwmon.kernelModules`, default `[]`. Kernel modules that the host loads at boot, such as `nct6775` for a Nuvoton Super I/O chip.
+* `hwmon.pwmChannels`, default `{}`. The PWM channels the service may write, as a list of channel numbers for each chip name. A chip name must match `[A-Za-z0-9_-]+`.
+
+The kernel makes `pwmN` and `pwmN_enable` writable by root only, and the service runs as the user `ipmi-fan-control`. So before each start of the service, a helper runs as root. For each chip in `hwmon.pwmChannels`, it finds the one `/sys/class/hwmon` entry whose `name` file holds the chip name. It then gives the service group write access to `pwmN` and `pwmN_enable` of each listed channel. It changes no other file. When no entry or more than one entry has the chip name, or a file does not exist, the helper fails and the service does not start. List every channel that a `hwmon` fan in `settings` names; the program cannot take over a channel that is not listed.
+
+The helper gives write access to the service group and not to all users, so that only the service can drive the fans. It runs on each start and not from a udev rule, because a udev rule does not reach a device that is already present. A reload of the hwmon driver makes the files root-only again; restart the service after it.
+
+This desktop has no IPMI device. It reads the CPU temperature from the `k10temp` chip and drives the case fan on channel 2 of the `nct6798` chip:
+
+```nix
+services.ipmi-fan-control = {
+  enable = true;
+  enableIpmi = false;
+  hwmon.kernelModules = ["nct6775"];
+  hwmon.pwmChannels.nct6798 = [2];
+  settings.zones = [
+    {
+      fans = [{ type = "hwmon"; chip = "nct6798"; pwm = 2; }];
+      sources = [{ type = "hwmon"; chip = "k10temp"; input = 1; }];
+      steps = [{ temp = 40; dcycle = 30; } { temp = 80; dcycle = 100; }];
+    }
+  ];
+};
+```
