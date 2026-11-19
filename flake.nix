@@ -66,6 +66,12 @@
             }
           ];
         };
+        # Differs from migrationSettings in a shared key and an extra key, so a
+        # merge of the two cannot equal migrationSettings
+        migrationRival = {
+          log_level = "info";
+          sessions = {};
+        };
 
         # Each host names the packages whose bin directory must be on the unit's PATH
         hosts = {
@@ -132,12 +138,15 @@
             };
             expected = p: [p.freeipmi];
           };
-          # Only old option paths, as a configuration written before the
-          # rename sets them; mkForce on an old path must still apply
+          # Old option paths, as a configuration written before the rename
+          # sets them. The normal-priority new-path definitions compete with
+          # them, so mkForce on an old path must carry over to win.
           migration = {
             nixos = evalModules [
+              {services.coolerd.enable = false;}
+              {services.coolerd.settings = migrationRival;}
               {services.ipmi-fan-control.enable = lib.mkForce true;}
-              {services.ipmi-fan-control.settings = migrationSettings;}
+              {services.ipmi-fan-control.settings = lib.mkForce migrationSettings;}
             ];
             expected = p: [p.freeipmi];
           };
