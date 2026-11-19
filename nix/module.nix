@@ -107,6 +107,18 @@ with lib; let
   accessHelper = pkgs.writeShellScript "coolerd-hwmon-access" cfg.hwmon.accessScript;
 
   validChipName = chip: builtins.match "[A-Za-z0-9_-]+" chip != null;
+
+  # Fails the system build when the package lacks the program that ExecStart
+  # runs, so a switch never stops the running unit for one that cannot start.
+  # The package is an attribute rather than part of the script, so a test can
+  # run the script against another package.
+  packageCheck = pkgs.runCommand "coolerd-package-check" {inherit (cfg) package;} ''
+    if [ ! -x "$package/bin/coolerd" ]; then
+      echo "services.coolerd.package: $package/bin/coolerd does not exist or is not executable; the package must provide bin/coolerd" >&2
+      exit 1
+    fi
+    touch "$out"
+  '';
 in {
   # One alias per option leaf: an alias of the whole subtree breaks
   # lib.mkForce on an old path. hwmon.accessScript is internal and has none.
@@ -129,7 +141,7 @@ in {
       type = types.package;
       default = pkgs.coolerd;
       defaultText = literalExpression "pkgs.coolerd";
-      description = "The coolerd package to use";
+      description = "The coolerd package to use. It must provide bin/coolerd, or the system build fails";
     };
 
     settings = mkOption {
@@ -244,6 +256,8 @@ in {
       + accessGrants;
 
     environment.systemPackages = [cfg.package];
+
+    system.checks = [packageCheck];
 
     # Ensure the IPMI kernel modules are loaded
     boot.kernelModules = optionals cfg.enableIpmi ["ipmi_devintf" "ipmi_si" "ipmi_msghandler"] ++ cfg.hwmon.kernelModules;

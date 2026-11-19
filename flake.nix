@@ -197,6 +197,24 @@
           .hwmon
           .accessScript;
 
+        # A package that ships only the program name from before the rename
+        oldNamePackage = pkgs.runCommand "old-name-package" {} ''
+          mkdir -p $out/bin
+          printf '#!/bin/sh\n' > $out/bin/ipmi-fan-control
+          chmod +x $out/bin/ipmi-fan-control
+        '';
+        # The module's package check of a host, or an empty stand-in when it has none
+        packageCheck = config:
+          lib.findFirst (c: c.name == "coolerd-package-check") {
+            buildCommand = "";
+            package = null;
+          }
+          config.system.checks;
+        # Only the old-name host's package check is read: its system build must fail
+        oldNameCheck = packageCheck (evalHost {services.coolerd.package = oldNamePackage;}).config;
+        defaultCheck = packageCheck hosts.default.nixos.config;
+        checksPackage = check: expected: check.package != null && "${check.package}" == "${expected}";
+
         hasPackage = name: packages: lib.any (p: lib.getName p == name) packages;
         unit = host: host.nixos.config.systemd.services.coolerd;
         unitText = host: host.nixos.config.systemd.units."coolerd.service".text;
@@ -355,7 +373,11 @@
           ++ lib.optional ((pkgs.coolerd.meta.mainProgram or null) != "coolerd")
           "overlay: meta.mainProgram of coolerd is not coolerd"
           ++ lib.optional (self.packages.${system}.ipmi-fan-control.drvPath != self.packages.${system}.default.drvPath)
-          "packages: ipmi-fan-control is not the default package";
+          "packages: ipmi-fan-control is not the default package"
+          ++ lib.optional (!checksPackage defaultCheck pkgs.coolerd)
+          "default: system.checks has no coolerd-package-check of pkgs.coolerd"
+          ++ lib.optional (!checksPackage oldNameCheck oldNamePackage)
+          "old name: system.checks has no coolerd-package-check of the package";
       in {
         formatter = pkgs.alejandra;
 
@@ -367,6 +389,21 @@
               echo "migration: /etc/coolerd.toml does not hold the settings set on the old path" >&2
               exit 1
             fi
+
+            # The default host's check passes once built; the old-name host's
+            # check script, run as its builder would run it, fails
+            ${lib.optionalString (lib.isDerivation defaultCheck) ": ${defaultCheck}"}
+            if package=${oldNamePackage} out="$TMPDIR/old-name-check" \
+              bash -c ${lib.escapeShellArg oldNameCheck.buildCommand} 2> "$TMPDIR/old-name-stderr"; then
+              echo "old name: the package check passed a package without bin/coolerd" >&2
+              exit 1
+            fi
+            for expected in services.coolerd.package ${oldNamePackage}/bin/coolerd; do
+              if ! grep -q -F -- "$expected" "$TMPDIR/old-name-stderr"; then
+                echo "old name: the package check message does not name $expected: $(cat "$TMPDIR/old-name-stderr")" >&2
+                exit 1
+              fi
+            done
             touch $out
           '';
 
