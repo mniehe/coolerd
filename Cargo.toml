@@ -1,6 +1,6 @@
 [package]
 name = "coolerd"
-description = "SuperMicro IPMI fan control daemon"
+description = "Fan control daemon for Linux"
 repository = "https://github.com/chenxiaolong/ipmi-fan-control"
 readme = "README.md"
 license = "GPL-3.0-or-later"
