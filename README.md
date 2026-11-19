@@ -190,6 +190,15 @@ On startup the program switches each board it uses to full fan mode. On exit, al
 
 A `hwmon` fan, `{ type = "hwmon", chip = "nct6798", pwm = 2 }`, is the PWM channel `pwm2` of the chip whose hwmon `name` file holds `nct6798`. `pwm` starts at 1. Two zones cannot drive the same chip and channel, whatever their sessions. On startup the program finds the chip, saves `pwm2_enable`, switches the channel to manual control and sets `pwm2` to 255, full speed. It scales each duty cycle to 0 to 255, rounding up, and writes `pwm2` only when the value changes. On exit, also after an error, it sets `pwm2` to 255 and then writes the saved `pwm2_enable` back, so the firmware or driver takes the fan over again. A saved value of 1 means the channel was already under manual control, and it then stays at 255.
 
+A zone with only `hwmon` fans needs no IPMI device. The program opens an IPMI session only for a zone that has a `supermicro` fan, so an `ipmi` source needs a `supermicro` fan in the same zone, and a config that breaks this rule is rejected. This zone reads a CPU temperature from the `k10temp` chip and drives a case fan on the `nct6798` chip:
+
+```toml
+[[zones]]
+fans = [{ type = "hwmon", chip = "nct6798", pwm = 2 }]
+sources = [{ type = "hwmon", chip = "k10temp", input = 1 }]
+steps = [{ temp = 40, dcycle = 30 }, { temp = 80, dcycle = 100 }]
+```
+
 The program finds the chip by name once, at startup, and keeps the chip's device path. If the chip's driver is unbound and bound again while the program runs, another chip can take that path, and the program then drives that chip. Restart the program after you rebind a hwmon driver.
 
 NixOS

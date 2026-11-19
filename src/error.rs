@@ -128,6 +128,8 @@ pub enum Error {
     },
     #[error("{0}: not taken over")]
     FanNotTaken(String),
+    #[error("IPMI sensors need an IPMI session, and the zone has none")]
+    SensorsWithoutSession,
 }
 
 pub type Result<T, E = Error> = result::Result<T, E>;

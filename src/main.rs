@@ -33,6 +33,7 @@ use {
     curve::{Transition, ZoneState},
     error::{Error, Result},
     fan::{build_fan, FanGuard},
+    freeipmi::SensorReading,
     hwmon::HwmonRoot,
     session::IpmiSession,
     source::{read_zone_sources, ZoneReaders},
@@ -96,7 +97,8 @@ impl MainApp {
 
         for zone_config in &self.config.zones {
             loops.spawn(Self::zone_loop(
-                self.sessions.get_mut(&zone_config.session.0).unwrap().clone(),
+                // Only a zone with a Supermicro fan has an open session
+                self.sessions.get(&zone_config.session.0).cloned(),
                 // Cloned since there's no structured concurrency support yet
                 Arc::new(zone_config.clone()),
             ));
@@ -152,7 +154,7 @@ impl MainApp {
     /// Main loop for a zone. The loop runs forever while the future is being
     /// polled.
     async fn zone_loop(
-        session: Arc<IpmiSession>,
+        session: Option<Arc<IpmiSession>>,
         zone_config: Arc<Zone>,
     ) -> Result<()> {
         // Each Supermicro fan holds an Arc of the session, so this guard
@@ -164,10 +166,10 @@ impl MainApp {
         let hwmon = HwmonRoot::default();
 
         for fan_config in &zone_config.fan_list {
-            fans.add(build_fan(fan_config, Some(&session), &hwmon)?)?;
+            fans.add(build_fan(fan_config, session.as_ref(), &hwmon)?)?;
         }
 
-        info!("[{}] Starting loop for fans {:?}", session.name(), fans.descriptions());
+        info!("[{}] Starting loop for fans {:?}", zone_label(session.as_deref()), fans.descriptions());
 
         let mut state = ZoneState::new(&zone_config);
         let mut readers = ZoneReaders::new(hwmon);
@@ -178,7 +180,7 @@ impl MainApp {
             let f = &mut fans;
 
             task::block_in_place(|| {
-                Self::update_duty_cycle(&session, &zone_config, st, r, f)
+                Self::update_duty_cycle(session.as_deref(), &zone_config, st, r, f)
             })?;
 
             sleep(zone_config.interval.to_duration()).await;
@@ -187,7 +189,7 @@ impl MainApp {
 
     /// Update fan PWM duty cycle from the zone's source readings and curves
     fn update_duty_cycle(
-        session: &IpmiSession,
+        session: Option<&IpmiSession>,
         zone_config: &Zone,
         state: &mut ZoneState,
         readers: &mut ZoneReaders,
@@ -195,19 +197,20 @@ impl MainApp {
     ) -> Result<()> {
         trace!("Querying sources for fans {:?}", fans.descriptions());
 
-        let mut query_ipmi = || session.lock().get_temperature_readings();
+        let label = zone_label(session);
+        let mut query_ipmi = || query_sensors(session);
         let failed_last = state.failed_sources();
         let readings = read_zone_sources(zone_config, &failed_last, &mut query_ipmi,
             &mut |index, source| readers.read(index, source))?;
         let update = state.next_duty(zone_config, &readings);
 
-        Self::log_transitions(session.name(), &fans.descriptions(), zone_config, &update.transitions);
+        Self::log_transitions(label, &fans.descriptions(), zone_config, &update.transitions);
 
         let applied = fans.set_duty(update.duty)?;
 
         for (fan, applied) in fans.descriptions().iter().zip(&applied) {
             debug!("[{}] {}: smoothed_temps={:?}C, curve_temps={:?}C, dcycle_cur={}, dcycle_new={}%, dcycle_sent={}",
-                   session.name(), fan, update.smoothed_temps, update.curve_temps,
+                   label, fan, update.smoothed_temps, update.curve_temps,
                    percent(applied.before), update.duty, percent(applied.sent));
         }
 
@@ -263,6 +266,23 @@ fn sessions_to_open(config: &Config) -> Vec<(String, Vec<u8>)> {
     }
 
     sessions
+}
+
+/// The readings of every IPMI temperature sensor through `session`. A zone
+/// without a session has no sensors to query.
+fn query_sensors(session: Option<&IpmiSession>) -> Result<HashMap<String, Option<SensorReading>>> {
+    match session {
+        Some(session) => session.lock().get_temperature_readings(),
+        None => Err(Error::SensorsWithoutSession),
+    }
+}
+
+/// The tag of a zone's log lines when the zone has no IPMI session
+const NO_SESSION_LABEL: &str = "no session";
+
+/// The tag of a zone's log lines: its session's name, when it has one
+fn zone_label(session: Option<&IpmiSession>) -> &str {
+    session.map_or(NO_SESSION_LABEL, IpmiSession::name)
 }
 
 /// A duty cycle for the debug log, or `-` when there is none
@@ -333,8 +353,11 @@ async fn main() {
 mod tests {
     use {
         std::path::Path,
-        super::sessions_to_open,
-        crate::config::{Config, parse_config},
+        super::{query_sensors, sessions_to_open},
+        crate::{
+            config::{Config, FanConfig, parse_config},
+            error::Error,
+        },
     };
 
     fn parse(contents: &str) -> Config {
@@ -372,5 +395,57 @@ mod tests {
         let config = parse(include_str!("../config.sample.toml"));
 
         assert_eq!(sessions_to_open(&config), [("default".to_owned(), vec![0, 1])]);
+    }
+
+    #[test]
+    fn hwmon_only_config_opens_no_session() {
+        let config = parse(concat!(
+            "[[zones]]\n",
+            "fans = [{ type = \"hwmon\", chip = \"nct6798\", pwm = 2 }]\n",
+            "sources = [{ type = \"hwmon\", chip = \"k10temp\", input = 1 }]\n",
+            "steps = [{ temp = 40, dcycle = 40 }]\n",
+            "[[zones]]\n",
+            "session = \"bmc\"\n",
+            "fans = [{ type = \"hwmon\", chip = \"nct6798\", pwm = 3 }]\n",
+            "sources = [{ type = \"file\", path = \"/sys/temp\" }]\n",
+            "steps = [{ temp = 40, dcycle = 40 }]\n",
+            "[sessions]\n",
+            "bmc = { type = \"remote\", hostname = \"bmc.lan\", username = \"admin\", password = \"secret\" }\n",
+        ));
+
+        assert_eq!(sessions_to_open(&config), []);
+    }
+
+    #[test]
+    fn readme_hwmon_zone_opens_no_session() {
+        let readme = include_str!("../README.md");
+        let block = readme.split("```toml\n")
+            .skip(1)
+            .filter_map(|rest| rest.split_once("```").map(|(block, _)| block))
+            .find(|b| b.contains("type = \"hwmon\"") && !b.contains("supermicro"))
+            .expect("the README has a TOML example of a hwmon zone");
+        let config = parse(block);
+
+        assert_eq!(config.zones[0].fan_list, [FanConfig::Hwmon { chip: "nct6798".into(), pwm: 2 }]);
+        assert_eq!(sessions_to_open(&config), []);
+    }
+
+    #[test]
+    fn session_restores_only_its_supermicro_zones() {
+        let config = parse(concat!(
+            "[[zones]]\n",
+            "fans = [{ type = \"hwmon\", chip = \"nct6798\", pwm = 2 }, { type = \"supermicro\", zone = 1 }]\n",
+            "sources = [{ type = \"ipmi\", sensor = \"CPU Temp\" }]\n",
+            "steps = [{ temp = 40, dcycle = 40 }]\n",
+        ));
+
+        assert_eq!(sessions_to_open(&config), [("default".to_owned(), vec![1])]);
+    }
+
+    #[test]
+    fn sensor_query_without_a_session_fails() {
+        let result = query_sensors(None);
+
+        assert!(matches!(result, Err(Error::SensorsWithoutSession)), "{:?}", result);
     }
 }

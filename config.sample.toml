@@ -34,7 +34,8 @@ hysteresis = 3
 [[zones]]
 # IPMI session. If unspecified, the `default` session is used, which uses the
 # local in-band IPMI device (eg. /dev/ipmi0). Sessions are defined below in the
-# `sessions` section.
+# `sessions` section. A session opens only when a zone on it has a
+# `supermicro` fan, so a config with only `hwmon` fans needs no IPMI device.
 session = "default"
 
 # Fans driven by this logical zone, each set to the zone's duty cycle. A
@@ -42,6 +43,13 @@ session = "default"
 # Each fan may be listed once, and two zones on one session cannot drive the
 # same IPMI zone. Two session names that reach the same board are not
 # detected, so do not drive one board through two sessions.
+#
+# A `hwmon` fan, `{ type = "hwmon", chip = "nct6798", pwm = 2 }`, is the PWM
+# channel `pwm2` of the hwmon chip whose `name` file holds `chip`. `pwm`
+# starts at 1. On startup the program saves `pwm2_enable` and switches the
+# channel to manual control at full speed. On exit it sets the channel to full
+# speed and writes the saved `pwm2_enable` back. Two zones cannot drive the
+# same chip and channel. See the hwmon zone example below.
 fans = [
   { type = "supermicro", zone = 0 },
   { type = "supermicro", zone = 1 },
@@ -80,7 +88,8 @@ interval = 1
 
 # Temperature sources to use for measurement.
 sources = [
-  # IPMI sensor source. The sensor's units must be `degrees C`.
+  # IPMI sensor source. The sensor's units must be `degrees C`. The zone must
+  # have a `supermicro` fan, because only such a zone opens an IPMI session.
   { type = "ipmi", sensor = "CPU Temp" },
 
   # Local file source. File formatting rules:
@@ -269,6 +278,17 @@ steps = [
 #steps = [
 #    { temp = 30, dcycle = 30 },
 #    { temp = 70, dcycle = 70 },
+#]
+
+# A zone with only hwmon fans and sources needs no IPMI device. It cannot
+# read `ipmi` sources: an `ipmi` source needs a `supermicro` fan in the same
+# zone. To list the chip names, run `grep . /sys/class/hwmon/*/name`.
+#[[zones]]
+#fans = [{ type = "hwmon", chip = "nct6798", pwm = 2 }]
+#sources = [{ type = "hwmon", chip = "k10temp", input = 1 }]
+#steps = [
+#    { temp = 40, dcycle = 30 },
+#    { temp = 80, dcycle = 100 },
 #]
 
 # Optional section for defining other IPMI sessions. This is not needed when

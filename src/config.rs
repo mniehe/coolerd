@@ -574,7 +574,19 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
             });
         }
 
+        // Only a zone with a Supermicro fan opens an IPMI session to read
+        // sensors through
+        let has_supermicro_fan = zone_config.fan_list.iter()
+            .any(|fan| matches!(fan, FanConfig::Supermicro { .. }));
+
         for (j, source) in zone_config.sources.iter().enumerate() {
+            if matches!(source.kind, Source::Ipmi { .. }) && !has_supermicro_fan {
+                return Err(Error::ConfigValidation {
+                    path: path.to_owned(),
+                    reason: format!("zones[{}].sources[{}]: an ipmi source needs a supermicro fan in the same zone", i, j),
+                });
+            }
+
             if let OnFailure::Dcycle { dcycle } = source.on_failure {
                 if dcycle > 100 {
                     return Err(Error::ConfigValidation {
@@ -1009,6 +1021,20 @@ mod tests {
     }
 
     #[test]
+    fn sample_hwmon_zone_loads_when_uncommented() {
+        let sample = include_str!("../config.sample.toml");
+        let start = sample.find("#[[zones]]\n#fans = [{ type = \"hwmon\"").expect("the sample has a commented hwmon zone");
+        let end = start + sample[start..].find("\n\n").unwrap_or(sample.len() - start);
+        let block = &sample[start..end];
+        let uncommented: Vec<&str> = block.lines().map(|l| &l[1..]).collect();
+        let config = parse(&sample.replacen(block, &uncommented.join("\n"), 1)).unwrap();
+        let zone = config.zones.last().unwrap();
+
+        assert_eq!(zone.fan_list, [FanConfig::Hwmon { chip: "nct6798".into(), pwm: 2 }]);
+        assert!(matches!(&zone.sources[..], [s] if matches!(&s.kind, Source::Hwmon { chip, input: 1 } if chip == "k10temp")));
+    }
+
+    #[test]
     fn sample_smoothed_source_loads_when_uncommented() {
         let sample = include_str!("../config.sample.toml");
         let line = sample.lines()
@@ -1347,6 +1373,22 @@ mod tests {
             hwmon_zone_toml(None, NCT6798_PWM_2), hwmon_zone_toml(Some("bmc"), NCT6798_PWM_2));
 
         assert_eq!(validation_reason(&contents), "zones[1].fans[0]: already driven by zones[0]");
+    }
+
+    #[test]
+    fn rejects_ipmi_source_in_a_zone_without_a_supermicro_fan() {
+        let sources = r#"[{ type = "file", path = "/sys/temp" }, { type = "ipmi", sensor = "CPU Temp" }]"#;
+        let contents = hwmon_zone_toml(None, NCT6798_PWM_2).replace(r#"[{ type = "file", path = "/sys/temp" }]"#, sources);
+
+        assert_eq!(validation_reason(&contents),
+            "zones[0].sources[1]: an ipmi source needs a supermicro fan in the same zone");
+    }
+
+    #[test]
+    fn accepts_ipmi_source_beside_a_hwmon_fan_and_a_supermicro_fan() {
+        let fans = r#"[{ type = "hwmon", chip = "nct6798", pwm = 2 }, { type = "supermicro", zone = 0 }]"#;
+
+        assert!(parse(&fans_toml(fans)).is_ok());
     }
 
     #[test]
