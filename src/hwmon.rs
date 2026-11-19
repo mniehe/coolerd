@@ -32,7 +32,8 @@ impl HwmonRoot {
     }
 
     /// The directory of the one chip whose `name` file holds `chip`, after
-    /// trimming. An entry without a `name` file is skipped.
+    /// trimming. An entry without a `name` file, or with one longer than
+    /// [`ATTRIBUTE_CAP`], is skipped.
     pub fn resolve(&self, chip: &str) -> Result<PathBuf> {
         let mut matches = Vec::new();
 
@@ -70,20 +71,26 @@ impl HwmonRoot {
 }
 
 /// The trimmed text of the `name` file of `entry`, or `None` when it has none
+/// or it is longer than [`ATTRIBUTE_CAP`]. The kernel sets no limit on a
+/// name, so a long one on an unrelated device must not fail every lookup.
 fn read_name(entry: &Path) -> Result<Option<String>> {
-    let path = entry.join("name");
+    let name = absent_as_none(read_capped(&entry.join("name")))?.flatten();
 
-    match read_attribute(&path) {
-        Ok(name) => Ok(Some(name.trim().to_owned())),
+    Ok(name.map(|name| name.trim().to_owned()))
+}
+
+/// `Ok(None)` in place of an error that says the file does not exist
+fn absent_as_none<T>(result: Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
         Err(Error::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
 }
 
-/// Read a sysfs attribute as text. An attribute longer than
-/// [`ATTRIBUTE_CAP`] is an error, because a prefix of it could parse as a
-/// different value.
-fn read_attribute(path: &Path) -> Result<String> {
+/// Read a sysfs attribute as text, or `None` when it is longer than
+/// [`ATTRIBUTE_CAP`]
+fn read_capped(path: &Path) -> Result<Option<String>> {
     let io_error = |e| Error::Io { path: path.to_owned(), source: e };
     let mut bytes = Vec::new();
 
@@ -94,11 +101,21 @@ fn read_attribute(path: &Path) -> Result<String> {
         .map_err(io_error)?;
 
     if bytes.len() as u64 > ATTRIBUTE_CAP {
-        return Err(io_error(io::Error::new(io::ErrorKind::InvalidData,
-            format!("longer than {} bytes", ATTRIBUTE_CAP))));
+        return Ok(None);
     }
 
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+/// Read a sysfs attribute as text. An attribute longer than
+/// [`ATTRIBUTE_CAP`] is an error, because a prefix of it could parse as a
+/// different value.
+fn read_attribute(path: &Path) -> Result<String> {
+    read_capped(path)?.ok_or_else(|| Error::Io {
+        path: path.to_owned(),
+        source: io::Error::new(io::ErrorKind::InvalidData,
+            format!("longer than {} bytes", ATTRIBUTE_CAP)),
+    })
 }
 
 /// Read a sysfs attribute that holds one decimal integer
@@ -116,11 +133,7 @@ pub(crate) fn read_number(path: &Path) -> Result<i64> {
 /// Read a sysfs attribute that holds one decimal integer, or `None` when the
 /// attribute does not exist
 pub(crate) fn read_optional_number(path: &Path) -> Result<Option<i64>> {
-    match read_number(path) {
-        Ok(value) => Ok(Some(value)),
-        Err(Error::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
+    absent_as_none(read_number(path))
 }
 
 /// Write `value` to a sysfs attribute. A missing attribute is an error and is
@@ -180,6 +193,16 @@ mod tests {
     fn skips_an_entry_without_a_name_file() {
         let dir = tree(&[("hwmon1", "nct6798")]);
         fs::create_dir(dir.0.join("hwmon0")).unwrap();
+
+        assert_eq!(root_of(&dir).resolve("nct6798").unwrap(), dir.0.join("hwmon1"));
+    }
+
+    #[test]
+    fn skips_an_entry_whose_name_is_longer_than_the_cap() {
+        // 80 characters and the line ending make an 81-byte name file
+        let long_name = "x".repeat(80);
+        let dir = tree(&[("hwmon0", &long_name), ("hwmon1", "nct6798")]);
+        assert_eq!(fs::metadata(dir.0.join("hwmon0/name")).unwrap().len(), 81);
 
         assert_eq!(root_of(&dir).resolve("nct6798").unwrap(), dir.0.join("hwmon1"));
     }
