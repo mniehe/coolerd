@@ -48,8 +48,10 @@ session = "default"
 # channel `pwm2` of the hwmon chip whose `name` file holds `chip`. `pwm`
 # starts at 1. On startup the program saves `pwm2_enable` and switches the
 # channel to manual control at full speed. On exit it sets the channel to full
-# speed and writes the saved `pwm2_enable` back when it is 2 or more, an
-# automatic mode; after a saved 0 or 1 the channel stays manual at full speed.
+# speed and writes the saved `pwm2_enable` back when it is 2 or more, a mode
+# the driver defines and on most chips an automatic one. After a saved 0 or 1
+# the channel stays manual at full speed, because the kernel's pwm-fan driver
+# reads 0 as fan off.
 # Two zones cannot drive the same chip and channel. See the hwmon zone example
 # below.
 fans = [
@@ -111,8 +113,8 @@ sources = [
   # degrees. A reading above 255 °C gives 255. A reading below 0 °C fails the
   # source, because an open probe reports a negative value; a real sub-zero
   # temperature then fails the source as well. When the chip has a
-  # `temp<input>_fault` file and it holds a value other than 0, the source
-  # fails. `input` starts at 1.
+  # `temp<input>_fault` file and it holds a value other than 0, or it cannot
+  # be read or parsed, the source fails. `input` starts at 1.
   #
   # The chip is found by name on every read, never by its hwmonN number,
   # which can change between boots. A name that no chip or more than one chip

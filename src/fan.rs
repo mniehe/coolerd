@@ -140,10 +140,11 @@ impl Fan for SupermicroZone {
 /// the kernel's hwmon sysfs interface (Documentation/hwmon/sysfs-interface.rst)
 const PWM_ENABLE_MANUAL: u32 = 1;
 
-/// The lowest `pwm<N>_enable` value that hands a channel to automatic
-/// control. In the generic hwmon ABI 0 means full speed, but the kernel's
-/// pwm-fan driver reads 0 as "fan off", so a saved 0 or 1 is never written
-/// back: the channel stays manual at full speed.
+/// The lowest saved `pwm<N>_enable` value that release writes back. Values
+/// from 2 up are modes the driver defines, automatic on most chips. A saved 0
+/// or 1 is never written back and the channel stays manual at full speed: 1
+/// is manual already, and while the generic hwmon ABI reads 0 as full speed,
+/// the kernel's pwm-fan driver reads it as "fan off".
 const PWM_ENABLE_AUTOMATIC_MIN: u32 = 2;
 
 /// The highest `pwm<N>` value, which is full speed
@@ -244,10 +245,10 @@ impl Fan for HwmonPwm {
         Ok(Applied { before, sent: Some(raw_to_percent(target)) })
     }
 
-    /// Run the channel at full speed while it is still manual, then give a
-    /// saved automatic mode back. Any other saved mode leaves the channel
-    /// manual at full speed (see [`PWM_ENABLE_AUTOMATIC_MIN`]). Both writes
-    /// are tried; the first error is returned and a second one is logged.
+    /// Run the channel at full speed while it is still manual, then write
+    /// back a saved mode of [`PWM_ENABLE_AUTOMATIC_MIN`] or more. A saved 0
+    /// or 1 leaves the channel manual at full speed. Both writes are tried;
+    /// the first error is returned and a second one is logged.
     fn release(&mut self) -> Result<()> {
         let Some(taken) = self.taken.take() else {
             return Ok(());
