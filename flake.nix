@@ -150,6 +150,11 @@
         defaultConfig = hosts.default.nixos.config;
         ipmiModules = ["ipmi_devintf" "ipmi_si" "ipmi_msghandler"];
         hasIpmiModule = kernelModules: lib.any (m: lib.elem m kernelModules) ipmiModules;
+        # Each rule as one whole line, so its GROUP and MODE apply to its KERNEL selector
+        ipmiUdevRules = [
+          "KERNEL==\"ipmi*\", GROUP=\"ipmi\", MODE=\"0660\""
+          "KERNEL==\"ipmidev/*\", GROUP=\"ipmi\", MODE=\"0660\""
+        ];
 
         hwmonConfig = hosts.hwmon.nixos.config;
         accessScript = hwmonConfig.services.ipmi-fan-control.hwmon.accessScript;
@@ -200,8 +205,8 @@
           "default: the ipmi group does not exist"
           ++ lib.optional (!lib.elem "ipmi" defaultConfig.users.users.ipmi-fan-control.extraGroups)
           "default: the service user is not in the ipmi group"
-          ++ lib.optional (!lib.hasInfix "KERNEL==\"ipmi*\"" defaultConfig.services.udev.extraRules)
-          "default: no udev rule gives the ipmi group the IPMI device"
+          ++ lib.optional (!lib.all (rule: lib.elem rule (lib.splitString "\n" defaultConfig.services.udev.extraRules)) ipmiUdevRules)
+          "default: the udev rules do not give the ipmi group mode 0660 on both ipmi* and ipmidev/*"
           ++ lib.optional (execStartPre hosts.default != [])
           "default: the unit has an ExecStartPre"
           ++ lib.optional (!lib.elem "nct6775" hwmonConfig.boot.kernelModules)
