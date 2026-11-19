@@ -72,6 +72,17 @@
           log_level = "info";
           sessions = {};
         };
+        # A value other than the default for every other public leaf except
+        # package, so an old path that sets nothing changes what the host builds
+        migrationLeaves = pkgs: {
+          enableIpmi = false;
+          enableSmartMonTools = true;
+          enableHdparm = true;
+          extraPackages = [pkgs.hello];
+          hwmon.kernelModules = ["nct6775"];
+          hwmon.pwmChannels.nct6798 = [2];
+        };
+        migrationExpectedPath = p: [p.freeipmi p.smartmontools p.hdparm p.hello];
 
         # Each host names the packages whose bin directory must be on the unit's PATH
         hosts = {
@@ -147,8 +158,16 @@
               {services.coolerd.settings = migrationRival;}
               {services.ipmi-fan-control.enable = lib.mkForce true;}
               {services.ipmi-fan-control.settings = lib.mkForce migrationSettings;}
+              ({pkgs, ...}: {services.ipmi-fan-control = migrationLeaves pkgs;})
             ];
-            expected = p: [p.freeipmi];
+            expected = migrationExpectedPath;
+          };
+          # The migration host's values through the new option paths
+          migrationTwin = {
+            nixos = evalHost ({pkgs, ...}: {
+              services.coolerd = migrationLeaves pkgs // {settings = migrationSettings;};
+            });
+            expected = migrationExpectedPath;
           };
         };
 
@@ -217,6 +236,31 @@
           opts);
         defaultOptions = hosts.default.nixos.options.services;
         unaliasedLeaves = lib.filter (leaf: !lib.hasAttrByPath leaf defaultOptions.ipmi-fan-control) (publicLeaves [] defaultOptions.coolerd);
+        # Leaves the migration host leaves unset on the old path, so their
+        # forwarding goes unchecked; package is left out on purpose
+        migrationOldOptions = hosts.migration.nixos.options.services.ipmi-fan-control;
+        unsetOldLeaves =
+          lib.filter (leaf: leaf != ["package"] && !(lib.attrByPath leaf {isDefined = false;} migrationOldOptions).isDefined)
+          (publicLeaves [] defaultOptions.coolerd);
+        # What the options produce on a host, for comparing the old-path and new-path hosts
+        producedBy = host: let
+          config = host.nixos.config;
+          etc = config.environment.etc."coolerd.toml";
+        in {
+          "the unit file" = unitText host;
+          "the service user" = {inherit (config.users.users.coolerd) group extraGroups isSystemUser home;};
+          "users.groups" = lib.attrNames config.users.groups;
+          "the udev rules" = config.services.udev.extraRules;
+          "boot.kernelModules" = config.boot.kernelModules;
+          "/etc/coolerd.toml" = {
+            inherit (etc) mode user group;
+            source = "${etc.source}";
+          };
+        };
+        migrationDifferences = let
+          twin = producedBy hosts.migrationTwin;
+        in
+          lib.attrNames (lib.filterAttrs (name: value: value != twin.${name}) (producedBy hosts.migration));
         # The config file the module would generate from the old-path settings
         migrationExpected = (pkgs.formats.toml {}).generate "coolerd-config.toml" migrationSettings;
         accessScript = hwmonConfig.services.coolerd.hwmon.accessScript;
@@ -295,6 +339,8 @@
           ++ lib.optional (migrationConfig.systemd.services ? ipmi-fan-control || migrationConfig.environment.etc ? "ipmi-fan-control.toml")
           "migration: the unit or config file still has the old name"
           ++ map (leaf: "migration: services.ipmi-fan-control.${lib.concatStringsSep "." leaf} is not an alias") unaliasedLeaves
+          ++ map (leaf: "migration: the host does not set services.ipmi-fan-control.${lib.concatStringsSep "." leaf}") unsetOldLeaves
+          ++ map (name: "migration: ${name} differs from the host that sets the new option paths") migrationDifferences
           ++ lib.optional (pkgs.ipmi-fan-control.drvPath != pkgs.coolerd.drvPath)
           "overlay: ipmi-fan-control is not the coolerd derivation";
       in {
