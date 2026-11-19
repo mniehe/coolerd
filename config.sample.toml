@@ -48,8 +48,10 @@ session = "default"
 # channel `pwm2` of the hwmon chip whose `name` file holds `chip`. `pwm`
 # starts at 1. On startup the program saves `pwm2_enable` and switches the
 # channel to manual control at full speed. On exit it sets the channel to full
-# speed and writes the saved `pwm2_enable` back. Two zones cannot drive the
-# same chip and channel. See the hwmon zone example below.
+# speed and writes the saved `pwm2_enable` back when it is 2 or more, an
+# automatic mode; after a saved 0 or 1 the channel stays manual at full speed.
+# Two zones cannot drive the same chip and channel. See the hwmon zone example
+# below.
 fans = [
   { type = "supermicro", zone = 0 },
   { type = "supermicro", zone = 1 },

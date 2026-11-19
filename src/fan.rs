@@ -140,6 +140,12 @@ impl Fan for SupermicroZone {
 /// the kernel's hwmon sysfs interface (Documentation/hwmon/sysfs-interface.rst)
 const PWM_ENABLE_MANUAL: u32 = 1;
 
+/// The lowest `pwm<N>_enable` value that hands a channel to automatic
+/// control. In the generic hwmon ABI 0 means full speed, but the kernel's
+/// pwm-fan driver reads 0 as "fan off", so a saved 0 or 1 is never written
+/// back: the channel stays manual at full speed.
+const PWM_ENABLE_AUTOMATIC_MIN: u32 = 2;
+
 /// The highest `pwm<N>` value, which is full speed
 const PWM_FULL: u32 = 255;
 
@@ -238,23 +244,30 @@ impl Fan for HwmonPwm {
         Ok(Applied { before, sent: Some(raw_to_percent(target)) })
     }
 
-    /// Run the channel at full speed while it is still manual, then give the
-    /// saved mode back. A saved manual mode would latch the last duty, so the
-    /// channel then stays at full speed. Both writes are tried; the first
-    /// error is returned and a second one is logged.
+    /// Run the channel at full speed while it is still manual, then give a
+    /// saved automatic mode back. Any other saved mode leaves the channel
+    /// manual at full speed (see [`PWM_ENABLE_AUTOMATIC_MIN`]). Both writes
+    /// are tried; the first error is returned and a second one is logged.
     fn release(&mut self) -> Result<()> {
         let Some(taken) = self.taken.take() else {
             return Ok(());
         };
 
-        info!("[{}] Setting pwm{} to {} and restoring pwm{}_enable {}",
-              self.chip, self.pwm, PWM_FULL, self.pwm, taken.saved_enable);
+        let restores = taken.saved_enable >= PWM_ENABLE_AUTOMATIC_MIN;
+
+        if restores {
+            info!("[{}] Setting pwm{} to {} and restoring pwm{}_enable {}",
+                  self.chip, self.pwm, PWM_FULL, self.pwm, taken.saved_enable);
+        } else {
+            info!("[{}] Setting pwm{} to {} and leaving it manual; saved pwm{}_enable {} is not automatic",
+                  self.chip, self.pwm, PWM_FULL, self.pwm, taken.saved_enable);
+        }
 
         let full = write_number(&self.pwm_path(&taken.device), PWM_FULL);
-        let restore = if taken.saved_enable == PWM_ENABLE_MANUAL {
-            Ok(())
-        } else {
+        let restore = if restores {
             write_number(&self.enable_path(&taken.device), taken.saved_enable)
+        } else {
+            Ok(())
         };
 
         match (full, restore) {
@@ -651,6 +664,19 @@ mod tests {
     #[test]
     fn hwmon_release_from_manual_mode_leaves_full_speed() {
         let chip = Nct6798::new("1\n", "90\n");
+        let mut fan = chip.fan();
+        fan.take_control().unwrap();
+        fan.set_duty(20).unwrap();
+
+        fan.release().unwrap();
+
+        assert_eq!(chip.read("pwm2"), "255");
+        assert_eq!(chip.read("pwm2_enable"), "1");
+    }
+
+    #[test]
+    fn hwmon_release_from_mode_0_leaves_manual_full_speed() {
+        let chip = Nct6798::new("0\n", "90\n");
         let mut fan = chip.fan();
         fan.take_control().unwrap();
         fan.set_duty(20).unwrap();
