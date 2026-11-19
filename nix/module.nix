@@ -26,9 +26,10 @@ with lib; let
     ++ cfg.extraPackages;
 
   # The helper grants group write rather than world write, so only the
-  # service user can drive the fans. It runs before every start rather than
-  # from a udev rule, because a udev rule does not reach a device that is
-  # already present when the rule is installed.
+  # service user can drive the fans. It runs before every start, so access is
+  # set whenever the unit starts, whatever the order in which the device
+  # appeared. A failure stops the unit with a message that names the chip or
+  # path, and a restart after a driver reload sets the access again.
   accessPreamble = ''
     set -eu
 

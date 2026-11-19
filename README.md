@@ -222,9 +222,15 @@ Three options serve a host that drives `hwmon` fans:
 * `hwmon.kernelModules`, default `[]`. Kernel modules that the host loads at boot, such as `nct6775` for a Nuvoton Super I/O chip.
 * `hwmon.pwmChannels`, default `{}`. The PWM channels the service may write, as a list of channel numbers for each chip name. A chip name must match `[A-Za-z0-9_-]+`.
 
-The kernel makes `pwmN` and `pwmN_enable` writable by root only, and the service runs as the user `ipmi-fan-control`. So before each start of the service, a helper runs as root. For each chip in `hwmon.pwmChannels`, it finds the one `/sys/class/hwmon` entry whose `name` file holds the chip name. It then gives the service group write access to `pwmN` and `pwmN_enable` of each listed channel. It changes no other file. When no entry or more than one entry has the chip name, or a file does not exist, the helper fails and the service does not start. List every channel that a `hwmon` fan in `settings` names; the program cannot take over a channel that is not listed.
+The kernel makes `pwmN` and `pwmN_enable` writable by root only, and the service runs as the user `ipmi-fan-control`. So before each start of the service, a helper runs as root. For each chip in `hwmon.pwmChannels`, it finds the one `/sys/class/hwmon` entry whose `name` file holds the chip name, after it trims surrounding whitespace. An entry without a `name` file is skipped. The helper checks that `pwmN` and `pwmN_enable` of each listed channel are regular files and not symbolic links. Only when every file of every chip has passed does it give the service group write access to them. It changes no other file. The helper fails and the service does not start when no entry or more than one entry has the chip name, when a `name` file exists but cannot be read, or when a file is missing, is a symbolic link or is not a regular file. List every channel that a `hwmon` fan in `settings` names; the program cannot take over a channel that is not listed.
 
-The helper gives write access to the service group and not to all users, so that only the service can drive the fans. It runs on each start and not from a udev rule, because a udev rule does not reach a device that is already present. A reload of the hwmon driver makes the files root-only again; restart the service after it.
+The helper gives write access to the service group and not to all users, so that only the service can drive the fans. It runs before every start, so the access is set whenever the service starts, whatever the order in which the device appeared. When it fails, the service stops with a message that names the chip or the path.
+
+The access has these limits:
+
+* `pwmN` and `pwmN_enable` must be direct children of the chip's hwmon directory. Neither the program nor the helper looks under `device/`.
+* A grant lasts until the kernel removes the file. When you remove a channel from `hwmon.pwmChannels`, the service group keeps write access to it until a reboot or a reload of the driver.
+* A reload of the hwmon driver removes the grants. The program then exits at its next write to the channel, systemd restarts the service, and the helper sets the access again.
 
 This desktop has no IPMI device. It reads the CPU temperature from the `k10temp` chip and drives the case fan on channel 2 of the `nct6798` chip:
 
