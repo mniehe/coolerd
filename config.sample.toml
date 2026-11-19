@@ -44,13 +44,14 @@ session = "default"
 # detected, so do not drive one board through two sessions.
 fans = [
   { type = "supermicro", zone = 0 },
+  { type = "supermicro", zone = 1 },
 ]
 
 # The older form of `fans`, which lists the IPMI zone numbers of `supermicro`
-# fans. `ipmi_zones = [0]` drives the same fans as `fans` above. A zone sets
+# fans. `ipmi_zones = [0, 1]` drives the same fans as `fans` above. A zone sets
 # either `fans` or `ipmi_zones`, not both. A number repeated in this list is
 # driven once.
-#ipmi_zones = [0]
+#ipmi_zones = [0, 1]
 
 # Number of seconds to wait between fan update interations. If unspecified, the
 # default interval is 1 second.
@@ -243,7 +244,8 @@ steps = [
 # named curve uses the `hysteresis` of its entry in `curves`.
 #hysteresis = 3
 
-# More fan zones can be added. Each drives fans that no other zone drives.
+# More fan zones can be added. Each drives fans that no other zone drives, so
+# to enable this example, remove zone 1 from the first zone's `fans`.
 #[[zones]]
 #fans = [{ type = "supermicro", zone = 1 }]
 #interval = 5

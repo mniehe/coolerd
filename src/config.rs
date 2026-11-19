@@ -882,13 +882,13 @@ mod tests {
         let config = parse(include_str!("../config.sample.toml")).unwrap();
 
         assert_eq!(config.zones.len(), 1);
-        assert_eq!(config.zones[0].fan_list, [FanConfig::Supermicro { zone: 0 }]);
+        assert_eq!(config.zones[0].fan_list, [FanConfig::Supermicro { zone: 0 }, FanConfig::Supermicro { zone: 1 }]);
         assert!(!config.curves.is_empty());
     }
 
     #[test]
     fn sample_ipmi_zones_loads_in_place_of_fans() {
-        const FANS: &str = "fans = [\n  { type = \"supermicro\", zone = 0 },\n]\n";
+        const FANS: &str = "fans = [\n  { type = \"supermicro\", zone = 0 },\n  { type = \"supermicro\", zone = 1 },\n]\n";
         let sample = include_str!("../config.sample.toml");
         let line = sample.lines()
             .find(|l| l.starts_with("#ipmi_zones = "))
@@ -897,19 +897,24 @@ mod tests {
         let edited = sample.replacen(FANS, "", 1).replacen(line, &line[1..], 1);
         let config = parse(&edited).unwrap();
 
-        assert_eq!(config.zones[0].fan_list, [FanConfig::Supermicro { zone: 0 }]);
+        assert_eq!(config.zones[0].fan_list, [FanConfig::Supermicro { zone: 0 }, FanConfig::Supermicro { zone: 1 }]);
     }
 
     #[test]
     fn sample_second_zone_loads_when_uncommented() {
+        const FIRST_ZONE_FAN_1: &str = "  { type = \"supermicro\", zone = 1 },\n";
         let sample = include_str!("../config.sample.toml");
         let start = sample.find("#[[zones]]\n").expect("the sample has a commented second zone");
         let end = start + sample[start..].find("\n\n").unwrap();
         let block = &sample[start..end];
         let uncommented: Vec<&str> = block.lines().map(|l| &l[1..]).collect();
-        let config = parse(&sample.replacen(block, &uncommented.join("\n"), 1)).unwrap();
+        assert!(sample.contains(FIRST_ZONE_FAN_1), "the first zone drives zone 1");
+        // The second zone takes zone 1 over, as the sample's comment says
+        let edited = sample.replacen(FIRST_ZONE_FAN_1, "", 1).replacen(block, &uncommented.join("\n"), 1);
+        let config = parse(&edited).unwrap();
 
         assert_eq!(config.zones.len(), 2);
+        assert_eq!(config.zones[0].fan_list, [FanConfig::Supermicro { zone: 0 }]);
         assert_eq!(config.zones[1].fan_list, [FanConfig::Supermicro { zone: 1 }]);
     }
 
