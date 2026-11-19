@@ -80,15 +80,23 @@ fn read_name(entry: &Path) -> Result<Option<String>> {
     }
 }
 
-/// Read at most [`ATTRIBUTE_CAP`] bytes of a sysfs attribute as text
+/// Read a sysfs attribute as text. An attribute longer than
+/// [`ATTRIBUTE_CAP`] is an error, because a prefix of it could parse as a
+/// different value.
 fn read_attribute(path: &Path) -> Result<String> {
     let io_error = |e| Error::Io { path: path.to_owned(), source: e };
     let mut bytes = Vec::new();
 
+    // One byte past the cap tells a long attribute from one of exactly the cap
     File::open(path).map_err(io_error)?
-        .take(ATTRIBUTE_CAP)
+        .take(ATTRIBUTE_CAP + 1)
         .read_to_end(&mut bytes)
         .map_err(io_error)?;
+
+    if bytes.len() as u64 > ATTRIBUTE_CAP {
+        return Err(io_error(io::Error::new(io::ErrorKind::InvalidData,
+            format!("longer than {} bytes", ATTRIBUTE_CAP))));
+    }
 
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
@@ -122,7 +130,7 @@ pub(crate) fn write_number(path: &Path, value: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use {
-        std::fs,
+        std::{fs, io},
         super::{ATTRIBUTE_CAP, HwmonRoot, read_number, write_number},
         crate::{command::testing::TempDir, error::Error},
     };
@@ -214,14 +222,23 @@ mod tests {
     }
 
     #[test]
-    fn reads_at_most_the_cap() {
+    fn reads_an_attribute_of_exactly_the_cap() {
         let dir = TempDir::new();
-        let path = dir.write("pwm2", &"1".repeat(ATTRIBUTE_CAP as usize + 1));
+        let cap = ATTRIBUTE_CAP as usize;
+        let path = dir.write("pwm2", &format!("{:<width$}\n", 7, width = cap - 1));
 
-        match read_number(&path) {
-            Err(Error::HwmonParse { value, .. }) => assert_eq!(value.len(), ATTRIBUTE_CAP as usize),
-            other => panic!("expected a parse error, got {:?}", other),
-        }
+        assert_eq!(read_number(&path).unwrap(), 7);
+    }
+
+    #[test]
+    fn attribute_longer_than_the_cap_is_an_error() {
+        let dir = TempDir::new();
+        let path = dir.write("pwm2", &format!("0{}bad", " ".repeat(ATTRIBUTE_CAP as usize - 1)));
+
+        let result = read_number(&path);
+
+        assert!(matches!(&result, Err(Error::Io { path: failed, source })
+                if *failed == path && source.kind() == io::ErrorKind::InvalidData), "{:?}", result);
     }
 
     #[test]
