@@ -32,13 +32,20 @@ with lib; let
   accessPreamble = ''
     set -eu
 
+    if [ "$#" -ne 2 ]; then
+      echo "usage: $0 HWMON_ROOT GROUP" >&2
+      exit 2
+    fi
+    hwmon_root="$1"
+    group="$2"
+
     # Set device to the one hwmon directory whose trimmed name is the chip,
     # the rule the daemon uses to find a chip
     find_chip() {
       chip="$1"
       device=""
       count=0
-      for dir in /sys/class/hwmon/*; do
+      for dir in "$hwmon_root"/*; do
         if [ ! -e "$dir/name" ]; then
           continue
         fi
@@ -51,7 +58,7 @@ with lib; let
         fi
       done
       if [ "$count" -ne 1 ]; then
-        echo "hwmon chip $chip: expected one /sys/class/hwmon entry with this name, found $count" >&2
+        echo "hwmon chip $chip: expected one $hwmon_root entry with this name, found $count" >&2
         exit 1
       fi
     }
@@ -61,7 +68,7 @@ with lib; let
         echo "$1 does not exist" >&2
         exit 1
       fi
-      ${pkgs.coreutils}/bin/chgrp ${escapeShellArg serviceGroup} "$1"
+      ${pkgs.coreutils}/bin/chgrp "$group" "$1"
       ${pkgs.coreutils}/bin/chmod g+w "$1"
     }
   '';
@@ -256,7 +263,7 @@ in {
         User = serviceUser;
         Group = serviceGroup;
         # The + prefix runs the helper as root; the daemon keeps its user
-        ExecStartPre = mkIf (cfg.hwmon.pwmChannels != {}) "+${accessHelper}";
+        ExecStartPre = mkIf (cfg.hwmon.pwmChannels != {}) "+${accessHelper} /sys/class/hwmon ${escapeShellArg serviceGroup}";
         ExecStart = "${cfg.package}/bin/ipmi-fan-control --config /etc/ipmi-fan-control.toml";
         Restart = "on-failure";
         RestartSec = "10s";
