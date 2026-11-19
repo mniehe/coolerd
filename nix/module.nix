@@ -24,6 +24,61 @@ with lib; let
     ++ optional cfg.enableSmartMonTools smartmontools
     ++ optional cfg.enableHdparm hdparm
     ++ cfg.extraPackages;
+
+  # The helper grants group write rather than world write, so only the
+  # service user can drive the fans. It runs before every start rather than
+  # from a udev rule, because a udev rule does not reach a device that is
+  # already present when the rule is installed.
+  accessPreamble = ''
+    set -eu
+
+    # Set device to the one hwmon directory whose trimmed name is the chip,
+    # the rule the daemon uses to find a chip
+    find_chip() {
+      chip="$1"
+      device=""
+      count=0
+      for dir in /sys/class/hwmon/*; do
+        if [ ! -e "$dir/name" ]; then
+          continue
+        fi
+        name=""
+        # read fails at the end of a file with no newline but still sets name
+        read -r name < "$dir/name" || true
+        if [ "$name" = "$chip" ]; then
+          device="$dir"
+          count=$((count + 1))
+        fi
+      done
+      if [ "$count" -ne 1 ]; then
+        echo "hwmon chip $chip: expected one /sys/class/hwmon entry with this name, found $count" >&2
+        exit 1
+      fi
+    }
+
+    grant() {
+      if [ ! -e "$1" ]; then
+        echo "$1 does not exist" >&2
+        exit 1
+      fi
+      ${pkgs.coreutils}/bin/chgrp ${escapeShellArg serviceGroup} "$1"
+      ${pkgs.coreutils}/bin/chmod g+w "$1"
+    }
+  '';
+
+  grantChannel = n: ''
+    grant "$device/pwm${toString n}"
+    grant "$device/pwm${toString n}_enable"
+  '';
+  grantChip = chip: channels:
+    ''
+      find_chip ${escapeShellArg chip}
+    ''
+    + concatMapStrings grantChannel channels;
+
+  accessHelper = pkgs.writeShellScript "ipmi-fan-control-hwmon-access" cfg.hwmon.accessScript;
+
+  validChipName = chip: builtins.match "[A-Za-z0-9_-]+" chip != null;
 in {
   options.services.ipmi-fan-control = {
     enable = mkEnableOption "IPMI fan control service";
@@ -102,13 +157,53 @@ in {
       example = literalExpression "[(lib.getBin config.hardware.nvidia.package)]";
       description = "Extra packages to put on the service's PATH, such as the package that provides nvidia-smi";
     };
+
+    enableIpmi = mkOption {
+      type = types.bool;
+      default = true;
+      description = "Load the IPMI kernel modules and give the service access to the IPMI device. Turn it off on a host with no IPMI and only hwmon fans";
+    };
+
+    hwmon = {
+      kernelModules = mkOption {
+        type = types.listOf types.str;
+        default = [];
+        example = ["nct6775"];
+        description = "Kernel modules that provide the hwmon chips the service reads or drives";
+      };
+
+      pwmChannels = mkOption {
+        type = types.attrsOf (types.listOf types.ints.positive);
+        default = {};
+        example = literalExpression "{nct6798 = [2 3];}";
+        description = "PWM channels, by hwmon chip name, that the service may write. Before the service starts, its group gets write access to pwmN and pwmN_enable of each channel. The service fails to start when a chip is absent";
+      };
+
+      accessScript = mkOption {
+        type = types.lines;
+        internal = true;
+        readOnly = true;
+        description = "Text of the root helper that grants the service group write access to the pwmChannels files";
+      };
+    };
   };
 
   config = mkIf cfg.enable {
+    assertions =
+      map (chip: {
+        assertion = validChipName chip;
+        message = "services.ipmi-fan-control.hwmon.pwmChannels: chip name ${builtins.toJSON chip} must match [A-Za-z0-9_-]+";
+      })
+      (attrNames cfg.hwmon.pwmChannels);
+
+    services.ipmi-fan-control.hwmon.accessScript =
+      accessPreamble
+      + concatStrings (mapAttrsToList grantChip (filterAttrs (chip: _: validChipName chip) cfg.hwmon.pwmChannels));
+
     environment.systemPackages = [cfg.package];
 
     # Ensure the IPMI kernel modules are loaded
-    boot.kernelModules = ["ipmi_devintf" "ipmi_si" "ipmi_msghandler"];
+    boot.kernelModules = optionals cfg.enableIpmi ["ipmi_devintf" "ipmi_si" "ipmi_msghandler"] ++ cfg.hwmon.kernelModules;
 
     # Create the necessary groups
     users.groups = {
@@ -116,7 +211,7 @@ in {
       "${serviceGroup}" = {};
 
       # Ensure ipmi group exists
-      "ipmi" = {};
+      "ipmi" = mkIf cfg.enableIpmi {};
 
       # Ensure disk group exists when drive access is needed
       "disk" = mkIf (cfg.enableSmartMonTools || cfg.enableHdparm) {};
@@ -129,15 +224,13 @@ in {
       description = "IPMI Fan Control service user";
       home = "/var/empty";
       extraGroups =
-        [
-          "ipmi"
-        ]
+        optional cfg.enableIpmi "ipmi"
         ++ optional cfg.enableSmartMonTools "disk"
         ++ optional cfg.enableHdparm "disk";
     };
 
     # Set up udev rules to ensure correct permissions for IPMI devices
-    services.udev.extraRules = ''
+    services.udev.extraRules = mkIf cfg.enableIpmi ''
       # Give the ipmi group access to the IPMI device
       KERNEL=="ipmi*", GROUP="ipmi", MODE="0660"
       KERNEL=="ipmidev/*", GROUP="ipmi", MODE="0660"
@@ -162,6 +255,8 @@ in {
         Type = "simple";
         User = serviceUser;
         Group = serviceGroup;
+        # The + prefix runs the helper as root; the daemon keeps its user
+        ExecStartPre = mkIf (cfg.hwmon.pwmChannels != {}) "+${accessHelper}";
         ExecStart = "${cfg.package}/bin/ipmi-fan-control --config /etc/ipmi-fan-control.toml";
         Restart = "on-failure";
         RestartSec = "10s";
