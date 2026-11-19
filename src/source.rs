@@ -1253,6 +1253,13 @@ mod tests {
     }
 
     #[test]
+    fn hwmon_source_fails_when_its_fault_file_does_not_parse() {
+        let reading = k10temp_reading_with_fault("garbage\n");
+
+        assert!(matches!(&reading, Err(Error::HwmonParse { path, .. }) if path.ends_with("hwmon3/temp1_fault")), "{:?}", reading);
+    }
+
+    #[test]
     fn hwmon_source_reads_when_its_input_reports_no_fault() {
         assert_eq!(k10temp_reading_with_fault("0\n").unwrap(), 46);
     }
