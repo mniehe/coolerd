@@ -28,8 +28,11 @@ with lib; let
   # The helper grants group write rather than world write, so only the
   # service user can drive the fans. It runs before every start, so access is
   # set whenever the unit starts, whatever the order in which the device
-  # appeared. A failure stops the unit with a message that names the chip or
-  # path, and a restart after a driver reload sets the access again.
+  # appeared. Every check runs before the first grant, so a failed check stops
+  # the unit with a message that names the chip or path and grants nothing. An
+  # error from chgrp or chmod while granting also stops the unit, but can leave
+  # some of the listed files already granted. A driver reload removes the
+  # access, so the service must be restarted after one.
   accessPreamble = ''
     set -eu
 
