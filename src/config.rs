@@ -611,10 +611,10 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
             }
 
             if let Source::Hwmon { chip, .. } = &source.kind {
-                if chip.is_empty() {
+                if let Some(reason) = chip_error(chip) {
                     return Err(Error::ConfigValidation {
                         path: path.to_owned(),
-                        reason: format!("zones[{}].sources[{}].chip: must not be empty", i, j),
+                        reason: format!("zones[{}].sources[{}].chip: {}", i, j, reason),
                     });
                 }
             }
@@ -754,8 +754,8 @@ fn listed_fans(fans: &[FanConfig], i: usize) -> Result<Vec<(String, FanConfig)>,
         }
 
         if let FanConfig::Hwmon { chip, .. } = fan {
-            if chip.is_empty() {
-                return Err(format!("zones[{}].fans[{}].chip: must not be empty", i, k));
+            if let Some(reason) = chip_error(chip) {
+                return Err(format!("zones[{}].fans[{}].chip: {}", i, k, reason));
             }
         }
     }
@@ -763,6 +763,20 @@ fn listed_fans(fans: &[FanConfig], i: usize) -> Result<Vec<(String, FanConfig)>,
     Ok(fans.iter().enumerate()
         .map(|(k, fan)| (format!("zones[{}].fans[{}]", i, k), fan.clone()))
         .collect())
+}
+
+/// Why `chip` can never equal a hwmon `name` file, which is compared after
+/// trimming, or `None` when it can
+fn chip_error(chip: &str) -> Option<&'static str> {
+    if chip.trim().is_empty() {
+        return Some("must not be empty");
+    }
+
+    if chip.trim() != chip {
+        return Some("must not have surrounding whitespace");
+    }
+
+    None
 }
 
 /// Check that no fan is driven by two zones, which would fight over its duty.
@@ -1380,6 +1394,14 @@ mod tests {
         let fans = r#"[{ type = "hwmon", chip = "nct6798", pwm = 1 }, { type = "hwmon", chip = "", pwm = 2 }]"#;
 
         assert_eq!(validation_reason(&hwmon_zone_toml(None, fans)), "zones[0].fans[1].chip: must not be empty");
+    }
+
+    #[test]
+    fn rejects_hwmon_fan_chip_with_surrounding_whitespace() {
+        let fans = r#"[{ type = "hwmon", chip = "nct6798", pwm = 1 }, { type = "hwmon", chip = " k10temp", pwm = 2 }]"#;
+
+        assert_eq!(validation_reason(&hwmon_zone_toml(None, fans)),
+            "zones[0].fans[1].chip: must not have surrounding whitespace");
     }
 
     #[test]
@@ -2139,6 +2161,14 @@ mod tests {
 
         assert_eq!(validation_reason(&zone_toml(&[("sources", sources)])),
             "zones[0].sources[1].chip: must not be empty");
+    }
+
+    #[test]
+    fn rejects_hwmon_source_chip_with_surrounding_whitespace() {
+        let sources = r#"[{ type = "ipmi", sensor = "CPU Temp" }, { type = "hwmon", chip = " k10temp", input = 1 }]"#;
+
+        assert_eq!(validation_reason(&zone_toml(&[("sources", sources)])),
+            "zones[0].sources[1].chip: must not have surrounding whitespace");
     }
 
     /// Build a zone whose second source is an nvidia source with `gpu`
