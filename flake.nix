@@ -102,6 +102,17 @@
           };
         };
 
+        # A host whose chip name the module must reject. Only its assertions are
+        # read: its toplevel and unit would fail or drop the chip.
+        badChipConfig =
+          (evalHost {
+            services.ipmi-fan-control.hwmon.pwmChannels."nct*" = [2];
+          })
+          .config;
+        rejectsBadChip =
+          lib.any (a: !a.assertion && lib.hasInfix "services.ipmi-fan-control.hwmon.pwmChannels" a.message)
+          badChipConfig.assertions;
+
         hasPackage = name: packages: lib.any (p: lib.getName p == name) packages;
         unit = host: host.nixos.config.systemd.services.ipmi-fan-control;
         unitText = host: host.nixos.config.systemd.units."ipmi-fan-control.service".text;
@@ -178,7 +189,9 @@
           ++ lib.optional (!lib.any (runsAccessHelper hosts.hwmon) (execStartPre hosts.hwmon))
           "hwmon: ExecStartPre does not run the access helper with the + prefix on /sys/class/hwmon and the service group"
           ++ lib.optional (lib.hasInfix "KERNEL==\"ipmi" hwmonConfig.services.udev.extraRules || lib.elem "ipmi" hwmonConfig.users.users.ipmi-fan-control.extraGroups || hwmonConfig.users.groups ? ipmi || hasIpmiModule hwmonConfig.boot.kernelModules)
-          "hwmon: an IPMI udev rule, ipmi group or IPMI kernel module is present with enableIpmi = false";
+          "hwmon: an IPMI udev rule, ipmi group or IPMI kernel module is present with enableIpmi = false"
+          ++ lib.optional (!rejectsBadChip)
+          "bad chip: no failed assertion names services.ipmi-fan-control.hwmon.pwmChannels for the chip nct*";
       in {
         formatter = pkgs.alejandra;
 
