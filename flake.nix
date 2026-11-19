@@ -290,6 +290,13 @@
         accessHelper = pkgs.writeShellScript "hwmon-access-helper" accessScript;
         twoChipHelper = pkgs.writeShellScript "hwmon-access-helper-two-chips" twoChipScript;
 
+        configFileAccess = host: {inherit (host.nixos.config.environment.etc."coolerd.toml") user group mode;};
+        serviceOnlyAccess = {
+          user = "coolerd";
+          group = "coolerd";
+          mode = "0600";
+        };
+
         hostFailures = name: host:
           map (p: "${name}: ${lib.getName p} is not on the effective unit PATH") (missingFromPath host)
           ++ lib.optional (envSetsPath host)
@@ -301,7 +308,9 @@
           ++ lib.optional (!lib.hasSuffix "/bin/coolerd --config /etc/coolerd.toml" (unit host).serviceConfig.ExecStart)
           "${name}: ExecStart does not run bin/coolerd with /etc/coolerd.toml"
           ++ lib.optional (!(host.nixos.config.environment.etc ? "coolerd.toml"))
-          "${name}: /etc/coolerd.toml is not defined";
+          "${name}: /etc/coolerd.toml is not defined"
+          ++ lib.optional (configFileAccess host != serviceOnlyAccess)
+          "${name}: /etc/coolerd.toml is not owned by coolerd:coolerd with mode 0600";
 
         moduleFailures =
           lib.concatLists (lib.mapAttrsToList hostFailures hosts)
@@ -342,7 +351,11 @@
           ++ map (leaf: "migration: the host does not set services.ipmi-fan-control.${lib.concatStringsSep "." leaf}") unsetOldLeaves
           ++ map (name: "migration: ${name} differs from the host that sets the new option paths") migrationDifferences
           ++ lib.optional (pkgs.ipmi-fan-control.drvPath != pkgs.coolerd.drvPath)
-          "overlay: ipmi-fan-control is not the coolerd derivation";
+          "overlay: ipmi-fan-control is not the coolerd derivation"
+          ++ lib.optional ((pkgs.coolerd.meta.mainProgram or null) != "coolerd")
+          "overlay: meta.mainProgram of coolerd is not coolerd"
+          ++ lib.optional (self.packages.${system}.ipmi-fan-control.drvPath != self.packages.${system}.default.drvPath)
+          "packages: ipmi-fan-control is not the default package";
       in {
         formatter = pkgs.alejandra;
 
