@@ -57,6 +57,49 @@
             });
             expected = p: [p.freeipmi p.smartmontools p.hdparm p.hello];
           };
+          hwmon = {
+            nixos = evalHost {
+              services.ipmi-fan-control = {
+                enableIpmi = false;
+                hwmon.kernelModules = ["nct6775"];
+                hwmon.pwmChannels.nct6798 = [2 12];
+                settings.zones = [
+                  {
+                    fans = [
+                      {
+                        type = "hwmon";
+                        chip = "nct6798";
+                        pwm = 2;
+                      }
+                      {
+                        type = "hwmon";
+                        chip = "nct6798";
+                        pwm = 12;
+                      }
+                    ];
+                    sources = [
+                      {
+                        type = "hwmon";
+                        chip = "k10temp";
+                        input = 1;
+                      }
+                    ];
+                    steps = [
+                      {
+                        temp = 40;
+                        dcycle = 30;
+                      }
+                      {
+                        temp = 80;
+                        dcycle = 100;
+                      }
+                    ];
+                  }
+                ];
+              };
+            };
+            expected = p: [p.freeipmi];
+          };
         };
 
         hasPackage = name: packages: lib.any (p: lib.getName p == name) packages;
@@ -78,6 +121,16 @@
           lib.filter (p: !lib.elem (lib.makeBinPath [p]) (effectivePath host))
           (host.expected host.nixos.pkgs);
 
+        hwmonConfig = hosts.hwmon.nixos.config;
+        accessScript = hwmonConfig.services.ipmi-fan-control.hwmon.accessScript;
+        # The file each grant line of the access helper names, in order
+        grantedFiles = lib.concatMap (line: let
+          m = builtins.match "[[:space:]]*grant \"\\$device/(pwm[0-9]+(_enable)?)\"" line;
+        in
+          lib.optional (m != null) (lib.head m))
+        (lib.splitString "\n" accessScript);
+        execStartPre = host: lib.toList ((unit host).serviceConfig.ExecStartPre or []);
+
         hostFailures = name: host:
           map (p: "${name}: ${lib.getName p} is not on the effective unit PATH") (missingFromPath host)
           ++ lib.optional (envSetsPath host)
@@ -92,7 +145,15 @@
           ++ lib.optional (!hasPackage "freeipmi" (unit hosts.default).path)
           "default: freeipmi is not in the unit path"
           ++ lib.optional (hosts.default.nixos.config.services.ipmi-fan-control.extraPackages != [])
-          "default: extraPackages is not empty";
+          "default: extraPackages is not empty"
+          ++ lib.optional (!lib.elem "nct6775" hwmonConfig.boot.kernelModules)
+          "hwmon: boot.kernelModules does not contain nct6775"
+          ++ lib.optional (!lib.hasInfix "find_chip ${lib.escapeShellArg "nct6798"}\n" accessScript || grantedFiles != ["pwm2" "pwm2_enable" "pwm12" "pwm12_enable"])
+          "hwmon: the access helper does not grant exactly pwm2, pwm2_enable, pwm12 and pwm12_enable of nct6798"
+          ++ lib.optional (!lib.any (c: lib.hasPrefix "+" c && lib.hasSuffix "-ipmi-fan-control-hwmon-access" c) (execStartPre hosts.hwmon))
+          "hwmon: ExecStartPre does not run the access helper with the + prefix"
+          ++ lib.optional (lib.hasInfix "KERNEL==\"ipmi" hwmonConfig.services.udev.extraRules || lib.elem "ipmi" hwmonConfig.users.users.ipmi-fan-control.extraGroups || hwmonConfig.users.groups ? ipmi || lib.elem "ipmi_si" hwmonConfig.boot.kernelModules)
+          "hwmon: an IPMI udev rule, ipmi group or ipmi_si kernel module is present with enableIpmi = false";
       in {
         formatter = pkgs.alejandra;
 
