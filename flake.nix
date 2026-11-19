@@ -327,6 +327,19 @@
             expect_unchanged "$root"
             end_case
 
+            start_case g
+            if [ "$(id -u)" -eq 0 ]; then
+              echo "case g: skipped, the build runs as root and can read a mode 000 file" >&2
+            else
+              make_chip "$root/hwmon0" 'nct6798\n'
+              make_chip "$root/hwmon1" 'k10temp\n'
+              chmod 000 "$root/hwmon1/name"
+              run_helper "$root" "$group"
+              expect_failure
+              expect_unchanged "$root"
+              end_case
+            fi
+
             start_case h
             make_chip "$root/hwmon0" 'nct6798'
             make_chip "$root/hwmon1" 'k10temp\n'
@@ -339,6 +352,13 @@
             make_chip "$root/hwmon0" ' \tnct6798\t \n'
             make_chip "$root/hwmon1" 'k10temp\n'
             expect_grants
+            end_case
+
+            start_case j-multi-line-name
+            make_chip "$root/hwmon0" 'nct6798\nnct6798\n'
+            run_helper "$root" "$group"
+            expect_failure
+            expect_unchanged "$root"
             end_case
 
             start_case u-usage

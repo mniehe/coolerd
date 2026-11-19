@@ -51,9 +51,14 @@ with lib; let
         if [ ! -e "$dir/name" ]; then
           continue
         fi
-        name=""
-        # read fails at the end of a file with no newline but still sets name
-        read -r name < "$dir/name" || true
+        if ! name="$(${pkgs.coreutils}/bin/cat -- "$dir/name")"; then
+          echo "$dir/name: cannot read the hwmon chip name" >&2
+          exit 1
+        fi
+        # Trim surrounding whitespace, as the daemon does; a name of more
+        # than one line keeps its inner newline and matches no chip
+        name="''${name#"''${name%%[![:space:]]*}"}"
+        name="''${name%"''${name##*[![:space:]]}"}"
         if [ "$name" = "$chip" ]; then
           device="$dir"
           count=$((count + 1))
