@@ -106,8 +106,9 @@ sources = [
 
   # hwmon source. This reads `temp<input>_input` of the hwmon chip whose
   # `name` file holds `chip`, in milli-degrees Celsius, and rounds up to whole
-  # degrees. A reading below 0 °C gives 0 and one above 255 °C gives 255.
-  # `input` starts at 1.
+  # degrees. A reading above 255 °C gives 255. A reading below 0 °C fails the
+  # source, because an open probe reports a negative value; a real sub-zero
+  # temperature then fails the source as well. `input` starts at 1.
   #
   # The chip is found by name on every read, never by its hwmonN number,
   # which can change between boots. A name that no chip or more than one chip

@@ -281,17 +281,23 @@ fn double_to_temp(value: f64) -> Option<u8> {
 }
 
 /// Convert a hwmon temperature in millidegrees Celsius to whole degrees,
-/// rounding up and clamping to the range of a reading
-fn millidegrees_to_celsius(raw: i64) -> u8 {
+/// rounding up and clamping above to the range of a reading. Returns `None`
+/// for a negative value, because an open probe reports a negative sentinel
+/// that would otherwise pass as a cool reading.
+fn millidegrees_to_celsius(raw: i64) -> Option<u8> {
     const MILLIDEGREES_PER_DEGREE: i64 = 1000;
+
+    if raw < 0 {
+        return None;
+    }
 
     let degrees = raw
         .saturating_add(MILLIDEGREES_PER_DEGREE - 1)
         .div_euclid(MILLIDEGREES_PER_DEGREE)
-        .clamp(0, u8::MAX.into());
+        .min(u8::MAX.into());
 
-    // The clamp leaves a value that fits
-    u8::try_from(degrees).unwrap_or(u8::MAX)
+    // The bounds leave a value that fits
+    Some(u8::try_from(degrees).unwrap_or(u8::MAX))
 }
 
 /// Read input `input` of the hwmon chip named `chip`. The chip is found again
@@ -299,7 +305,7 @@ fn millidegrees_to_celsius(raw: i64) -> u8 {
 fn read_hwmon_source(root: &HwmonRoot, chip: &str, input: u8) -> Result<u8> {
     let path = root.resolve(chip)?.join(format!("temp{}_input", input));
 
-    Ok(millidegrees_to_celsius(read_number(&path)?))
+    millidegrees_to_celsius(read_number(&path)?).ok_or(Error::ReadingExceedsBounds)
 }
 
 /// The readers of one zone's sources. Each source that runs a program has
@@ -1176,17 +1182,19 @@ mod tests {
 
     #[test]
     fn millidegrees_round_up_to_whole_degrees() {
-        assert_eq!(millidegrees_to_celsius(45500), 46);
-        assert_eq!(millidegrees_to_celsius(45001), 46);
-        assert_eq!(millidegrees_to_celsius(45000), 45);
+        assert_eq!(millidegrees_to_celsius(45500), Some(46));
+        assert_eq!(millidegrees_to_celsius(45001), Some(46));
+        assert_eq!(millidegrees_to_celsius(45000), Some(45));
+        assert_eq!(millidegrees_to_celsius(0), Some(0));
     }
 
     #[test]
-    fn millidegrees_clamp_to_a_reading() {
-        assert_eq!(millidegrees_to_celsius(-1000), 0);
-        assert_eq!(millidegrees_to_celsius(300000), 255);
-        assert_eq!(millidegrees_to_celsius(i64::MAX), 255);
-        assert_eq!(millidegrees_to_celsius(i64::MIN), 0);
+    fn millidegrees_clamp_above_and_reject_below_zero() {
+        assert_eq!(millidegrees_to_celsius(300000), Some(255));
+        assert_eq!(millidegrees_to_celsius(i64::MAX), Some(255));
+        assert_eq!(millidegrees_to_celsius(-1), None);
+        assert_eq!(millidegrees_to_celsius(-1000), None);
+        assert_eq!(millidegrees_to_celsius(i64::MIN), None);
     }
 
     /// A hwmon tree with chip `k10temp` at `hwmon3`, whose `temp1_input`
@@ -1218,6 +1226,17 @@ mod tests {
         let reading = readers.read(0, &Source::Hwmon { chip: "k10temp".into(), input: 2 });
 
         assert!(matches!(&reading, Err(Error::Io { path, .. }) if path.ends_with("hwmon3/temp2_input")), "{:?}", reading);
+    }
+
+    #[test]
+    fn hwmon_source_fails_for_a_negative_reading() {
+        // An open thermistor on nct67xx chips reads -128 °C
+        let dir = k10temp_tree("-128000\n");
+        let mut readers = ZoneReaders::new(HwmonRoot::new(dir.0.clone()));
+
+        let reading = readers.read(0, &Source::Hwmon { chip: "k10temp".into(), input: 1 });
+
+        assert!(matches!(&reading, Err(Error::ReadingExceedsBounds)), "{:?}", reading);
     }
 
     #[test]
