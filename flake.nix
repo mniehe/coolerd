@@ -123,9 +123,9 @@
 
         hwmonConfig = hosts.hwmon.nixos.config;
         accessScript = hwmonConfig.services.ipmi-fan-control.hwmon.accessScript;
-        # The file each grant line of the access helper names, in order
+        # The file each add_target line of the access helper names, in order
         grantedFiles = lib.concatMap (line: let
-          m = builtins.match "[[:space:]]*grant \"\\$device/(pwm[0-9]+(_enable)?)\"" line;
+          m = builtins.match "[[:space:]]*add_target \"\\$device/(pwm[0-9]+(_enable)?)\"" line;
         in
           lib.optional (m != null) (lib.head m))
         (lib.splitString "\n" accessScript);
@@ -294,6 +294,37 @@
             start_case c-empty
             run_helper "$root" "$group"
             expect_failure
+            end_case
+
+            start_case d
+            make_chip "$root/hwmon0" 'nct6798\n'
+            rm "$root/hwmon0/pwm12_enable"
+            run_helper "$root" "$group"
+            expect_failure
+            expect_mode "$root/hwmon0/pwm2" 644
+            expect_unchanged "$root"
+            end_case
+
+            start_case e
+            make_chip "$root/hwmon0" 'nct6798\n'
+            echo 0 > "$TMPDIR/e-outside"
+            chmod 644 "$TMPDIR/e-outside"
+            rm "$root/hwmon0/pwm2"
+            ln -s "$TMPDIR/e-outside" "$root/hwmon0/pwm2"
+            run_helper "$root" "$group"
+            expect_failure
+            expect_mode "$TMPDIR/e-outside" 644
+            expect_unchanged "$root"
+            end_case
+
+            start_case f
+            make_chip "$root/hwmon0" 'nct6798\n'
+            rm "$root/hwmon0/pwm2"
+            mkdir -m 755 "$root/hwmon0/pwm2"
+            run_helper "$root" "$group"
+            expect_failure
+            expect_mode "$root/hwmon0/pwm2" 755
+            expect_unchanged "$root"
             end_case
 
             start_case h

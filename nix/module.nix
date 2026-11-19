@@ -38,6 +38,8 @@ with lib; let
     fi
     hwmon_root="$1"
     group="$2"
+    # Every file to grant; none is granted until all of them have passed
+    targets=()
 
     # Set device to the one hwmon directory whose trimmed name is the chip,
     # the rule the daemon uses to find a chip
@@ -63,25 +65,35 @@ with lib; let
       fi
     }
 
-    grant() {
-      if [ ! -e "$1" ]; then
-        echo "$1 does not exist" >&2
+    add_target() {
+      if [ -L "$1" ]; then
+        echo "$1: is a symbolic link, not a regular file" >&2
         exit 1
       fi
-      ${pkgs.coreutils}/bin/chgrp "$group" "$1"
-      ${pkgs.coreutils}/bin/chmod g+w "$1"
+      if [ ! -f "$1" ]; then
+        echo "$1: does not exist or is not a regular file" >&2
+        exit 1
+      fi
+      targets+=("$1")
     }
   '';
 
   grantChannel = n: ''
-    grant "$device/pwm${toString n}"
-    grant "$device/pwm${toString n}_enable"
+    add_target "$device/pwm${toString n}"
+    add_target "$device/pwm${toString n}_enable"
   '';
   grantChip = chip: channels:
     ''
       find_chip ${escapeShellArg chip}
     ''
     + concatMapStrings grantChannel channels;
+
+  accessGrants = ''
+    for target in "''${targets[@]}"; do
+      ${pkgs.coreutils}/bin/chgrp -- "$group" "$target"
+      ${pkgs.coreutils}/bin/chmod g+w -- "$target"
+    done
+  '';
 
   accessHelper = pkgs.writeShellScript "ipmi-fan-control-hwmon-access" cfg.hwmon.accessScript;
 
@@ -205,7 +217,8 @@ in {
 
     services.ipmi-fan-control.hwmon.accessScript =
       accessPreamble
-      + concatStrings (mapAttrsToList grantChip (filterAttrs (chip: _: validChipName chip) cfg.hwmon.pwmChannels));
+      + concatStrings (mapAttrsToList grantChip (filterAttrs (chip: _: validChipName chip) cfg.hwmon.pwmChannels))
+      + accessGrants;
 
     environment.systemPackages = [cfg.package];
 
