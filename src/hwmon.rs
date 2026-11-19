@@ -159,6 +159,14 @@ mod tests {
     }
 
     #[test]
+    fn skips_an_entry_without_a_name_file() {
+        let dir = tree(&[("hwmon1", "nct6798")]);
+        fs::create_dir(dir.0.join("hwmon0")).unwrap();
+
+        assert_eq!(root_of(&dir).resolve("nct6798").unwrap(), dir.0.join("hwmon1"));
+    }
+
+    #[test]
     fn two_chips_of_one_name_fail_with_both_paths() {
         let dir = tree(&[("hwmon0", "nvme"), ("hwmon1", "nct6798"), ("hwmon2", "nvme")]);
 
