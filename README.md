@@ -1,20 +1,27 @@
-ipmi-fan-control
-================
+coolerd
+=======
 
-ipmi-fan-control is a program written in Rust to control the fans on Supermicro motherboards based on the readings of temperature sensors.
+coolerd is a Linux fan control daemon. It reads temperatures from sources, maps them through curves that sources and zones can share, and drives fans through backends. The sources are IPMI sensors, files, hwmon chips, `smartctl`, `hdparm` and `nvidia-smi`. The fan backends are Supermicro boards over IPMI and hwmon PWM channels.
 
-_Note_: This has primarily been tested on a 6028U-TR4T+, which uses the X10DRU-i+ motherboard. Also, only Linux and other Unix-like operating systems are currently supported.
+_Note_: Only Linux is supported.
 
-**2022-11-04 Update**: This project is no longer in active development because I no longer have a Supermicro motherboard that requires more granular fan control. However, the project is feature complete and I will continue to do maintenance work, like updating dependencies and creating binary repos for new Linux distro releases. The underlying fan control IPMI commands have not changed across 5 generations of motherboards. It's unlikely that ipmi-fan-control will stop working on any currently supported motherboards.
+Origin
+------
 
-**2024-04-14 Update**: I am archiving this repo and no longer plan to keep the binary repos up to date for new distro releases. Folks who want to continue using this project should build it from source. As mentioned in the previous update, this project is feature complete and is unlikely to suddenly stop working.
+coolerd is a fork of [chenxiaolong/ipmi-fan-control](https://github.com/chenxiaolong/ipmi-fan-control), which Andrew Gunnerson wrote and has since archived. The Supermicro IPMI backend, which sets the fan duty cycle with Supermicro OEM raw commands through libfreeipmi, is that project's work. coolerd keeps its licence, the GNU GPL version 3 or later, and the `authors` field of `Cargo.toml` still names Andrew Gunnerson.
+
+The upstream project was tested mainly on a 6028U-TR4T+, which uses the X10DRU-i+ motherboard. Its author reported that the fan control IPMI commands did not change across five generations of Supermicro motherboards.
 
 Installation
 ------------
 
-Prebuilt packages for Arch Linux, CentOS, Fedora, openSUSE, Debian, and Ubuntu are available from [OBS](https://build.opensuse.org/package/show/home:chenxiaolong:ipmi-fan-control/ipmi-fan-control). Please follow the instructions at [the repo's landing page](https://software.opensuse.org//download.html?project=home%3Achenxiaolong%3Aipmi-fan-control&package=ipmi-fan-control).
+coolerd has no prebuilt packages. This repository is a Nix flake. Its `packages.default` output builds the program:
 
-For other Unix-like systems, follow the instructions in the next section to build from source. Windows is currently not supported.
+```sh
+nix build .#default
+```
+
+The program is then `result/bin/coolerd`. To run it as a service on NixOS, add this repository as a flake input and use the module described under [NixOS](#nixos). On another system, build it from source as the next section describes.
 
 Building
 --------
@@ -54,31 +61,16 @@ or to make a release build, run:
 cargo build --release
 ```
 
-To build Linux distro-specific packages, first build the corresponding source package:
-
-```sh
-# SRPM for RPM-based distros
-./dist/build_source_package.py -t srpm
-# PKGBUILD for Arch Linux
-./dist/build_source_package.py -t pkgbuild
-# dsc for Debian-based distros
-./dist/build_source_package.py -t debian
-```
-
-and then use the distro's standard utilities for building the binary packages. The source packages will be placed in `dist/output/`.
-
 Running
 -------
 
-If ipmi-fan-control was installed from a package, update `/etc/ipmi-fan-control.toml` to match the desired configuration and then enable and start the `ipmi-fan-control` systemd service.
-
-If built from source, make a copy of [`config.sample.toml`](config.sample.toml) and update the values to match your server's configuration. Then, run `ipmi-fan-control` with:
+Make a copy of [`config.sample.toml`](config.sample.toml) and update the values to match your hardware. Then, run `coolerd` with:
 
 ```sh
 # Debug
-sudo ./target/debug/ipmi-fan-control --config config.toml
+sudo ./target/debug/coolerd --config config.toml
 # Release
-sudo ./target/release/ipmi-fan-control --config config.toml
+sudo ./target/release/coolerd --config config.toml
 ```
 
 Fan curves
@@ -204,12 +196,20 @@ The program finds the chip by name once, at startup, and keeps the chip's device
 NixOS
 -----
 
-This flake provides a NixOS module, `nixosModules.default`, and an overlay, `overlays.default`, that adds the package. The module's options live under `services.ipmi-fan-control`. The module puts freeipmi on the service's `PATH`, plus smartmontools and hdparm when `enableSmartMonTools` and `enableHdparm` are set.
+This flake provides a NixOS module, `nixosModules.default`, and an overlay, `overlays.default`, that adds the package. The module's options live under `services.coolerd`. The module uses the package from the overlay, so a host adds both:
+
+```nix
+nixpkgs.overlays = [coolerd.overlays.default];
+imports = [coolerd.nixosModules.default];
+services.coolerd.enable = true;
+```
+
+Here `coolerd` is this repository's flake input. The module puts freeipmi on the service's `PATH`, plus smartmontools and hdparm when `enableSmartMonTools` and `enableHdparm` are set.
 
 A source that runs another program needs that program on the service's `PATH`. Add its package to `extraPackages`. For example, to make `nvidia-smi` available:
 
 ```nix
-services.ipmi-fan-control.extraPackages = [(lib.getBin config.hardware.nvidia.package)];
+services.coolerd.extraPackages = [(lib.getBin config.hardware.nvidia.package)];
 ```
 
 _Note_: The attribute that holds `nvidia-smi` depends on the host's driver package. `config.hardware.nvidia.package` is the driver that `hardware.nvidia` installs; a host that installs the driver another way must name that package instead.
@@ -222,7 +222,7 @@ Three options serve a host that drives `hwmon` fans:
 * `hwmon.kernelModules`, default `[]`. Kernel modules that the host loads at boot, such as `nct6775` for a Nuvoton Super I/O chip.
 * `hwmon.pwmChannels`, default `{}`. The PWM channels the service may write, as a list of channel numbers for each chip name. A chip name must match `[A-Za-z0-9_-]+`.
 
-The kernel makes `pwmN` and `pwmN_enable` writable by root only, and the service runs as the user `ipmi-fan-control`. So before each start of the service, a helper runs as root. For each chip in `hwmon.pwmChannels`, it finds the one `/sys/class/hwmon` entry whose `name` file holds the chip name, after it trims surrounding whitespace. An entry without a `name` file is skipped. The helper checks that `pwmN` and `pwmN_enable` of each listed channel are regular files and not symbolic links. Only when every file of every chip has passed does it give the service group write access to them. It changes no other file. The helper fails and the service does not start when no entry or more than one entry has the chip name, when a `name` file exists but cannot be read, or when a file is missing, is a symbolic link or is not a regular file. Every check runs before the first grant, so a failed check grants nothing. When `chgrp` or `chmod` fails while the helper grants access, the service does not start either, but some of the listed files can already have the access. List every channel that a `hwmon` fan in `settings` names; the program cannot take over a channel that is not listed.
+The kernel makes `pwmN` and `pwmN_enable` writable by root only, and the service runs as the user `coolerd`. So before each start of the service, a helper runs as root. For each chip in `hwmon.pwmChannels`, it finds the one `/sys/class/hwmon` entry whose `name` file holds the chip name, after it trims surrounding whitespace. An entry without a `name` file is skipped. The helper checks that `pwmN` and `pwmN_enable` of each listed channel are regular files and not symbolic links. Only when every file of every chip has passed does it give the service group write access to them. It changes no other file. The helper fails and the service does not start when no entry or more than one entry has the chip name, when a `name` file exists but cannot be read, or when a file is missing, is a symbolic link or is not a regular file. Every check runs before the first grant, so a failed check grants nothing. When `chgrp` or `chmod` fails while the helper grants access, the service does not start either, but some of the listed files can already have the access. List every channel that a `hwmon` fan in `settings` names; the program cannot take over a channel that is not listed.
 
 The helper gives write access to the service group and not to all users, so that only the service can drive the fans. It runs before every start, so the access is set whenever the service starts, whatever the order in which the device appeared. When it fails, the service stops with a message that names the chip or the path.
 
@@ -235,7 +235,7 @@ The access has these limits:
 This desktop has no IPMI device. It reads the CPU temperature from the `k10temp` chip and drives the case fan on channel 2 of the `nct6798` chip:
 
 ```nix
-services.ipmi-fan-control = {
+services.coolerd = {
   enable = true;
   enableIpmi = false;
   hwmon.kernelModules = ["nct6775"];
@@ -249,3 +249,23 @@ services.ipmi-fan-control = {
   ];
 };
 ```
+
+Migrating from ipmi-fan-control
+-------------------------------
+
+The rename from ipmi-fan-control to coolerd changes these names:
+
+| What | ipmi-fan-control | coolerd |
+|---|---|---|
+| Program | `ipmi-fan-control` | `coolerd` |
+| systemd unit | `ipmi-fan-control.service` | `coolerd.service` |
+| Service user and group | `ipmi-fan-control` | `coolerd` |
+| Config file that the NixOS module writes | `/etc/ipmi-fan-control.toml` | `/etc/coolerd.toml` |
+| NixOS options | `services.ipmi-fan-control` | `services.coolerd` |
+| Nix package | `ipmi-fan-control` | `coolerd` |
+| Log target in `RUST_LOG` | `ipmi_fan_control` | `coolerd` |
+| Variable that turns off log timestamps | `IPMI_FAN_CONTROL_LOG_TIMESTAMPS` | `COOLERD_LOG_TIMESTAMPS` |
+
+The config file format does not change, so an existing config loads with the same result.
+
+The old NixOS option path still works. Each option under `services.ipmi-fan-control` is an alias of the same option under `services.coolerd`, and a priority such as `lib.mkForce` carries over. NixOS prints a warning for each old option that a configuration sets. The Nix package `ipmi-fan-control` is the same package as `coolerd`. Move the configuration to `services.coolerd` to remove the warnings.
