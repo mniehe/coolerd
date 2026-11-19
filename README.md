@@ -269,3 +269,10 @@ The rename from ipmi-fan-control to coolerd changes these names:
 The config file format does not change, so an existing config loads with the same result.
 
 The old NixOS option path still works. Each option under `services.ipmi-fan-control` is an alias of the same option under `services.coolerd`, and a priority such as `lib.mkForce` carries over. NixOS prints a warning for each old option that a configuration sets. The Nix package `ipmi-fan-control` is the same package as `coolerd`. Move the configuration to `services.coolerd` to remove the warnings.
+
+Before switching a host to coolerd, note these points:
+
+* Host settings that name the old unit, user or group do not carry over. Rename overrides written as `systemd.services.ipmi-fan-control.*`, drop-ins for `ipmi-fan-control.service`, and local udev rules or ACLs that name the `ipmi-fan-control` user or group.
+* A `package` override must provide `bin/coolerd`, or the system build fails.
+* Move all definitions of one option to the new path together. The old and new paths define the same option, and the old path does not keep `lib.mkBefore` and `lib.mkAfter` ordering.
+* On the switch, NixOS stops `ipmi-fan-control.service`, which attempts its normal exit: it sets the fans to full and restores the saved fan mode. NixOS then starts `coolerd.service`. A started unit does not prove that coolerd controls the fans, so read `journalctl -u coolerd.service` after the switch to confirm that the zones started.
