@@ -121,6 +121,10 @@
           lib.filter (p: !lib.elem (lib.makeBinPath [p]) (effectivePath host))
           (host.expected host.nixos.pkgs);
 
+        defaultConfig = hosts.default.nixos.config;
+        ipmiModules = ["ipmi_devintf" "ipmi_si" "ipmi_msghandler"];
+        hasIpmiModule = kernelModules: lib.any (m: lib.elem m kernelModules) ipmiModules;
+
         hwmonConfig = hosts.hwmon.nixos.config;
         accessScript = hwmonConfig.services.ipmi-fan-control.hwmon.accessScript;
         # The file each add_target line of the access helper names, in order
@@ -157,14 +161,24 @@
           "default: freeipmi is not in the unit path"
           ++ lib.optional (hosts.default.nixos.config.services.ipmi-fan-control.extraPackages != [])
           "default: extraPackages is not empty"
+          ++ lib.optional (!lib.all (m: lib.elem m defaultConfig.boot.kernelModules) ipmiModules)
+          "default: boot.kernelModules does not contain ipmi_devintf, ipmi_si and ipmi_msghandler"
+          ++ lib.optional (!(defaultConfig.users.groups ? ipmi))
+          "default: the ipmi group does not exist"
+          ++ lib.optional (!lib.elem "ipmi" defaultConfig.users.users.ipmi-fan-control.extraGroups)
+          "default: the service user is not in the ipmi group"
+          ++ lib.optional (!lib.hasInfix "KERNEL==\"ipmi*\"" defaultConfig.services.udev.extraRules)
+          "default: no udev rule gives the ipmi group the IPMI device"
+          ++ lib.optional (execStartPre hosts.default != [])
+          "default: the unit has an ExecStartPre"
           ++ lib.optional (!lib.elem "nct6775" hwmonConfig.boot.kernelModules)
           "hwmon: boot.kernelModules does not contain nct6775"
           ++ lib.optional (!lib.hasInfix "find_chip ${lib.escapeShellArg "nct6798"}\n" accessScript || grantedFiles != ["pwm2" "pwm2_enable" "pwm12" "pwm12_enable"])
           "hwmon: the access helper does not grant exactly pwm2, pwm2_enable, pwm12 and pwm12_enable of nct6798"
           ++ lib.optional (!lib.any (runsAccessHelper hosts.hwmon) (execStartPre hosts.hwmon))
           "hwmon: ExecStartPre does not run the access helper with the + prefix on /sys/class/hwmon and the service group"
-          ++ lib.optional (lib.hasInfix "KERNEL==\"ipmi" hwmonConfig.services.udev.extraRules || lib.elem "ipmi" hwmonConfig.users.users.ipmi-fan-control.extraGroups || hwmonConfig.users.groups ? ipmi || lib.elem "ipmi_si" hwmonConfig.boot.kernelModules)
-          "hwmon: an IPMI udev rule, ipmi group or ipmi_si kernel module is present with enableIpmi = false";
+          ++ lib.optional (lib.hasInfix "KERNEL==\"ipmi" hwmonConfig.services.udev.extraRules || lib.elem "ipmi" hwmonConfig.users.users.ipmi-fan-control.extraGroups || hwmonConfig.users.groups ? ipmi || hasIpmiModule hwmonConfig.boot.kernelModules)
+          "hwmon: an IPMI udev rule, ipmi group or IPMI kernel module is present with enableIpmi = false";
       in {
         formatter = pkgs.alejandra;
 
