@@ -140,6 +140,8 @@ A zone reads each source once per update. It reads the sources that are not `ipm
 
 A `file` source's path must be a regular file after symlinks are followed, as sysfs and hwmon files are; a FIFO, directory or device fails the source without being read.
 
+A `hwmon` source, `{ type = "hwmon", chip = "k10temp", input = 1 }`, reads `temp1_input` of the chip whose hwmon `name` file holds `k10temp` and rounds the reading up to whole degrees. It finds the chip by name on every read, never by its `hwmonN` number, which can change between boots. A name that no chip or more than one chip has fails the source.
+
 A source that fails is read again after `retry_delay_ms`, up to `retries` times; a source that read well is not read again. Earlier versions read every source of the zone again when one source failed. All sources of a zone share these retries in each update, so a source that uses them up leaves none for the sources read after it. `retries` bounds the number of waits in an update, not its duration, because each attempt also takes as long as the source needs to answer.
 
 A source that failed in the previous update gets one attempt in each update and no retries, until it reads again. A source that keeps failing therefore leaves the retries to the other sources and adds one attempt to each update.

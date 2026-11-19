@@ -122,6 +122,12 @@ pub enum Source {
         // PCI bus id or GPU UUID, as nvidia-smi -i accepts
         gpu: String,
     },
+    Hwmon {
+        // The text of the chip's hwmon `name` file
+        chip: String,
+        // N of the chip's tempN_input; the kernel numbers inputs from 1
+        input: u8,
+    },
 }
 
 /// What a zone does when a source has failed every attempt of a poll
@@ -580,6 +586,13 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
                 });
             }
 
+            if let Source::Hwmon { input: 0, .. } = &source.kind {
+                return Err(Error::ConfigValidation {
+                    path: path.to_owned(),
+                    reason: format!("zones[{}].sources[{}].input: must be greater than 0", i, j),
+                });
+            }
+
             if let Source::Nvidia { gpu } = &source.kind {
                 if !is_gpu_uuid(gpu) && !is_pci_bus_id(gpu) {
                     return Err(Error::ConfigValidation {
@@ -964,6 +977,19 @@ mod tests {
         assert!(matches!(sources.last().unwrap().kind, Source::Nvidia { .. }));
         assert_eq!(sources.last().unwrap().steps.as_ref().unwrap().len(), 2);
         assert_eq!(sources.last().unwrap().on_failure, OnFailure::Dcycle { dcycle: 80 });
+    }
+
+    #[test]
+    fn sample_hwmon_source_loads_when_uncommented() {
+        let sample = include_str!("../config.sample.toml");
+        let line = sample.lines()
+            .find(|l| l.trim_start().starts_with("# {") && l.contains(r#"type = "hwmon""#))
+            .expect("the sample has a commented hwmon source");
+        let uncommented = line.replacen("# ", "", 1);
+        let config = parse(&sample.replacen(line, &uncommented, 1)).unwrap();
+        let sources = &config.zones[0].sources;
+
+        assert!(matches!(&sources[1].kind, Source::Hwmon { chip, input: 1 } if chip == "k10temp"), "{:?}", sources[1].kind);
     }
 
     #[test]
@@ -1961,6 +1987,24 @@ mod tests {
         let config = parse(&zone_toml(&[("sources", r#"[["file", "/dev/null"]]"#)])).unwrap();
 
         assert!(config.zones[0].sources[0].curve.is_none());
+    }
+
+    #[test]
+    fn accepts_hwmon_source() {
+        let sources = r#"[{ type = "hwmon", chip = "k10temp", input = 1 }, ["hwmon", "nvme", 2]]"#;
+        let config = parse(&zone_toml(&[("sources", sources)])).unwrap();
+        let sources = &config.zones[0].sources;
+
+        assert!(matches!(&sources[0].kind, Source::Hwmon { chip, input: 1 } if chip == "k10temp"));
+        assert!(matches!(&sources[1].kind, Source::Hwmon { chip, input: 2 } if chip == "nvme"));
+    }
+
+    #[test]
+    fn rejects_hwmon_input_zero() {
+        let sources = r#"[{ type = "ipmi", sensor = "CPU Temp" }, { type = "hwmon", chip = "k10temp", input = 0 }]"#;
+
+        assert_eq!(validation_reason(&zone_toml(&[("sources", sources)])),
+            "zones[0].sources[1].input: must be greater than 0");
     }
 
     /// Build a zone whose second source is an nvidia source with `gpu`

@@ -19,6 +19,7 @@ use {
         curve::SourceReading,
         error::{Error, Result},
         freeipmi::{SensorReading, SensorUnits, SensorValue},
+        hwmon::{HwmonRoot, read_number},
     },
 };
 
@@ -279,6 +280,28 @@ fn double_to_temp(value: f64) -> Option<u8> {
     Some(value as u8)
 }
 
+/// Convert a hwmon temperature in millidegrees Celsius to whole degrees,
+/// rounding up and clamping to the range of a reading
+fn millidegrees_to_celsius(raw: i64) -> u8 {
+    const MILLIDEGREES_PER_DEGREE: i64 = 1000;
+
+    let degrees = raw
+        .saturating_add(MILLIDEGREES_PER_DEGREE - 1)
+        .div_euclid(MILLIDEGREES_PER_DEGREE)
+        .clamp(0, u8::MAX.into());
+
+    // The clamp leaves a value that fits
+    u8::try_from(degrees).unwrap_or(u8::MAX)
+}
+
+/// Read input `input` of the hwmon chip named `chip`. The chip is found again
+/// on every read, so a chip that moves to another `hwmonN` keeps reading.
+fn read_hwmon_source(root: &HwmonRoot, chip: &str, input: u8) -> Result<u8> {
+    let path = root.resolve(chip)?.join(format!("temp{}_input", input));
+
+    Ok(millidegrees_to_celsius(read_number(&path)?))
+}
+
 /// The readers of one zone's sources. Each source that runs a program has
 /// its own [`CommandRunner`], so a program stuck after its kill blocks only
 /// its own source. Each zone loop owns one, so zones share no runner.
@@ -286,9 +309,15 @@ fn double_to_temp(value: f64) -> Option<u8> {
 pub struct ZoneReaders {
     /// By source index, as in [`Zone::sources`]; made on a source's first read
     runners: Vec<CommandRunner>,
+    /// Where `hwmon` sources find their chips
+    hwmon: HwmonRoot,
 }
 
 impl ZoneReaders {
+    pub fn new(hwmon: HwmonRoot) -> Self {
+        Self { runners: Vec::new(), hwmon }
+    }
+
     /// Read `source`, the source at `index` of the zone, which is not an IPMI
     /// sensor
     pub fn read(&mut self, index: usize, source: &Source) -> Result<u8> {
@@ -300,6 +329,7 @@ impl ZoneReaders {
             Source::Smart { block_dev } => parse_smart_source(self.runner(index), Path::new(block_dev)),
             Source::Hdparm { block_dev } => parse_hdparm_source(self.runner(index), Path::new(block_dev)),
             Source::Nvidia { gpu } => read_nvidia_source(self.runner(index), gpu),
+            Source::Hwmon { chip, input } => read_hwmon_source(&self.hwmon, chip, *input),
         }
     }
 
@@ -523,6 +553,7 @@ mod tests {
         std::{
             cell::RefCell,
             collections::HashMap,
+            fs,
             io,
             os::unix::{fs::symlink, process::ExitStatusExt},
             path::{Path, PathBuf},
@@ -536,6 +567,7 @@ mod tests {
             NVIDIA_OUTPUT_CAP,
             ZoneReaders,
             ipmi_sensor_temp,
+            millidegrees_to_celsius,
             parse_file_source,
             parse_hdparm_output,
             parse_nvidia_output,
@@ -584,6 +616,7 @@ mod tests {
             },
             error::Error,
             freeipmi::{SensorReading, SensorUnits, SensorValue},
+            hwmon::HwmonRoot,
         },
     };
 
@@ -1139,6 +1172,52 @@ mod tests {
     #[test]
     fn hdparm_read_uses_the_runner_of_its_own_index() {
         assert_only_source_0_refused("hdparm", Source::Hdparm { block_dev: ABSENT_DEV.into() });
+    }
+
+    #[test]
+    fn millidegrees_round_up_to_whole_degrees() {
+        assert_eq!(millidegrees_to_celsius(45500), 46);
+        assert_eq!(millidegrees_to_celsius(45001), 46);
+        assert_eq!(millidegrees_to_celsius(45000), 45);
+    }
+
+    #[test]
+    fn millidegrees_clamp_to_a_reading() {
+        assert_eq!(millidegrees_to_celsius(-1000), 0);
+        assert_eq!(millidegrees_to_celsius(300000), 255);
+        assert_eq!(millidegrees_to_celsius(i64::MAX), 255);
+        assert_eq!(millidegrees_to_celsius(i64::MIN), 0);
+    }
+
+    /// A hwmon tree with chip `k10temp` at `hwmon3`, whose `temp1_input`
+    /// holds `millidegrees`
+    fn k10temp_tree(millidegrees: &str) -> TempDir {
+        let dir = TempDir::new();
+        let chip = dir.0.join("hwmon3");
+        fs::create_dir(&chip).unwrap();
+        fs::write(chip.join("name"), "k10temp\n").unwrap();
+        fs::write(chip.join("temp1_input"), millidegrees).unwrap();
+        dir
+    }
+
+    #[test]
+    fn hwmon_source_reads_its_chip_input() {
+        let dir = k10temp_tree("45500\n");
+        let mut readers = ZoneReaders::new(HwmonRoot::new(dir.0.clone()));
+
+        let reading = readers.read(0, &Source::Hwmon { chip: "k10temp".into(), input: 1 });
+
+        assert_eq!(reading.unwrap(), 46);
+    }
+
+    #[test]
+    fn hwmon_source_fails_for_an_absent_input() {
+        let dir = k10temp_tree("45500\n");
+        let mut readers = ZoneReaders::new(HwmonRoot::new(dir.0.clone()));
+
+        let reading = readers.read(0, &Source::Hwmon { chip: "k10temp".into(), input: 2 });
+
+        assert!(matches!(&reading, Err(Error::Io { path, .. }) if path.ends_with("hwmon3/temp2_input")), "{:?}", reading);
     }
 
     #[test]

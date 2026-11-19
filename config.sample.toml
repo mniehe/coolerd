@@ -95,6 +95,18 @@ sources = [
   # The thermal_zone sysfs paths on Linux satisfy these conditions.
   # { type = "file", path = "/sys/class/thermal/thermal_zone1/temp" },
 
+  # hwmon source. This reads `temp<input>_input` of the hwmon chip whose
+  # `name` file holds `chip`, in milli-degrees Celsius, and rounds up to whole
+  # degrees. A reading below 0 °C gives 0 and one above 255 °C gives 255.
+  # `input` starts at 1.
+  #
+  # The chip is found by name on every read, never by its hwmonN number,
+  # which can change between boots. A name that no chip or more than one chip
+  # has fails the source. To list the names, run:
+  #
+  #   grep . /sys/class/hwmon/*/name
+  # { type = "hwmon", chip = "k10temp", input = 1 },
+
   # HDD S.M.A.R.T. source. Disks that are spun down may not report a
   # temperature reading, leading to an error. This internally runs:
   #

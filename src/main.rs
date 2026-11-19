@@ -5,6 +5,7 @@ mod curve;
 mod error;
 mod fan;
 mod freeipmi;
+mod hwmon;
 mod source;
 mod ipmi;
 mod session;
@@ -32,6 +33,7 @@ use {
     curve::{Transition, ZoneState},
     error::{Error, Result},
     fan::{build_fan, FanGuard},
+    hwmon::HwmonRoot,
     session::IpmiSession,
     source::{read_zone_sources, ZoneReaders},
 };
@@ -167,7 +169,7 @@ impl MainApp {
         info!("[{}] Starting loop for fans {:?}", session.name(), fans.descriptions());
 
         let mut state = ZoneState::new(&zone_config);
-        let mut readers = ZoneReaders::default();
+        let mut readers = ZoneReaders::new(HwmonRoot::default());
 
         loop {
             let st = &mut state;

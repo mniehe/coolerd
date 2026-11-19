@@ -105,6 +105,22 @@ pub enum Error {
     },
     #[error("{0}: needs an IPMI session")]
     FanWithoutSession(String),
+    #[error("No hwmon chip named {chip:?} under {root:?}")]
+    HwmonChipNotFound {
+        chip: String,
+        root: PathBuf,
+    },
+    #[error("Several hwmon chips named {chip:?}: {paths:?}")]
+    HwmonChipAmbiguous {
+        chip: String,
+        paths: Vec<PathBuf>,
+    },
+    #[error("Failed to parse hwmon value: {path:?}: {value:?}: {source}")]
+    HwmonParse {
+        path: PathBuf,
+        value: String,
+        source: ParseIntError,
+    },
 }
 
 pub type Result<T, E = Error> = result::Result<T, E>;
