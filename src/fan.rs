@@ -631,6 +631,19 @@ mod tests {
     }
 
     #[test]
+    fn hwmon_release_restores_mode_2() {
+        let chip = Nct6798::new("2\n", "127\n");
+        let mut fan = chip.fan();
+        fan.take_control().unwrap();
+        fan.set_duty(20).unwrap();
+
+        fan.release().unwrap();
+
+        assert_eq!(chip.read("pwm2_enable"), "2");
+        assert_eq!(chip.read("pwm2"), "255");
+    }
+
+    #[test]
     fn hwmon_set_duty_writes_only_a_changed_raw_value() {
         let chip = Nct6798::new("5\n", "127\n");
         let mut fan = chip.fan();
