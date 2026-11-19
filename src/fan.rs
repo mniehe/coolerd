@@ -357,7 +357,7 @@ pub mod fake {
 #[cfg(test)]
 mod tests {
     use {
-        std::{fs, path::PathBuf, sync::Arc},
+        std::{fs, os::unix::fs::symlink, path::PathBuf, sync::Arc},
         super::{
             build_fan,
             fake::{CallLog, FakeFan, Op},
@@ -785,6 +785,35 @@ mod tests {
         assert!(released.is_err());
         assert_eq!(fs::read_to_string(moved.join("pwm2")).unwrap(), "77\n");
         assert_eq!(fs::read_to_string(moved.join("pwm2_enable")).unwrap(), "1\n");
+    }
+
+    #[test]
+    fn hwmon_fan_keeps_the_device_behind_the_link_it_took_over() {
+        // As in sysfs, the root entry is a link to the chip's device directory
+        let dir = TempDir::new();
+        let (root, taken, other) = (dir.0.join("class"), dir.0.join("taken"), dir.0.join("other"));
+
+        for device in [&root, &taken, &other] {
+            fs::create_dir(device).unwrap();
+        }
+
+        for device in [&taken, &other] {
+            fs::write(device.join("name"), "nct6798\n").unwrap();
+            fs::write(device.join("pwm2_enable"), "5\n").unwrap();
+            fs::write(device.join("pwm2"), "127\n").unwrap();
+        }
+
+        let link = root.join("hwmon1");
+        symlink(&taken, &link).unwrap();
+        let mut fan = HwmonPwm::new(HwmonRoot::new(root.clone()), "nct6798".into(), 2);
+        fan.take_control().unwrap();
+        fs::remove_file(&link).unwrap();
+        symlink(&other, &link).unwrap();
+
+        fan.set_duty(20).unwrap();
+
+        assert_eq!(fs::read_to_string(taken.join("pwm2")).unwrap(), "51");
+        assert_eq!(fs::read_to_string(other.join("pwm2")).unwrap(), "127\n");
     }
 
     #[test]
