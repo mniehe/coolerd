@@ -1,5 +1,5 @@
 [package]
-name = "ipmi-fan-control"
+name = "coolerd"
 description = "SuperMicro IPMI fan control daemon"
 repository = "https://github.com/chenxiaolong/ipmi-fan-control"
 readme = "README.md"

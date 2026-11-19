@@ -353,7 +353,8 @@ async fn main() {
 mod tests {
     use {
         std::path::Path,
-        super::{query_sensors, sessions_to_open},
+        clap::CommandFactory,
+        super::{Opt, query_sensors, sessions_to_open},
         crate::{
             config::{Config, FanConfig, parse_config},
             error::Error,
@@ -361,7 +362,7 @@ mod tests {
     };
 
     fn parse(contents: &str) -> Config {
-        parse_config(contents, Path::new("/etc/ipmi-fan-control.toml")).unwrap()
+        parse_config(contents, Path::new("/etc/coolerd.toml")).unwrap()
     }
 
     /// `sessions_to_open` sorted by session name, because sessions are a map
@@ -369,6 +370,11 @@ mod tests {
         let mut sessions = sessions_to_open(config);
         sessions.sort();
         sessions
+    }
+
+    #[test]
+    fn command_name_is_coolerd() {
+        assert_eq!(Opt::command().get_name(), "coolerd");
     }
 
     #[test]

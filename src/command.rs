@@ -214,7 +214,7 @@ pub mod testing {
         pub fn new() -> Self {
             static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-            let name = format!("ipmi-fan-control-test-{}-{}",
+            let name = format!("coolerd-test-{}-{}",
                 process::id(), COUNTER.fetch_add(1, Ordering::SeqCst));
             let path = env::temp_dir().join(name);
             fs::create_dir(&path).unwrap();

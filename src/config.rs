@@ -906,7 +906,7 @@ mod tests {
         },
     };
 
-    const CONFIG_PATH: &str = "/etc/ipmi-fan-control.toml";
+    const CONFIG_PATH: &str = "/etc/coolerd.toml";
 
     /// Build a TOML config with one zone. Each override replaces the default
     /// value of its key or adds the key.

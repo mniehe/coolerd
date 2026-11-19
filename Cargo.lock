@@ -129,6 +129,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "coolerd"
+version = "0.4.3"
+dependencies = [
+ "bindgen",
+ "clap",
+ "env_logger",
+ "log",
+ "once_cell",
+ "pkg-config",
+ "retry",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "toml",
+]
+
+[[package]]
 name = "either"
 version = "1.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -205,25 +224,6 @@ checksum = "10a35a97730320ffe8e2d410b5d3b69279b98d2c14bdb8b70ea89ecf7888d41e"
 dependencies = [
  "autocfg",
  "hashbrown",
-]
-
-[[package]]
-name = "ipmi-fan-control"
-version = "0.4.3"
-dependencies = [
- "bindgen",
- "clap",
- "env_logger",
- "log",
- "once_cell",
- "pkg-config",
- "retry",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-stream",
- "toml",
 ]
 
 [[package]]

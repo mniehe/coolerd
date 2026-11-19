@@ -1149,7 +1149,7 @@ mod tests {
 
     /// A block device that does not exist, so that a host that has the real
     /// disk tool touches no disk
-    const ABSENT_DEV: &str = "/nonexistent/ipmi-fan-control-test-disk";
+    const ABSENT_DEV: &str = "/nonexistent/coolerd-test-disk";
 
     /// Keep a child on the runner of source 0 as a run of `program`, the
     /// program that [`ZoneReaders::read`] runs for `source`, and give the
