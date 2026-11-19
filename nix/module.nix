@@ -6,15 +6,15 @@
   ...
 }:
 with lib; let
-  cfg = config.services.ipmi-fan-control;
+  cfg = config.services.coolerd;
 
   # Service user and group
-  serviceUser = "ipmi-fan-control";
-  serviceGroup = "ipmi-fan-control";
+  serviceUser = "coolerd";
+  serviceGroup = "coolerd";
 
   # Use pkgs.formats.toml to handle the conversion
   format = pkgs.formats.toml {};
-  configFile = format.generate "ipmi-fan-control-config.toml" cfg.settings;
+  configFile = format.generate "coolerd-config.toml" cfg.settings;
 
   # Runtime dependencies
   runtimeDeps = with pkgs;
@@ -104,24 +104,38 @@ with lib; let
     done
   '';
 
-  accessHelper = pkgs.writeShellScript "ipmi-fan-control-hwmon-access" cfg.hwmon.accessScript;
+  accessHelper = pkgs.writeShellScript "coolerd-hwmon-access" cfg.hwmon.accessScript;
 
   validChipName = chip: builtins.match "[A-Za-z0-9_-]+" chip != null;
 in {
-  options.services.ipmi-fan-control = {
-    enable = mkEnableOption "IPMI fan control service";
+  # One alias per option leaf: an alias of the whole subtree breaks
+  # lib.mkForce on an old path. hwmon.accessScript is internal and has none.
+  imports = map (leaf: mkRenamedOptionModule (["services" "ipmi-fan-control"] ++ leaf) (["services" "coolerd"] ++ leaf)) [
+    ["enable"]
+    ["package"]
+    ["settings"]
+    ["enableSmartMonTools"]
+    ["enableHdparm"]
+    ["extraPackages"]
+    ["enableIpmi"]
+    ["hwmon" "kernelModules"]
+    ["hwmon" "pwmChannels"]
+  ];
+
+  options.services.coolerd = {
+    enable = mkEnableOption "the coolerd fan control service";
 
     package = mkOption {
       type = types.package;
-      default = pkgs.ipmi-fan-control;
-      defaultText = literalExpression "pkgs.ipmi-fan-control";
-      description = "The ipmi-fan-control package to use";
+      default = pkgs.coolerd;
+      defaultText = literalExpression "pkgs.coolerd";
+      description = "The coolerd package to use";
     };
 
     settings = mkOption {
       type = types.attrs;
       default = {};
-      description = "Configuration for IPMI fan control";
+      description = "Configuration for coolerd";
       example = literalExpression ''
         {
           log_level = "info";
@@ -220,11 +234,11 @@ in {
     assertions =
       map (chip: {
         assertion = validChipName chip;
-        message = "services.ipmi-fan-control.hwmon.pwmChannels: chip name ${builtins.toJSON chip} must match [A-Za-z0-9_-]+";
+        message = "services.coolerd.hwmon.pwmChannels: chip name ${builtins.toJSON chip} must match [A-Za-z0-9_-]+";
       })
       (attrNames cfg.hwmon.pwmChannels);
 
-    services.ipmi-fan-control.hwmon.accessScript =
+    services.coolerd.hwmon.accessScript =
       accessPreamble
       + concatStrings (mapAttrsToList grantChip (filterAttrs (chip: _: validChipName chip) cfg.hwmon.pwmChannels))
       + accessGrants;
@@ -250,7 +264,7 @@ in {
     users.users."${serviceUser}" = {
       isSystemUser = true;
       group = serviceGroup;
-      description = "IPMI Fan Control service user";
+      description = "coolerd service user";
       home = "/var/empty";
       extraGroups =
         optional cfg.enableIpmi "ipmi"
@@ -265,15 +279,15 @@ in {
       KERNEL=="ipmidev/*", GROUP="ipmi", MODE="0660"
     '';
 
-    environment.etc."ipmi-fan-control.toml" = {
+    environment.etc."coolerd.toml" = {
       source = configFile;
       mode = "0600"; # Restrict access as it might contain credentials
       user = serviceUser;
       group = serviceGroup;
     };
 
-    systemd.services.ipmi-fan-control = {
-      description = "IPMI Fan Control Service";
+    systemd.services.coolerd = {
+      description = "coolerd fan control service";
       wantedBy = ["multi-user.target"];
       after = ["network.target"];
       restartTriggers = [configFile];
@@ -286,7 +300,7 @@ in {
         Group = serviceGroup;
         # The + prefix runs the helper as root; the daemon keeps its user
         ExecStartPre = mkIf (cfg.hwmon.pwmChannels != {}) "+${accessHelper} /sys/class/hwmon ${escapeShellArg serviceGroup}";
-        ExecStart = "${cfg.package}/bin/ipmi-fan-control --config /etc/ipmi-fan-control.toml";
+        ExecStart = "${cfg.package}/bin/coolerd --config /etc/coolerd.toml";
         Restart = "on-failure";
         RestartSec = "10s";
         # CAP_SYS_RAWIO: required for SATA SMART (SCSI passthrough) and hdparm

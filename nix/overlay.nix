@@ -1,6 +1,6 @@
 final: prev: {
-  ipmi-fan-control = final.rustPlatform.buildRustPackage {
-    pname = "ipmi-fan-control";
+  coolerd = final.rustPlatform.buildRustPackage {
+    pname = "coolerd";
     version = "0.1.0"; # Update with your actual version
 
     src = ../.;
@@ -40,5 +40,10 @@ final: prev: {
     postFixup = ''
       patchelf --set-rpath "${final.lib.makeLibraryPath [final.freeipmi]}" $out/bin/*
     '';
+
+    meta.mainProgram = "coolerd";
   };
+
+  # The name before the rename to coolerd
+  ipmi-fan-control = final.coolerd;
 }

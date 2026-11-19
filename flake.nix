@@ -1,5 +1,5 @@
 {
-  description = "ipmi-fan-control";
+  description = "coolerd";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
@@ -19,21 +19,53 @@
         };
         lib = nixpkgs.lib;
 
-        # Evaluate a minimal host that enables the service, plus one extra module
-        evalHost = extraModule:
+        # Evaluate a minimal host with the module and the given modules, which
+        # must enable the service themselves
+        evalModules = modules:
           lib.nixosSystem {
-            modules = [
-              self.nixosModules.default
-              {
-                nixpkgs.hostPlatform = system;
-                nixpkgs.overlays = [self.overlays.default];
-                fileSystems."/".device = "/dev/null";
-                boot.loader.grub.enable = false;
-                services.ipmi-fan-control.enable = true;
-              }
-              extraModule
-            ];
+            modules =
+              [
+                self.nixosModules.default
+                {
+                  nixpkgs.hostPlatform = system;
+                  nixpkgs.overlays = [self.overlays.default];
+                  fileSystems."/".device = "/dev/null";
+                  boot.loader.grub.enable = false;
+                }
+              ]
+              ++ modules;
           };
+        # Evaluate a minimal host that enables the service, plus one extra module
+        evalHost = extraModule: evalModules [{services.coolerd.enable = true;} extraModule];
+
+        # Settings that the migration host sets on the old option path
+        migrationSettings = {
+          log_level = "debug";
+          zones = [
+            {
+              fans = [
+                {
+                  type = "hwmon";
+                  chip = "nct6798";
+                  pwm = 2;
+                }
+              ];
+              sources = [
+                {
+                  type = "hwmon";
+                  chip = "k10temp";
+                  input = 1;
+                }
+              ];
+              steps = [
+                {
+                  temp = 40;
+                  dcycle = 30;
+                }
+              ];
+            }
+          ];
+        };
 
         # Each host names the packages whose bin directory must be on the unit's PATH
         hosts = {
@@ -43,13 +75,13 @@
           };
           extra = {
             nixos = evalHost ({pkgs, ...}: {
-              services.ipmi-fan-control.extraPackages = [pkgs.hello];
+              services.coolerd.extraPackages = [pkgs.hello];
             });
             expected = p: [p.freeipmi p.hello];
           };
           drives = {
             nixos = evalHost ({pkgs, ...}: {
-              services.ipmi-fan-control = {
+              services.coolerd = {
                 enableSmartMonTools = true;
                 enableHdparm = true;
                 extraPackages = [pkgs.hello];
@@ -59,7 +91,7 @@
           };
           hwmon = {
             nixos = evalHost {
-              services.ipmi-fan-control = {
+              services.coolerd = {
                 enableIpmi = false;
                 hwmon.kernelModules = ["nct6775"];
                 hwmon.pwmChannels.nct6798 = [2 12];
@@ -100,37 +132,46 @@
             };
             expected = p: [p.freeipmi];
           };
+          # Only old option paths, as a configuration written before the
+          # rename sets them; mkForce on an old path must still apply
+          migration = {
+            nixos = evalModules [
+              {services.ipmi-fan-control.enable = lib.mkForce true;}
+              {services.ipmi-fan-control.settings = migrationSettings;}
+            ];
+            expected = p: [p.freeipmi];
+          };
         };
 
         # A host whose chip name the module must reject. Only its assertions are
         # read: its toplevel and unit would fail or drop the chip.
         badChipConfig =
           (evalHost {
-            services.ipmi-fan-control.hwmon.pwmChannels."nct*" = [2];
+            services.coolerd.hwmon.pwmChannels."nct*" = [2];
           })
           .config;
         rejectsBadChip =
-          lib.any (a: !a.assertion && lib.hasInfix "services.ipmi-fan-control.hwmon.pwmChannels" a.message)
+          lib.any (a: !a.assertion && lib.hasInfix "services.coolerd.hwmon.pwmChannels" a.message)
           badChipConfig.assertions;
 
         # A host with two chips. Only its access script is read, so that the
         # helper can be run against a tree where the second chip fails.
         twoChipScript =
           (evalHost {
-            services.ipmi-fan-control.hwmon.pwmChannels = {
+            services.coolerd.hwmon.pwmChannels = {
               nct6798 = [2];
               it8792 = [1];
             };
           })
           .config
           .services
-          .ipmi-fan-control
+          .coolerd
           .hwmon
           .accessScript;
 
         hasPackage = name: packages: lib.any (p: lib.getName p == name) packages;
-        unit = host: host.nixos.config.systemd.services.ipmi-fan-control;
-        unitText = host: host.nixos.config.systemd.units."ipmi-fan-control.service".text;
+        unit = host: host.nixos.config.systemd.services.coolerd;
+        unitText = host: host.nixos.config.systemd.units."coolerd.service".text;
 
         # PATH= at the start of a value or after a space or quote, so LD_LIBRARY_PATH= does not count
         assignsPath = s: builtins.match "(.*[ \"])?PATH=.*" s != null;
@@ -157,7 +198,19 @@
         ];
 
         hwmonConfig = hosts.hwmon.nixos.config;
-        accessScript = hwmonConfig.services.ipmi-fan-control.hwmon.accessScript;
+        migrationConfig = hosts.migration.nixos.config;
+        # The path of every option leaf under opts that is not internal
+        publicLeaves = prefix: opts:
+          lib.concatLists (lib.mapAttrsToList (name: value:
+            if lib.isOption value
+            then lib.optional (!(value.internal or false)) (prefix ++ [name])
+            else publicLeaves (prefix ++ [name]) value)
+          opts);
+        defaultOptions = hosts.default.nixos.options.services;
+        unaliasedLeaves = lib.filter (leaf: !lib.hasAttrByPath leaf defaultOptions.ipmi-fan-control) (publicLeaves [] defaultOptions.coolerd);
+        # The config file the module would generate from the old-path settings
+        migrationExpected = (pkgs.formats.toml {}).generate "coolerd-config.toml" migrationSettings;
+        accessScript = hwmonConfig.services.coolerd.hwmon.accessScript;
         # The first capture of pattern on each line of script that matches it, in order
         scriptMatches = pattern: script:
           lib.concatMap (line: let
@@ -178,7 +231,7 @@
           lib.length words
           == 3
           && lib.hasPrefix "+" (lib.elemAt words 0)
-          && lib.hasSuffix "-ipmi-fan-control-hwmon-access" (lib.elemAt words 0)
+          && lib.hasSuffix "-coolerd-hwmon-access" (lib.elemAt words 0)
           && lib.elemAt words 1 == "/sys/class/hwmon"
           && lib.elemAt words 2 == lib.escapeShellArg (unit host).serviceConfig.Group;
         accessHelper = pkgs.writeShellScript "hwmon-access-helper" accessScript;
@@ -189,7 +242,13 @@
           ++ lib.optional (envSetsPath host)
           "${name}: serviceConfig.Environment sets PATH"
           ++ lib.optional (lib.length (pathLines host) != 1)
-          "${name}: the unit file does not assign PATH exactly once";
+          "${name}: the unit file does not assign PATH exactly once"
+          ++ lib.optional ((unit host).serviceConfig.User != "coolerd" || (unit host).serviceConfig.Group != "coolerd")
+          "${name}: the unit does not run as the user and group coolerd"
+          ++ lib.optional (!lib.hasSuffix "/bin/coolerd --config /etc/coolerd.toml" (unit host).serviceConfig.ExecStart)
+          "${name}: ExecStart does not run bin/coolerd with /etc/coolerd.toml"
+          ++ lib.optional (!(host.nixos.config.environment.etc ? "coolerd.toml"))
+          "${name}: /etc/coolerd.toml is not defined";
 
         moduleFailures =
           lib.concatLists (lib.mapAttrsToList hostFailures hosts)
@@ -197,13 +256,13 @@
           "extraPackages: hello is not in the unit path"
           ++ lib.optional (!hasPackage "freeipmi" (unit hosts.default).path)
           "default: freeipmi is not in the unit path"
-          ++ lib.optional (hosts.default.nixos.config.services.ipmi-fan-control.extraPackages != [])
+          ++ lib.optional (hosts.default.nixos.config.services.coolerd.extraPackages != [])
           "default: extraPackages is not empty"
           ++ lib.optional (!lib.all (m: lib.elem m defaultConfig.boot.kernelModules) ipmiModules)
           "default: boot.kernelModules does not contain ipmi_devintf, ipmi_si and ipmi_msghandler"
           ++ lib.optional (!(defaultConfig.users.groups ? ipmi))
           "default: the ipmi group does not exist"
-          ++ lib.optional (!lib.elem "ipmi" defaultConfig.users.users.ipmi-fan-control.extraGroups)
+          ++ lib.optional (!lib.elem "ipmi" defaultConfig.users.users.coolerd.extraGroups)
           "default: the service user is not in the ipmi group"
           ++ lib.optional (!lib.all (rule: lib.elem rule (lib.splitString "\n" defaultConfig.services.udev.extraRules)) ipmiUdevRules)
           "default: the udev rules do not give the ipmi group mode 0660 on both ipmi* and ipmidev/*"
@@ -218,10 +277,17 @@
           "two chips: the access helper does not find it8792 and then nct6798, granting pwm1 and pwm1_enable and then pwm2 and pwm2_enable"
           ++ lib.optional (!lib.any (runsAccessHelper hosts.hwmon) (execStartPre hosts.hwmon))
           "hwmon: ExecStartPre does not run the access helper with the + prefix on /sys/class/hwmon and the service group"
-          ++ lib.optional (lib.hasInfix "KERNEL==\"ipmi" hwmonConfig.services.udev.extraRules || lib.elem "ipmi" hwmonConfig.users.users.ipmi-fan-control.extraGroups || hwmonConfig.users.groups ? ipmi || hasIpmiModule hwmonConfig.boot.kernelModules)
+          ++ lib.optional (lib.hasInfix "KERNEL==\"ipmi" hwmonConfig.services.udev.extraRules || lib.elem "ipmi" hwmonConfig.users.users.coolerd.extraGroups || hwmonConfig.users.groups ? ipmi || hasIpmiModule hwmonConfig.boot.kernelModules)
           "hwmon: an IPMI udev rule, ipmi group or IPMI kernel module is present with enableIpmi = false"
           ++ lib.optional (!rejectsBadChip)
-          "bad chip: no failed assertion names services.ipmi-fan-control.hwmon.pwmChannels for the chip nct*";
+          "bad chip: no failed assertion names services.coolerd.hwmon.pwmChannels for the chip nct*"
+          ++ lib.optional (migrationConfig.services.coolerd.settings != migrationSettings)
+          "migration: services.coolerd.settings is not the settings set on the old path"
+          ++ lib.optional (migrationConfig.systemd.services ? ipmi-fan-control || migrationConfig.environment.etc ? "ipmi-fan-control.toml")
+          "migration: the unit or config file still has the old name"
+          ++ map (leaf: "migration: services.ipmi-fan-control.${lib.concatStringsSep "." leaf} is not an alias") unaliasedLeaves
+          ++ lib.optional (pkgs.ipmi-fan-control.drvPath != pkgs.coolerd.drvPath)
+          "overlay: ipmi-fan-control is not the coolerd derivation";
       in {
         formatter = pkgs.alejandra;
 
@@ -229,6 +295,10 @@
           module-eval = pkgs.runCommand "module-eval" {} ''
             ${lib.concatMapStrings (m: "echo ${lib.escapeShellArg m} >&2\n") moduleFailures}
             ${lib.optionalString (moduleFailures != []) "exit 1"}
+            if ! cmp ${migrationConfig.environment.etc."coolerd.toml".source} ${migrationExpected}; then
+              echo "migration: /etc/coolerd.toml does not hold the settings set on the old path" >&2
+              exit 1
+            fi
             touch $out
           '';
 
@@ -538,12 +608,13 @@
         };
 
         packages = {
-          default = pkgs.ipmi-fan-control;
+          default = pkgs.coolerd;
+          coolerd = pkgs.coolerd;
           ipmi-fan-control = pkgs.ipmi-fan-control;
         };
 
         devShells.default = pkgs.mkShell rec {
-          name = "ipmi-fan";
+          name = "coolerd";
           nativeBuildInputs = [pkgs.pkg-config];
           buildInputs = with pkgs; [
             clang
