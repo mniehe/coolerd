@@ -215,6 +215,19 @@ steps = [{ temp = 50, dcycle = 30 }, { temp = 85, dcycle = 100 }]
 
 On NixOS, set `services.coolerd.enableNvidiaFans = true`. It runs the service as root and puts `/run/opengl-driver/lib` on the service's `LD_LIBRARY_PATH`, where NixOS links the driver's libraries. `/run/opengl-driver/lib` exists only when the host enables its graphics driver packages. The `nvidia` source also needs `nvidia-smi` on the service's `PATH`, through `extraPackages` as shown under [NixOS](#nixos).
 
+#### Checking the fans on a host
+
+`nvidia-smi` cannot show the fan policy, that is, whether the driver or a program sets the speed. So these steps show only the effect. They suit a host with one zone that drives an NVIDIA fan. To make the change easy to see, give the zone a fixed duty cycle for the check, such as `steps = [{ temp = 0, dcycle = 60 }]`.
+
+1. Start the unit with `sudo systemctl start coolerd.service`. Wait for a few updates, then read the speed:
+
+   ```sh
+   nvidia-smi --query-gpu=fan.speed --format=csv
+   ```
+
+   The speed is the zone's duty cycle, or the fan's minimum when the duty cycle is lower. The unit logs the limits at startup in a line with `speed limits`; read it with `journalctl -u coolerd.service`.
+2. Stop the unit with `sudo systemctl stop coolerd.service`, and read the speed again with the same command. The speed follows the GPU temperature again. If the journal shows `Failed to give fan`, the default policy was not restored, and the fan stays in manual control at its maximum.
+
 NixOS
 -----
 
