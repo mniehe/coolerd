@@ -6,8 +6,8 @@ temperatures from IPMI sensors, files, hwmon, `smartctl`, `hdparm` and
 Supermicro zones, with OEM raw commands through libfreeipmi, or hwmon PWM
 files. This repository is a fork of the archived
 `chenxiaolong/ipmi-fan-control`, so nothing goes upstream. It was named
-ipmi-fan-control until the rename; the NixOS module keeps that name as option
-and package aliases. It runs on a real server through the NixOS module in
+ipmi-fan-control until the rename; the NixOS module and the overlay keep that
+name as option and package aliases. It runs on a real server through the NixOS module in
 `nix/`.
 
 A wrong duty value can overheat hardware, and nothing on a development machine
@@ -44,9 +44,12 @@ Before you start, say in a line what you're about to do; brief updates while you
 
 Ask first, naming the exact action, before:
 
-- running the built binary, `ipmitool`, or any other command that can reach a
-  BMC. On start the daemon switches the board to full fan mode and takes over
-  the duty cycle, and `testing.md` holds raw commands aimed at a live machine;
+- running the built binary with any config, `ipmitool`, or any other command
+  that can reach a BMC or write under `/sys`. On start the daemon takes over
+  the fans: a Supermicro fan switches the board to full fan mode, and a hwmon
+  fan switches `pwm<N>_enable` of this machine's own chip to manual. A killed
+  process leaves them that way. `testing.md` holds raw commands aimed at a
+  live machine;
 - any command on a deployed host, and any `nixos-rebuild` or other activation;
 - pushing, merging, or anything that lands on `master`. The server's
   configuration pins this repository as a flake input, so `master` is what
@@ -105,8 +108,9 @@ The dev shell's toolchain comes from `flake.lock` and is the authority for
 lint results. CI and a system toolchain run other clippy versions and can
 report different lints.
 
-No IPMI hardware exists on a development machine, so the daemon cannot be run
-here. Behaviour is proved by tests of pure functions.
+Do not run the daemon on a development machine. No IPMI hardware exists
+here, and a hwmon fan would take over this machine's own fans. Behaviour is
+proved by tests of pure functions and of fake hwmon trees.
 
 ## Rules
 
@@ -116,8 +120,8 @@ here. Behaviour is proved by tests of pure functions.
 - Every fallible path returns a variant of `Error` in `src/error.rs`. Do not
   panic or call `process::exit` outside `main`: a return from `main_wrapper`,
   with `Ok` or with an `Error`, is what runs `FanGuard::drop` and
-  `IpmiSession::drop`, which set every fan to full and restore the saved fan
-  mode.
+  `IpmiSession::drop`, which set every fan to full and restore a saved
+  automatic fan mode.
 - That shutdown path is the safety net. A change must keep it running on every
   exit, including a failed zone loop and a signal.
 - A duty cycle is a `u8` from 0 to 100. Validate it where it enters, in
@@ -196,8 +200,8 @@ the fans slow, or breaks the deployed unit:
 - `build.rs` and `wrapper.h`
 - `src/curve.rs`, which holds the duty calculation
 - `src/command.rs`
-- `src/fan.rs`, `src/session.rs` and `src/hwmon.rs`, which write the duty and
-  restore the fans on exit
+- `src/fan.rs` and `src/session.rs`, which write the duty and restore the
+  fans on exit, and `src/hwmon.rs`, which picks the chip they write to
 - the zone loop and the shutdown path in `src/main.rs`
 - `nix/**`
 - `.claude/review/review.yaml`

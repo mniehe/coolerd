@@ -15,15 +15,27 @@ names the physical or privilege consequence.
   much output is read.
 - `src/freeipmi.rs` is the FFI boundary. `src/ipmi.rs` builds the raw
   Supermicro OEM request bytes.
+- `src/fan.rs` holds the fan backends. `SupermicroZone` writes through the
+  shared `IpmiSession` in `src/session.rs`. `HwmonPwm` writes `pwm<N>` and
+  `pwm<N>_enable` of the chip that `HwmonRoot` in `src/hwmon.rs` finds by
+  name. `FanGuard` owns one fan and releases it on drop.
 - `nix/module.nix` sets the unit's user, groups, PATH, udev rule and ambient
-  capabilities (`CAP_SYS_RAWIO`, `CAP_SYS_ADMIN`).
+  capabilities (`CAP_SYS_RAWIO`, `CAP_SYS_ADMIN`). Its hwmon access helper
+  runs as root before each start and makes the listed PWM files
+  group-writable.
 
 ## Lenses, in priority order
 
 1. Fail-safe: any exit path, including a failed zone loop, a panic and a
-   signal, that does not reach `IpmiSession::drop`, which sets every zone to
-   100% and restores the fan mode. A new `process::exit`, `abort`, or a
-   leaked `Arc<IpmiSession>` that keeps the destructor from running.
+   signal, that does not reach `FanGuard::drop` and `IpmiSession::drop`.
+   `IpmiSession::drop` sets every Supermicro zone to 100% and restores the
+   fan mode. `FanGuard::drop` releases its fan: a hwmon fan writes 255 to
+   `pwm<N>`, then restores a saved `pwm<N>_enable` of 2 or more. A config
+   with only hwmon fans opens no `IpmiSession`, so `FanGuard::drop` is then
+   the whole safety net. A new `process::exit`, `abort`, a leaked
+   `Arc<IpmiSession>` or `FanGuard`, a guard moved into a detached task, or
+   a release that returns before the full-speed write keeps it from
+   working.
 2. Fail-slow: a failure handled by lowering or keeping the duty where the
    safe answer is a higher one; a source dropped from a zone without a
    stated fallback; a blocked read that stalls a zone loop with no bound.

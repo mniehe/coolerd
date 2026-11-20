@@ -32,9 +32,11 @@ termination owner.
   reports each change as a `Transition`, which the zone loop logs.
 - `src/main.rs`: `zone_loop` returns the first error that `on_failure` does
   not absorb, `run` aborts the other loops through a `JoinSet`, and
-  `main` exits 1 after `MainApp` drops. `IpmiSession::drop` is the cleanup:
-  it sets every zone to 100% and restores the fan mode, logging and not
-  returning its own errors.
+  `main` exits 1 after `MainApp` drops. `FanGuard::drop` in `src/fan.rs` and
+  `IpmiSession::drop` in `src/session.rs` are the cleanup. The first
+  releases its fan (a hwmon fan writes 255, then restores a saved automatic
+  mode). The second sets every Supermicro zone to 100% and restores the fan
+  mode. Both log their own errors and do not return them.
 - A failure that ends in a lower or unchanged fan duty with no log line is
   the disguised success that matters most here.
 

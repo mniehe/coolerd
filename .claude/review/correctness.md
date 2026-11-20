@@ -20,7 +20,8 @@ hunks alone.
   and `ZoneState::next_duty` applies smoothing, hysteresis and the failure
   floor. Read a change there together with the config keys it serves.
 - `src/main.rs`: `zone_loop` calls `update_duty_cycle`, which reads the
-  sources, calls `next_duty` and writes the duty. Read a duty change together with `IpmiSession::drop`.
+  sources, calls `next_duty` and writes the duty. Read a duty change together with
+  `FanGuard::drop` in `src/fan.rs` and `IpmiSession::drop` in `src/session.rs`.
 - `src/ipmi.rs`: the only caller of raw commands.
 
 ## Lenses, in priority order
