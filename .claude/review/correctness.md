@@ -8,8 +8,8 @@ hunks alone.
 ## Project shape
 
 - `src/config.rs`: serde types with `deny_unknown_fields` and all validation
-  in `load_config`. Read a new key together with its validation, its default
-  and `config.sample.toml`.
+  in `load_config`. Read a new key together with its validation, its default,
+  `config.sample.toml` and `docs/configuration.md`.
 - `src/source.rs`: one reader per source type, the dispatch in
   `ZoneReaders::read`, and the retries in `read_zone_sources`. Readings are
   `u8` degrees Celsius.
@@ -44,11 +44,16 @@ hunks alone.
 ## Check for what is absent
 
 - Every new config value is validated before the zone loops start.
-- Every documented key in `config.sample.toml` matches the name and type the
-  code reads, and the `settings` example in `nix/module.nix` still loads.
+- Every documented key in `config.sample.toml` and `docs/configuration.md`
+  matches the name, type, default and rule the code applies, and the
+  `settings` example in `nix/module.nix` still loads.
+- A changed behaviour is changed on the page that states it:
+  `docs/failure.md` for source failures, fan releases, the exit status and the
+  known limits, `docs/nixos.md` for the module, and the files in
+  `docs/examples/` for a key or an option they show.
 - Every reading that can be absent is handled before it reaches the curve.
 - A changed constant or format is changed everywhere it is duplicated,
-  including `README.md`.
+  including `README.md` and `docs/`.
 
 ## Finding fields
 
