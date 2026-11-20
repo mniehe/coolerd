@@ -5,6 +5,7 @@ use {
         path::PathBuf,
         process::ExitStatus,
         result,
+        time::Duration,
     },
     nvml_wrapper::error::NvmlError,
     thiserror::Error,
@@ -145,6 +146,28 @@ pub enum Error {
     Nvml {
         gpu: String,
         source: NvmlError,
+    },
+    #[error("GPU {gpu}: NVML call {operation} did not return within {limit:?}; every later NVML call fails at once")]
+    NvmlTimeout {
+        gpu: String,
+        operation: &'static str,
+        limit: Duration,
+    },
+    #[error("GPU {gpu}: NVML call {operation} not made, because an earlier call has not returned since it timed out: {earlier}")]
+    NvmlStalled {
+        gpu: String,
+        operation: &'static str,
+        earlier: String,
+    },
+    #[error("GPU {gpu}: NVML call {operation} got no reply, because the NVML thread stopped")]
+    NvmlNoReply {
+        gpu: String,
+        operation: &'static str,
+    },
+    #[error("GPU {gpu}: failed to start the NVML thread: {source}")]
+    NvmlThread {
+        gpu: String,
+        source: io::Error,
     },
     #[error("GPU {gpu}: has {count} fan(s), so fan {fan} does not exist")]
     NvidiaFanMissing {

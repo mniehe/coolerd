@@ -482,7 +482,13 @@ pub mod fake {
 #[cfg(test)]
 mod tests {
     use {
-        std::{fs, os::unix::fs::symlink, path::PathBuf, sync::Arc},
+        std::{
+            fs,
+            os::unix::fs::symlink,
+            path::PathBuf,
+            sync::Arc,
+            time::{Duration, Instant},
+        },
         super::{
             build_fan,
             fake::{CallLog, FakeFan, Op},
@@ -500,7 +506,8 @@ mod tests {
             hwmon::HwmonRoot,
             ipmi::FanMode,
             nvml::{
-                fake::{Call, FakeGpu, FakeNvml, Op as NvmlOp},
+                fake::{stalling_worker, Call, FakeGpu, FakeNvml, Op as NvmlOp},
+                Limits,
                 Nvml,
             },
             session::{
@@ -1190,6 +1197,52 @@ mod tests {
         }
 
         assert_eq!(sets_of(&nvml), [Call::SetFanSpeed(GPU.into(), 0, 50), Call::SetDefaultFanSpeed(GPU.into(), 0)]);
+    }
+
+    /// NVML limits short enough for a test
+    const SHORT: Limits = Limits { call: Duration::from_millis(200), load: Duration::from_millis(400) };
+
+    /// The longest a call that fails at once may take
+    const AT_ONCE: Duration = Duration::from_millis(100);
+
+    /// An NVML worker over a fake that holds [`GPU`] and whose fan_speed never returns
+    fn stalling_on_fan_speed() -> Arc<dyn Nvml> {
+        Arc::new(stalling_worker(GPU, ONE_FAN, NvmlOp::FanSpeed, SHORT))
+    }
+
+    #[test]
+    fn nvidia_release_after_a_timeout_fails_at_once() {
+        let nvml = stalling_on_fan_speed();
+        let mut fan = NvidiaFan::new(nvml.clone(), GPU.into(), 0);
+        fan.take_control().unwrap();
+        let timed_out = nvml.fan_speed(GPU, 0);
+
+        let start = Instant::now();
+        let result = fan.release();
+        let elapsed = start.elapsed();
+
+        assert!(matches!(&timed_out, Err(Error::NvmlTimeout { .. })), "{:?}", timed_out);
+        assert!(matches!(&result, Err(Error::NvmlStalled { .. })), "{:?}", result);
+        assert!(elapsed < AT_ONCE, "{:?}", elapsed);
+    }
+
+    #[test]
+    fn dropped_guard_releases_another_fan_after_an_nvidia_timeout() {
+        let calls = CallLog::default();
+        let nvml = stalling_on_fan_speed();
+        let mut guard = FanGuard::new();
+        guard.add(Box::new(FakeFan::new("a", &calls))).unwrap();
+        // Added last, so released first
+        guard.add(Box::new(NvidiaFan::new(nvml, GPU.into(), 0))).unwrap();
+
+        let duty = guard.set_duty(50);
+        let start = Instant::now();
+        drop(guard);
+        let elapsed = start.elapsed();
+
+        assert!(duty.is_err(), "{:?}", duty);
+        assert_eq!(log_of(&calls), [("a", Op::TakeControl), ("a", Op::SetDuty), ("a", Op::Release)]);
+        assert!(elapsed < AT_ONCE, "{:?}", elapsed);
     }
 
     #[test]
