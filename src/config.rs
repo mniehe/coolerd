@@ -1024,6 +1024,16 @@ mod tests {
             .collect()
     }
 
+    /// The `gpu` of each NVIDIA source of a zone
+    fn nvidia_source_gpus(zone: &Zone) -> Vec<&str> {
+        zone.sources.iter()
+            .filter_map(|source| match &source.kind {
+                Source::Nvidia { gpu } => Some(gpu.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn every_example_config_loads() {
         for example in ["supermicro", "hwmon-desktop", "nvidia", "mixed"] {
@@ -1254,6 +1264,7 @@ mod tests {
 
         assert!(named.len() >= 2, "{:?}", named);
         assert!(named.iter().all(|s| s.steps.is_some() && s.curve_hysteresis.is_some()));
+        assert!(named.iter().all(|s| s.curve.as_deref() == Some("gpu")), "{:?}", named);
     }
 
     #[test]
@@ -1291,7 +1302,9 @@ mod tests {
 
         assert_eq!(config.zones.len(), 1);
         assert_eq!(source_types(&config.zones[0]), ["nvidia"]);
-        assert!(matches!(&config.zones[0].fan_list[..], [FanConfig::Nvidia { .. }]));
+        // The zone reads the GPU whose fan it drives
+        assert_eq!(nvidia_source_gpus(&config.zones[0]), ["00000000:01:00.0"]);
+        assert_eq!(config.zones[0].fan_list, [FanConfig::Nvidia { gpu: "00000000:01:00.0".into(), fan: 0 }]);
     }
 
     #[test]
@@ -1306,6 +1319,12 @@ mod tests {
         assert_eq!(config.zones[1].fan_list, [nvidia_fan]);
         assert_eq!(config.zones[0].curve.as_deref(), Some("gpu"));
         assert_eq!(config.zones[0].curve, config.zones[1].curve);
+        // Both zones read the GPU whose fan the second zone drives, and
+        // neither stops the daemon when that read fails
+        assert_eq!(nvidia_source_gpus(&config.zones[0]), ["00000000:01:00.0"]);
+        assert_eq!(nvidia_source_gpus(&config.zones[1]), ["00000000:01:00.0"]);
+        assert_eq!(config.zones[0].sources[1].on_failure, OnFailure::Dcycle { dcycle: 80 });
+        assert_eq!(config.zones[1].sources[0].on_failure, OnFailure::Dcycle { dcycle: 100 });
     }
 
     #[test]

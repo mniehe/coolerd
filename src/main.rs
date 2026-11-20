@@ -617,7 +617,10 @@ mod tests {
         let targets = file_link_targets(&read_repo_file(Path::new("README.md")));
         let mut wanted: Vec<String> = pages[1..].iter().map(|page| page.display().to_string()).collect();
 
-        wanted.extend(EXAMPLES.iter().map(|name| format!("docs/examples/{}.toml", name)));
+        for name in EXAMPLES {
+            wanted.push(format!("docs/examples/{}.toml", name));
+            wanted.push(format!("docs/examples/{}.nix", name));
+        }
 
         // A README with no page to link would pass on an empty docs directory
         assert!(pages.len() > 1, "docs holds no page");
