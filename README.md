@@ -273,6 +273,6 @@ The old NixOS option path still works. Each option under `services.ipmi-fan-cont
 Before switching a host to coolerd, note these points:
 
 * Host settings that name the old unit, user or group do not carry over. Rename overrides written as `systemd.services.ipmi-fan-control.*`, drop-ins for `ipmi-fan-control.service`, and local udev rules or ACLs that name the `ipmi-fan-control` user or group.
-* A `package` override must provide `bin/coolerd`, or the system build fails.
-* Move all definitions of one option to the new path together. The old and new paths define the same option, and the old path does not keep `lib.mkBefore` and `lib.mkAfter` ordering.
-* On the switch, NixOS stops `ipmi-fan-control.service`, which attempts its normal exit: it sets the fans to full and restores the saved fan mode. NixOS then starts `coolerd.service`. A started unit does not prove that coolerd controls the fans, so read `journalctl -u coolerd.service` after the switch to confirm that the zones started.
+* A normal system build fails when a `package` override has no executable file `bin/coolerd`. The check does not run the program, so it does not prove that coolerd starts.
+* Move all definitions of one option to the new path together. The old and new paths define the same option. `lib.mkBefore` and `lib.mkAfter` keep their order among definitions that are all on the old path, but not relative to definitions on the new path.
+* On the switch, NixOS stops `ipmi-fan-control.service`, which attempts to set the fans to full and restore the saved fan mode as it exits. NixOS then starts `coolerd.service`. A started unit does not prove that coolerd controls the fans, and each zone logs `Starting loop for fans` before its first fan update. After the switch, watch `journalctl -u coolerd.service` for errors and restarts. At the default `log_level` of `info`, coolerd logs no line per update; set `log_level = "debug"` to see each duty update.
