@@ -43,31 +43,68 @@ use {
 
 static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
+/// The path that names a failure to listen for signals in its error
+const SIGNALS_PATH: &str = "(interrupt)";
+
+/// The signals that stop the program. From the moment it listens, a signal
+/// no longer ends the process at once; it waits here until `recv`.
 #[cfg(unix)]
-async fn interrupted() -> io::Result<()> {
-    use tokio::signal::unix::{signal, SignalKind};
+struct Signals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
 
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut sigterm = signal(SignalKind::terminate())?;
+#[cfg(unix)]
+impl Signals {
+    fn listen() -> io::Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
 
-    tokio::select! {
-        _ = sigint.recv() => {}
-        _ = sigterm.recv() => {}
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
     }
 
-    Ok(())
+    /// Wait for a signal, which may have arrived before the call
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+    }
 }
 
 #[cfg(windows)]
-async fn interrupted() -> io::Result<()> {
-    use tokio::signal::windows::{ctrl_break, ctrl_c};
+struct Signals {
+    ctrl_break: tokio::signal::windows::CtrlBreak,
+    ctrl_c: tokio::signal::windows::CtrlC,
+}
 
-    tokio::select! {
-        _ = ctrl_break() => {},
-        _ = ctrl_c() => {},
+#[cfg(windows)]
+impl Signals {
+    fn listen() -> io::Result<Self> {
+        use tokio::signal::windows::{ctrl_break, ctrl_c};
+
+        Ok(Self { ctrl_break: ctrl_break()?, ctrl_c: ctrl_c()? })
     }
 
-    Ok(())
+    /// Wait for a signal, which may have arrived before the call
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.ctrl_break.recv() => {}
+            _ = self.ctrl_c.recv() => {}
+        }
+    }
+}
+
+/// Listen for signals, then open the app. A signal that arrives while the
+/// app opens sessions waits until the zone loops run, so it stops the program
+/// through the exit path that releases the fans and restores the fan mode.
+fn start_up<S, A>(listen: impl FnOnce() -> io::Result<S>, open: impl FnOnce() -> Result<A>) -> Result<(S, A)> {
+    let signals = listen().map_err(|source| Error::Io { path: SIGNALS_PATH.into(), source })?;
+    let app = open()?;
+
+    Ok((signals, app))
 }
 
 struct MainApp {
@@ -99,9 +136,9 @@ impl MainApp {
         })
     }
 
-    /// Run asynchronous loops for each zone. Returns when interrupted via
-    /// signal handlers (eg. ^C) or if a fatal error occurs.
-    async fn run(&mut self) -> Result<()> {
+    /// Run asynchronous loops for each zone. Returns when interrupted by one
+    /// of `signals` (eg. ^C) or if a fatal error occurs.
+    async fn run(&mut self, signals: &mut Signals) -> Result<()> {
         let mut loops = JoinSet::new();
 
         for zone_config in &self.config.zones {
@@ -120,11 +157,9 @@ impl MainApp {
         loop {
             let ret: Result<()> = tokio::select! {
                 // Explicitly interrupted by ^C or signal handler
-                c = interrupted() => {
-                    if c.is_ok() {
-                        info!("Interrupted");
-                    }
-                    c.map_err(|e| Error::Io { path: "(interrupt)".into(), source: e })
+                _ = signals.recv() => {
+                    info!("Interrupted");
+                    Ok(())
                 }
                 // Oh boy, this is an Option<Result<Result<()>, JoinError>>
                 r = loops.join_next() => {
@@ -352,8 +387,8 @@ async fn main_wrapper() -> Result<()> {
 
     trace!("Loaded config: {:#?}", config);
 
-    let mut app = MainApp::new(config)?;
-    let run = app.run().await;
+    let (mut signals, mut app) = start_up(Signals::listen, || MainApp::new(config))?;
+    let run = app.run(&mut signals).await;
 
     // Every zone task has ended, so every guard has released its fans
     exit_result(run, app.release_failures.outcome())
@@ -377,9 +412,16 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use {
-        std::path::Path,
+        std::{
+            cell::{Cell, RefCell},
+            io,
+            path::Path,
+            process,
+            time::Duration,
+        },
         clap::CommandFactory,
-        super::{exit_result, Opt, query_sensors, sessions_to_open},
+        tokio::time::timeout,
+        super::{exit_result, Opt, query_sensors, sessions_to_open, Signals, start_up},
         crate::{
             config::{Config, FanConfig, parse_config},
             error::Error,
@@ -491,6 +533,50 @@ mod tests {
         ));
 
         assert_eq!(sorted_sessions(&config), [("default".to_owned(), vec![1])]);
+    }
+
+    #[test]
+    fn start_up_listens_for_signals_before_it_opens_the_app() {
+        let steps = RefCell::new(Vec::new());
+
+        let started = start_up(
+            || { steps.borrow_mut().push("listen"); Ok("signals") },
+            || { steps.borrow_mut().push("open"); Ok("app") },
+        );
+
+        assert_eq!(started.unwrap(), ("signals", "app"));
+        assert_eq!(steps.into_inner(), ["listen", "open"]);
+    }
+
+    #[test]
+    fn start_up_opens_nothing_when_it_cannot_listen() {
+        let opened = Cell::new(false);
+
+        let started = start_up(
+            || Err::<(), _>(io::Error::other("no signal driver")),
+            || { opened.set(true); Ok(()) },
+        );
+
+        assert!(matches!(&started, Err(Error::Io { path, .. }) if path == Path::new("(interrupt)")), "{:?}", started);
+        assert!(!opened.get());
+    }
+
+    /// A signal sent to this process after it listens, but before anything
+    /// waits for one, is delivered at the first wait. The process handles
+    /// SIGINT from the moment it listens, so the signal does not stop it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signal_before_the_first_wait_is_delivered() {
+        let mut signals = Signals::listen().unwrap();
+
+        let status = process::Command::new("kill")
+            .args(["-INT", &process::id().to_string()])
+            .status()
+            .unwrap();
+        let delivered = timeout(Duration::from_secs(2), signals.recv()).await;
+
+        assert!(status.success(), "{:?}", status);
+        assert!(delivered.is_ok(), "no signal within 2 seconds");
     }
 
     #[test]

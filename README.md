@@ -194,7 +194,7 @@ steps = [{ temp = 40, dcycle = 30 }, { temp = 80, dcycle = 100 }]
 
 The program finds the chip by name once, at startup, and keeps the chip's device path. If the chip's driver is unbound and bound again while the program runs, another chip can take that path, and the program then drives that chip. Restart the program after you rebind a hwmon driver.
 
-If the program fails to release a fan on exit, it logs the error and exits with status 1, also when a signal stopped it. Earlier versions exited with status 0 in that case.
+If the program fails to release a fan on exit, it logs the error and exits with status 1, also when a signal stopped it. Earlier versions exited with status 0 in that case. The program listens for SIGINT and SIGTERM before it opens an IPMI session or takes over a fan, so a signal that arrives during startup stops it through the same exit path. Earlier versions started to listen only after the zones had started.
 
 ### NVIDIA fans
 
