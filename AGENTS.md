@@ -3,8 +3,8 @@
 coolerd is a Rust daemon that controls fan duty on Linux. It reads
 temperatures from IPMI sensors, files, hwmon, `smartctl`, `hdparm` and
 `nvidia-smi`, maps them through curves, and writes the duty to a fan backend:
-Supermicro zones, with OEM raw commands through libfreeipmi, or hwmon PWM
-files. This repository is a fork of the archived
+Supermicro zones, with OEM raw commands through libfreeipmi, hwmon PWM
+files, or NVIDIA GPU fans through the host's NVML library. This repository is a fork of the archived
 `chenxiaolong/ipmi-fan-control`, so nothing goes upstream. It was named
 ipmi-fan-control until the rename; the NixOS module and the overlay keep that
 name as option and package aliases. It runs on a real server through the NixOS module in
@@ -47,8 +47,10 @@ Ask first, naming the exact action, before:
 - running the built binary with any config, `ipmitool`, or any other command
   that can reach a BMC or write under `/sys`. On start the daemon takes over
   the fans: a Supermicro fan switches the board to full fan mode, and a hwmon
-  fan switches `pwm<N>_enable` of this machine's own chip to manual. A killed
-  process leaves them that way. `testing.md` holds raw commands aimed at a
+  fan switches `pwm<N>_enable` of this machine's own chip to manual. An
+  NVIDIA fan is set to a manual speed through NVML. A killed process leaves
+  them that way. The same holds for `nvidia-smi` and any other program that
+  loads `libnvidia-ml` on a machine with an NVIDIA GPU. `testing.md` holds raw commands aimed at a
   live machine;
 - any command on a deployed host, and any `nixos-rebuild` or other activation;
 - pushing, merging, or anything that lands on `master`. The server's
@@ -71,7 +73,8 @@ worktree other than `flake.lock` and the dependency tables of `Cargo.toml`.
 ```
 /src
   main.rs       # CLI, zone loops, shutdown path
-  fan.rs        # The Fan trait, its Supermicro and hwmon backends, FanGuard, build_fan
+  fan.rs        # The Fan trait, its Supermicro, hwmon and NVIDIA backends, FanGuard, build_fan
+  nvml.rs       # The Nvml trait and RealNvml: NVML calls on one worker thread, each under a time limit
   session.rs    # IpmiSession: the shared BMC connection and its restore on drop
   hwmon.rs      # HwmonRoot: finds a hwmon chip by name under /sys/class/hwmon
   curve.rs      # Pure duty logic: curve, aggregation, hysteresis, smoothing, failure floor
@@ -110,7 +113,8 @@ report different lints.
 
 Do not run the daemon on a development machine. No IPMI hardware exists
 here, and a hwmon fan would take over this machine's own fans. Behaviour is
-proved by tests of pure functions and of fake hwmon trees.
+proved by tests of pure functions, of fake hwmon trees and of a fake NVML.
+No test loads the real `libnvidia-ml`.
 
 ## Rules
 
@@ -146,6 +150,14 @@ proved by tests of pure functions and of fake hwmon trees.
   A program that must match the host's driver, as `nvidia-smi` must, is not
   taken from `pkgs`: the host passes its package through the `extraPackages`
   option.
+- Every NVML call goes through the `Nvml` trait in `src/nvml.rs`. `RealNvml`
+  runs it on its worker thread under a named time limit, because a call into
+  a hung driver never returns and a zone loop cannot be cancelled while it
+  blocks. Nothing else calls `nvml-wrapper`, and nothing calls
+  `nvmlShutdown`.
+- A fan's `release` returns an error when it could not leave the fan in a
+  safe state. `FanGuard` records that error, and the process then exits with
+  a failure status.
 - Raw IPMI bytes are named constants in `src/ipmi.rs`. A new one carries a
   comment that says where the value comes from, because no test can check it.
 - Each `unsafe` block carries a comment that says why it is sound, as the
@@ -202,6 +214,8 @@ the fans slow, or breaks the deployed unit:
 - `src/command.rs`
 - `src/fan.rs` and `src/session.rs`, which write the duty and restore the
   fans on exit, and `src/hwmon.rs`, which picks the chip they write to
+- `src/nvml.rs`, which bounds every NVML call so that a hung driver cannot
+  block the shutdown path
 - the zone loop and the shutdown path in `src/main.rs`
 - `nix/**`
 - `.claude/review/review.yaml`

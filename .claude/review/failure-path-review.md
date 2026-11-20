@@ -27,6 +27,10 @@ termination owner.
 - `src/command.rs`: `CommandRunner` returns `CommandTimeout` when a program
   passes its limit and `CommandStillRunning` while a killed program has not
   exited.
+- `src/nvml.rs`: `RealNvml` returns `NvmlTimeout` when a call passes its
+  limit and `NvmlStalled` or `NvmlNoReply` for every call after that.
+  `NvidiaFan::set_duty` in `src/fan.rs` returns those from its speed read;
+  any other failed speed read is logged and the write goes ahead.
 - `src/curve.rs`: a failed source that did not end the read is dropped from
   the duty (`ignore`) or sets a duty floor (`dcycle`). `ZoneState::next_duty`
   reports each change as a `Transition`, which the zone loop logs.
