@@ -145,7 +145,7 @@ pub mod fake {
     pub struct FakeNvml {
         pub gpus: HashMap<String, FakeGpu>,
         pub failing: Option<Op>,
-        calls: Mutex<Vec<Call>>,
+        pub calls: Mutex<Vec<Call>>,
     }
 
     impl FakeNvml {

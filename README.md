@@ -1,7 +1,7 @@
 coolerd
 =======
 
-coolerd is a Linux fan control daemon. It reads temperatures from sources, maps them through curves that sources and zones can share, and drives fans through backends. The sources are IPMI sensors, files, hwmon chips, `smartctl`, `hdparm` and `nvidia-smi`. The fan backends are Supermicro boards over IPMI and hwmon PWM channels.
+coolerd is a Linux fan control daemon. It reads temperatures from sources, maps them through curves that sources and zones can share, and drives fans through backends. The sources are IPMI sensors, files, hwmon chips, `smartctl`, `hdparm` and `nvidia-smi`. The fan backends are Supermicro boards over IPMI, hwmon PWM channels and NVIDIA GPU fans through NVML.
 
 _Note_: Only Linux is supported.
 
@@ -35,6 +35,7 @@ This project depends on:
 * [optional] smartmontools (for querying HDD/SSD drive temperatures)
 * [optional] hdparm (for querying Hitachi/HGST/WD drive temperatures while spun down)
 * [optional] nvidia-smi from the NVIDIA driver (for querying NVIDIA GPU temperatures). The `nvidia` source selects the card by PCI bus id or UUID; see [`config.sample.toml`](config.sample.toml). On NixOS, supply it through `extraPackages` as shown under [NixOS](#nixos).
+* [optional] `libnvidia-ml.so.1` from the NVIDIA driver (for driving NVIDIA GPU fans). The program loads it at run time and does not need it to build; see [NVIDIA fans](#nvidia-fans).
 
 These packages can be installed from the system package manager:
 
@@ -192,6 +193,27 @@ steps = [{ temp = 40, dcycle = 30 }, { temp = 80, dcycle = 100 }]
 ```
 
 The program finds the chip by name once, at startup, and keeps the chip's device path. If the chip's driver is unbound and bound again while the program runs, another chip can take that path, and the program then drives that chip. Restart the program after you rebind a hwmon driver.
+
+### NVIDIA fans
+
+An `nvidia` fan, `{ type = "nvidia", gpu = "00000000:01:00.0", fan = 0 }`, is fan 0 of the NVIDIA GPU at PCI bus id `00000000:01:00.0`. `fan` starts at 0. A fan selects its GPU by PCI bus id only; a GPU UUID, which the `nvidia` source accepts, is rejected. The domain may have four or eight hex digits in either case, so `0000:01:00.0` and `00000000:01:00.0` name the same GPU, and two zones cannot drive the same fan of one GPU in either spelling. To list the bus ids, run `nvidia-smi --query-gpu=pci.bus_id --format=csv`.
+
+The program drives the fan through NVML, the management library of the NVIDIA driver. It loads `libnvidia-ml.so.1` at run time, when a zone with an `nvidia` fan starts, because the library must match the driver that the kernel has loaded. A config without an `nvidia` fan never loads it. Setting a GPU fan speed needs root, so the program must run as root.
+
+On startup the program reads the GPU's fan count and the fan's speed limits, and logs the limits. It fails when the fan does not exist or when the limits are not a range within 0 to 100%. It changes nothing at startup. Its first update sets the fan speed, which switches the fan to manual control; later updates set the speed only when it changes. NVML refuses a speed below the fan's minimum, so the program raises a lower duty cycle to the minimum: with a minimum of 30%, a duty cycle of 20% runs the fan at 30%. A duty cycle above the fan's maximum is capped at the maximum. The debug log shows the speed that NVML reports as the fan's speed before each update.
+
+On exit, also after an error, the program gives the fan back to the driver's default fan policy, so that the driver sets the speed from the GPU temperature again. If that call fails, the program sets the fan to its maximum instead. This leaves the fan in manual control at full speed until the program next starts and exits normally, or until the driver is reloaded.
+
+This zone drives fan 0 of a GPU from the GPU's own temperature:
+
+```toml
+[[zones]]
+fans = [{ type = "nvidia", gpu = "00000000:01:00.0", fan = 0 }]
+sources = [{ type = "nvidia", gpu = "00000000:01:00.0" }]
+steps = [{ temp = 50, dcycle = 30 }, { temp = 85, dcycle = 100 }]
+```
+
+On NixOS, set `services.coolerd.enableNvidiaFans = true`. It runs the service as root and puts `/run/opengl-driver/lib` on the service's `LD_LIBRARY_PATH`, where NixOS links the driver's libraries. `/run/opengl-driver/lib` exists only when the host enables its graphics driver packages. The `nvidia` source also needs `nvidia-smi` on the service's `PATH`, through `extraPackages` as shown under [NixOS](#nixos).
 
 NixOS
 -----

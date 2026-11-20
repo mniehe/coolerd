@@ -302,6 +302,12 @@ pub enum FanConfig {
         chip: String,
         pwm: u8,
     },
+    /// Fan `fan` of the NVIDIA GPU at PCI bus id `gpu`. Validation rewrites
+    /// `gpu` to the canonical form of its PCI bus id.
+    Nvidia {
+        gpu: String,
+        fan: u32,
+    },
 }
 
 /// A zone may also be written as a TOML array, whose values serde reads in the
@@ -505,21 +511,52 @@ fn is_pci_device(device: &str) -> bool {
     is_hex_digits(device, 2) && matches!(device.as_bytes()[0], b'0' | b'1')
 }
 
-/// Whether `gpu` is a full PCI bus id, `DDDD:BB:DD.F` or `DDDDDDDD:BB:DD.F`,
-/// with hex domain and bus, a device from 00 to 1f and a function from 0 to 7.
-fn is_pci_bus_id(gpu: &str) -> bool {
-    let parts: Vec<&str> = gpu.split(':').collect();
-    let [domain, bus, device_function] = parts[..] else {
-        return false;
-    };
-    let Some((device, function)) = device_function.split_once('.') else {
-        return false;
-    };
+/// A full PCI bus id. Its canonical form, which `Display` writes, has an
+/// eight-digit domain and lower-case hex: `00000000:01:00.0`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PciBusId {
+    domain: u32,
+    bus: u8,
+    device: u8,
+    function: u8,
+}
 
-    (is_hex_digits(domain, 4) || is_hex_digits(domain, 8))
-        && is_hex_digits(bus, 2)
-        && is_pci_device(device)
-        && matches!(function, "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7")
+impl PciBusId {
+    /// Parse `DDDD:BB:DD.F` or `DDDDDDDD:BB:DD.F`, with hex domain and bus in
+    /// either case, a device from 00 to 1f and a function from 0 to 7
+    fn parse(id: &str) -> Option<Self> {
+        let parts: Vec<&str> = id.split(':').collect();
+        let [domain, bus, device_function] = parts[..] else {
+            return None;
+        };
+        let (device, function) = device_function.split_once('.')?;
+        let valid = (is_hex_digits(domain, 4) || is_hex_digits(domain, 8))
+            && is_hex_digits(bus, 2)
+            && is_pci_device(device)
+            && matches!(function, "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7");
+
+        if !valid {
+            return None;
+        }
+
+        Some(Self {
+            domain: u32::from_str_radix(domain, 16).ok()?,
+            bus: u8::from_str_radix(bus, 16).ok()?,
+            device: u8::from_str_radix(device, 16).ok()?,
+            function: function.parse().ok()?,
+        })
+    }
+}
+
+impl fmt::Display for PciBusId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:08x}:{:02x}:{:02x}.{:x}", self.domain, self.bus, self.device, self.function)
+    }
+}
+
+/// Whether `gpu` is a full PCI bus id, as [`PciBusId::parse`] accepts
+fn is_pci_bus_id(gpu: &str) -> bool {
+    PciBusId::parse(gpu).is_some()
 }
 
 pub fn load_config(path: &Path) -> Result<Config> {
@@ -737,14 +774,19 @@ fn legacy_fans(numbers: &[u8], i: usize) -> Result<Vec<(String, FanConfig)>, Str
     Ok(fans)
 }
 
-/// The fans of a `fans` list, which must not repeat a fan
+/// The fans of a `fans` list, which must not repeat a fan, with the `gpu` of
+/// each NVIDIA fan in canonical form
 fn listed_fans(fans: &[FanConfig], i: usize) -> Result<Vec<(String, FanConfig)>, String> {
     if fans.is_empty() {
         return Err(format!("zones[{}].fans: must be non-empty", i));
     }
 
+    let mut listed: Vec<(String, FanConfig)> = Vec::new();
+
     for (k, fan) in fans.iter().enumerate() {
-        if fans[..k].contains(fan) {
+        let fan = canonical_fan(fan).map_err(|reason| format!("zones[{}].fans[{}].{}", i, k, reason))?;
+
+        if listed.iter().any(|(_, earlier)| *earlier == fan) {
             return Err(format!("zones[{}].fans[{}]: listed twice", i, k));
         }
 
@@ -753,16 +795,31 @@ fn listed_fans(fans: &[FanConfig], i: usize) -> Result<Vec<(String, FanConfig)>,
             return Err(format!("zones[{}].fans[{}].pwm: must be greater than 0", i, k));
         }
 
-        if let FanConfig::Hwmon { chip, .. } = fan {
+        if let FanConfig::Hwmon { chip, .. } = &fan {
             if let Some(reason) = chip_error(chip) {
                 return Err(format!("zones[{}].fans[{}].chip: {}", i, k, reason));
             }
         }
+
+        listed.push((format!("zones[{}].fans[{}]", i, k), fan));
     }
 
-    Ok(fans.iter().enumerate()
-        .map(|(k, fan)| (format!("zones[{}].fans[{}]", i, k), fan.clone()))
-        .collect())
+    Ok(listed)
+}
+
+/// `fan` with the `gpu` of an NVIDIA fan in canonical form, so that two
+/// spellings of one bus id name one fan. The error is the reason after the
+/// fan's key.
+fn canonical_fan(fan: &FanConfig) -> Result<FanConfig, String> {
+    let FanConfig::Nvidia { gpu, fan } = fan else {
+        return Ok(fan.clone());
+    };
+    // NVML finds a GPU by bus id, so a fan does not take the UUID that a
+    // source accepts
+    let id = PciBusId::parse(gpu)
+        .ok_or_else(|| format!("gpu: select the GPU by PCI bus id, such as 00000000:01:00.0: {:?}", gpu))?;
+
+    Ok(FanConfig::Nvidia { gpu: id.to_string(), fan: *fan })
 }
 
 /// Why `chip` can never equal a hwmon `name` file, which is compared after
@@ -782,8 +839,9 @@ fn chip_error(chip: &str) -> Option<&'static str> {
 /// Check that no fan is driven by two zones, which would fight over its duty.
 /// A Supermicro fan is the same fan in two zones when both name the same zone
 /// number on the same session. A hwmon fan is the same fan when both name the
-/// same chip and channel, whatever their sessions. The zones must have passed
-/// `zone_fans`.
+/// same chip and channel, and an NVIDIA fan when both name the same bus id, in
+/// canonical form, and fan index, whatever their sessions. The zones must
+/// have passed `zone_fans`.
 fn check_fan_owners(zones: &[Zone]) -> Result<(), String> {
     let mut owners = HashMap::new();
 
@@ -791,7 +849,7 @@ fn check_fan_owners(zones: &[Zone]) -> Result<(), String> {
         for (key, fan) in keyed_fans(zone, i)? {
             let session = match fan {
                 FanConfig::Supermicro { .. } => Some(zone.session.0.clone()),
-                FanConfig::Hwmon { .. } => None,
+                FanConfig::Hwmon { .. } | FanConfig::Nvidia { .. } => None,
             };
             let owner = (session, fan);
 
@@ -1061,6 +1119,31 @@ mod tests {
 
         assert_eq!(zone.fan_list, [FanConfig::Hwmon { chip: "nct6798".into(), pwm: 2 }]);
         assert!(matches!(&zone.sources[..], [s] if matches!(&s.kind, Source::Hwmon { chip, input: 1 } if chip == "k10temp")));
+    }
+
+    #[test]
+    fn sample_nvidia_zone_loads_when_uncommented() {
+        let sample = include_str!("../config.sample.toml");
+        let start = sample.find("#[[zones]]\n#fans = [{ type = \"nvidia\"").expect("the sample has a commented nvidia zone");
+        let end = start + sample[start..].find("\n\n").unwrap_or(sample.len() - start);
+        let block = &sample[start..end];
+        let uncommented: Vec<&str> = block.lines().map(|l| &l[1..]).collect();
+        let config = parse(&sample.replacen(block, &uncommented.join("\n"), 1)).unwrap();
+        let zone = config.zones.last().unwrap();
+
+        assert_eq!(zone.fan_list, [FanConfig::Nvidia { gpu: "00000000:01:00.0".into(), fan: 0 }]);
+        assert!(matches!(&zone.sources[..], [s] if matches!(&s.kind, Source::Nvidia { gpu } if gpu == "00000000:01:00.0")));
+    }
+
+    #[test]
+    fn readme_nvidia_fan_example_loads() {
+        let blocks = readme_toml_blocks();
+        let block = blocks.iter()
+            .find(|b| b.contains(r#"fans = [{ type = "nvidia""#))
+            .expect("the README has a TOML example of an nvidia fan");
+        let config = parse(block).unwrap();
+
+        assert_eq!(config.zones[0].fan_list, [FanConfig::Nvidia { gpu: "00000000:01:00.0".into(), fan: 0 }]);
     }
 
     #[test]
@@ -1440,6 +1523,84 @@ mod tests {
         let other = r#"[{ type = "hwmon", chip = "nct6798", pwm = 3 }]"#;
 
         assert!(parse(&format!("{}{}", hwmon_zone_toml(None, NCT6798_PWM_2), hwmon_zone_toml(None, other))).is_ok());
+    }
+
+    /// A GPU UUID in the form nvidia-smi prints
+    const GPU_UUID: &str = "GPU-3c1a2b4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d";
+
+    /// A fans list with fan `fan` of the NVIDIA GPU at `gpu`
+    fn nvidia_fans(gpu: &str, fan: u32) -> String {
+        format!(r#"[{{ type = "nvidia", gpu = "{}", fan = {} }}]"#, gpu, fan)
+    }
+
+    fn nvidia_fan(gpu: &str, fan: u32) -> FanConfig {
+        FanConfig::Nvidia { gpu: gpu.into(), fan }
+    }
+
+    #[test]
+    fn nvidia_fan_gpu_loads_in_canonical_form() {
+        let config = parse(&hwmon_zone_toml(None, &nvidia_fans("00AB:81:1F.7", 1))).unwrap();
+
+        assert_eq!(config.zones[0].fan_list, [nvidia_fan("000000ab:81:1f.7", 1)]);
+    }
+
+    #[test]
+    fn nvidia_fan_with_eight_digit_domain_loads_unchanged() {
+        let config = parse(&hwmon_zone_toml(None, &nvidia_fans("00000000:01:00.0", 0))).unwrap();
+
+        assert_eq!(config.zones[0].fan_list, [nvidia_fan("00000000:01:00.0", 0)]);
+    }
+
+    #[test]
+    fn rejects_nvidia_fan_driven_by_two_zones_in_two_spellings() {
+        let contents = format!("{}{}",
+            hwmon_zone_toml(None, &nvidia_fans("0000:01:00.0", 0)),
+            hwmon_zone_toml(None, &nvidia_fans("00000000:01:00.0", 0)));
+
+        assert_eq!(validation_reason(&contents), "zones[1].fans[0]: already driven by zones[0]");
+    }
+
+    #[test]
+    fn rejects_nvidia_fan_listed_twice_in_two_spellings() {
+        let fans = r#"[{ type = "nvidia", gpu = "0000:01:00.0", fan = 0 }, { type = "nvidia", gpu = "00000000:01:00.0", fan = 0 }]"#;
+
+        assert_eq!(validation_reason(&hwmon_zone_toml(None, fans)), "zones[0].fans[1]: listed twice");
+    }
+
+    #[test]
+    fn accepts_two_fans_of_one_gpu_in_two_zones() {
+        let contents = format!("{}{}",
+            hwmon_zone_toml(None, &nvidia_fans("00000000:01:00.0", 0)),
+            hwmon_zone_toml(None, &nvidia_fans("00000000:01:00.0", 1)));
+
+        assert!(parse(&contents).is_ok());
+    }
+
+    #[test]
+    fn rejects_gpu_uuid_in_nvidia_fan() {
+        let fans = format!(r#"[{{ type = "hwmon", chip = "nct6798", pwm = 2 }}, {}]"#,
+            nvidia_fans(GPU_UUID, 0).trim_matches(['[', ']']));
+
+        let reason = validation_reason(&hwmon_zone_toml(None, &fans));
+
+        assert!(reason.starts_with("zones[0].fans[1].gpu: "), "{}", reason);
+        assert!(reason.contains(GPU_UUID), "{}", reason);
+    }
+
+    #[test]
+    fn rejects_malformed_nvidia_fan_gpu() {
+        for gpu in ["", "0", "01:00.0", "000:01:00.0", "0000:01:20.0", "0000:01:00.8", "0000:01:00.0 ", "+000:01:00.0"] {
+            let reason = validation_reason(&hwmon_zone_toml(None, &nvidia_fans(gpu, 0)));
+
+            assert!(reason.starts_with("zones[0].fans[0].gpu: "), "{:?}: {}", gpu, reason);
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_key_in_nvidia_fan() {
+        let message = parse_error(&hwmon_zone_toml(None, r#"[{ type = "nvidia", gpu = "00000000:01:00.0", fan = 0, speed = 1 }]"#));
+
+        assert!(message.contains("unknown field `speed`"), "{}", message);
     }
 
     #[test]

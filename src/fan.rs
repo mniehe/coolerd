@@ -10,6 +10,7 @@ use {
         config::FanConfig,
         error::{Error, Result},
         hwmon::{HwmonRoot, read_number, write_number},
+        nvml::Nvml,
         session::IpmiSession,
     },
 };
@@ -282,10 +283,119 @@ impl Fan for HwmonPwm {
     }
 }
 
+/// The highest fan speed NVML can report as a limit, in percent
+const NVIDIA_SPEED_MAX: u32 = 100;
+
+/// One fan of an NVIDIA GPU, found by the GPU's PCI bus id and driven through
+/// NVML. Take-over only reads the fan; the first duty switches it to manual
+/// control, and release gives it back to the driver's default policy.
+pub struct NvidiaFan {
+    nvml: Arc<dyn Nvml>,
+    gpu: String,
+    fan: u32,
+    /// The (min, max) speed the fan accepts, read at take-over. `None` until a
+    /// take-over succeeds and again after release.
+    limits: Option<(u32, u32)>,
+    /// The speed sent last since take-over
+    last_sent: Option<u32>,
+}
+
+impl NvidiaFan {
+    pub fn new(nvml: Arc<dyn Nvml>, gpu: String, fan: u32) -> Self {
+        Self { nvml, gpu, fan, limits: None, last_sent: None }
+    }
+
+    /// The fan's limits, which must be a range within 0 to 100 percent
+    fn read_limits(&self) -> Result<(u32, u32)> {
+        let (min, max) = self.nvml.fan_limits(&self.gpu)?;
+
+        if min > max || max > NVIDIA_SPEED_MAX {
+            return Err(Error::NvidiaFanLimits { gpu: self.gpu.clone(), min, max });
+        }
+
+        Ok((min, max))
+    }
+}
+
+/// The speed NVML is sent for `duty`: raised to the fan's minimum, because
+/// NVML rejects a lower speed, and capped at its maximum
+fn nvidia_target(duty: u8, (min, max): (u32, u32)) -> u32 {
+    u32::from(duty).max(min).min(max)
+}
+
+impl Fan for NvidiaFan {
+    fn describe(&self) -> String {
+        format!("nvidia gpu {} fan {}", self.gpu, self.fan)
+    }
+
+    /// Check that the fan exists and keep its limits. Nothing is written, so
+    /// a failed take-over leaves the fan under the driver's control.
+    fn take_control(&mut self) -> Result<()> {
+        let count = self.nvml.fan_count(&self.gpu)?;
+
+        if self.fan >= count {
+            return Err(Error::NvidiaFanMissing { gpu: self.gpu.clone(), fan: self.fan, count });
+        }
+
+        let (min, max) = self.read_limits()?;
+
+        info!("[{}] Taking over fan {}, speed limits {}% to {}%", self.gpu, self.fan, min, max);
+        self.limits = Some((min, max));
+        self.last_sent = None;
+
+        Ok(())
+    }
+
+    /// Send the target speed on the first call after take-over, whatever the
+    /// fan reports, because the reported speed does not show whether the
+    /// driver or this program controls the fan. Later calls send only a
+    /// changed target.
+    fn set_duty(&mut self, duty: u8) -> Result<Applied> {
+        let limits = self.limits.ok_or_else(|| Error::FanNotTaken(self.describe()))?;
+        let reported = self.nvml.fan_speed(&self.gpu, self.fan)?;
+        let before = Some(u8::try_from(reported).unwrap_or(u8::MAX));
+        let target = nvidia_target(duty, limits);
+
+        if self.last_sent == Some(target) {
+            return Ok(Applied { before, sent: None });
+        }
+
+        self.nvml.set_fan_speed(&self.gpu, self.fan, target)?;
+        self.last_sent = Some(target);
+
+        // The target is at most NVIDIA_SPEED_MAX, so it fits
+        Ok(Applied { before, sent: Some(u8::try_from(target).unwrap_or(u8::MAX)) })
+    }
+
+    /// Ask for the default fan policy. When that fails, run the fan at its
+    /// maximum under manual control, and return the first error.
+    fn release(&mut self) -> Result<()> {
+        let Some((_, max)) = self.limits.take() else {
+            return Ok(());
+        };
+
+        self.last_sent = None;
+        info!("[{}] Giving fan {} back to the default fan policy", self.gpu, self.fan);
+
+        let Err(default) = self.nvml.set_default_fan_speed(&self.gpu, self.fan) else {
+            return Ok(());
+        };
+
+        error!("Failed to give fan {} of GPU {} back to the default policy: {}; setting it to {}%",
+               self.fan, self.gpu, default, max);
+
+        if let Err(full) = self.nvml.set_fan_speed(&self.gpu, self.fan, max) {
+            error!("Failed to set fan {} of GPU {} to {}%: {}", self.fan, self.gpu, max, full);
+        }
+
+        Err(default)
+    }
+}
+
 /// Build the fan that `config` names. This is the only place that turns a
 /// fan config into a fan. A Supermicro fan needs the zone's IPMI session; a
-/// hwmon fan finds its chip under `hwmon`.
-pub fn build_fan(config: &FanConfig, session: Option<&Arc<IpmiSession>>, hwmon: &HwmonRoot) -> Result<Box<dyn Fan>> {
+/// hwmon fan finds its chip under `hwmon`; an NVIDIA fan calls `nvml`.
+pub fn build_fan(config: &FanConfig, session: Option<&Arc<IpmiSession>>, hwmon: &HwmonRoot, nvml: &Arc<dyn Nvml>) -> Result<Box<dyn Fan>> {
     match config {
         FanConfig::Supermicro { zone } => {
             let session = session
@@ -294,6 +404,7 @@ pub fn build_fan(config: &FanConfig, session: Option<&Arc<IpmiSession>>, hwmon: 
             Ok(Box::new(SupermicroZone::new(session.clone(), *zone)))
         }
         FanConfig::Hwmon { chip, pwm } => Ok(Box::new(HwmonPwm::new(hwmon.clone(), chip.clone(), *pwm))),
+        FanConfig::Nvidia { gpu, fan } => Ok(Box::new(NvidiaFan::new(nvml.clone(), gpu.clone(), *fan))),
     }
 }
 
@@ -379,6 +490,7 @@ mod tests {
             Fan,
             FanGuard,
             HwmonPwm,
+            NvidiaFan,
             SupermicroZone,
         },
         crate::{
@@ -387,12 +499,21 @@ mod tests {
             error::{Error, Result},
             hwmon::HwmonRoot,
             ipmi::FanMode,
+            nvml::{
+                fake::{Call, FakeGpu, FakeNvml, Op as NvmlOp},
+                Nvml,
+            },
             session::{
                 fake::{BoardLog, FakeBoard, PortCall},
                 IpmiSession,
             },
         },
     };
+
+    /// An NVML with no GPU, for fans that never call it
+    fn no_nvml() -> Arc<dyn Nvml> {
+        Arc::new(FakeNvml::default())
+    }
 
     fn log_of(calls: &CallLog) -> Vec<(&'static str, Op)> {
         calls.lock().unwrap().clone()
@@ -535,7 +656,7 @@ mod tests {
     fn supermicro_fan_needs_a_session() {
         let config = FanConfig::Supermicro { zone: 1 };
 
-        let error = build_fan(&config, None, &HwmonRoot::default()).err().expect("a supermicro fan without a session fails");
+        let error = build_fan(&config, None, &HwmonRoot::default(), &no_nvml()).err().expect("a supermicro fan without a session fails");
 
         assert!(matches!(&error, Error::FanWithoutSession(fan) if fan == "supermicro zone 1"), "{:?}", error);
     }
@@ -545,7 +666,7 @@ mod tests {
         let calls = BoardLog::default();
         let session = session_on(FakeBoard::new(FanMode::Standard, &calls));
 
-        let fan = build_fan(&FanConfig::Supermicro { zone: 1 }, Some(&session), &HwmonRoot::default()).unwrap();
+        let fan = build_fan(&FanConfig::Supermicro { zone: 1 }, Some(&session), &HwmonRoot::default(), &no_nvml()).unwrap();
 
         assert_eq!(fan.describe(), "supermicro zone 1 on session test");
     }
@@ -873,8 +994,214 @@ mod tests {
     fn hwmon_fan_is_built_without_a_session() {
         let config = FanConfig::Hwmon { chip: "nct6798".into(), pwm: 2 };
 
-        let fan = build_fan(&config, None, &HwmonRoot::default()).unwrap();
+        let fan = build_fan(&config, None, &HwmonRoot::default(), &no_nvml()).unwrap();
 
         assert_eq!(fan.describe(), "hwmon nct6798 pwm2");
+    }
+
+    const GPU: &str = "00000000:01:00.0";
+
+    /// One fan at 20% with limits of 30% and 100%, as on an RTX A4000
+    const ONE_FAN: FakeGpu = FakeGpu { fans: 1, limits: (30, 100), speed: 20 };
+
+    /// An NVML that holds [`GPU`], which reports `reports`
+    fn nvml_with(reports: FakeGpu) -> Arc<FakeNvml> {
+        Arc::new(FakeNvml::with_gpu(GPU, reports))
+    }
+
+    fn nvidia_fan(nvml: &Arc<FakeNvml>, gpu: &str, fan: u32) -> NvidiaFan {
+        NvidiaFan::new(nvml.clone(), gpu.into(), fan)
+    }
+
+    /// The setter calls of `nvml`, which are the calls that change a fan
+    fn sets_of(nvml: &FakeNvml) -> Vec<Call> {
+        nvml.calls().into_iter()
+            .filter(|call| matches!(call, Call::SetFanSpeed(..) | Call::SetDefaultFanSpeed(..)))
+            .collect()
+    }
+
+    #[test]
+    fn nvidia_set_duty_raises_to_the_minimum_and_sends_only_changes() {
+        let nvml = nvml_with(ONE_FAN);
+        let mut fan = nvidia_fan(&nvml, GPU, 0);
+        fan.take_control().unwrap();
+
+        let first = fan.set_duty(20).unwrap();
+        let repeated = fan.set_duty(20).unwrap();
+        let raised = fan.set_duty(65).unwrap();
+
+        assert_eq!(first, Applied { before: Some(20), sent: Some(30) });
+        assert_eq!(repeated, Applied { before: Some(20), sent: None });
+        assert_eq!(raised, Applied { before: Some(20), sent: Some(65) });
+        assert_eq!(sets_of(&nvml), [Call::SetFanSpeed(GPU.into(), 0, 30), Call::SetFanSpeed(GPU.into(), 0, 65)]);
+    }
+
+    #[test]
+    fn nvidia_set_duty_caps_at_the_maximum() {
+        let nvml = nvml_with(FakeGpu { limits: (30, 80), ..ONE_FAN });
+        let mut fan = nvidia_fan(&nvml, GPU, 0);
+        fan.take_control().unwrap();
+
+        let applied = fan.set_duty(100).unwrap();
+
+        assert_eq!(applied.sent, Some(80));
+        assert_eq!(sets_of(&nvml), [Call::SetFanSpeed(GPU.into(), 0, 80)]);
+    }
+
+    #[test]
+    fn nvidia_first_set_duty_sends_even_the_reported_speed() {
+        let nvml = nvml_with(FakeGpu { speed: 50, ..ONE_FAN });
+        let mut fan = nvidia_fan(&nvml, GPU, 0);
+        fan.take_control().unwrap();
+
+        let applied = fan.set_duty(50).unwrap();
+
+        assert_eq!(applied, Applied { before: Some(50), sent: Some(50) });
+        assert_eq!(sets_of(&nvml), [Call::SetFanSpeed(GPU.into(), 0, 50)]);
+    }
+
+    #[test]
+    fn nvidia_set_duty_sends_again_after_a_failed_send() {
+        let failing = FakeNvml { failing: Some(NvmlOp::SetFanSpeed), ..FakeNvml::with_gpu(GPU, ONE_FAN) };
+        let nvml = Arc::new(failing);
+        let mut fan = nvidia_fan(&nvml, GPU, 0);
+        fan.take_control().unwrap();
+
+        let first = fan.set_duty(40);
+        let second = fan.set_duty(40);
+
+        assert!(matches!(&first, Err(Error::Nvml { gpu, .. }) if gpu == GPU), "{:?}", first);
+        assert!(second.is_err(), "{:?}", second);
+        assert_eq!(sets_of(&nvml), [Call::SetFanSpeed(GPU.into(), 0, 40), Call::SetFanSpeed(GPU.into(), 0, 40)]);
+    }
+
+    #[test]
+    fn nvidia_set_duty_before_take_control_sends_nothing() {
+        let nvml = nvml_with(ONE_FAN);
+        let mut fan = nvidia_fan(&nvml, GPU, 0);
+
+        let result = fan.set_duty(50);
+
+        assert!(matches!(&result, Err(Error::FanNotTaken(_))), "{:?}", result);
+        assert_eq!(sets_of(&nvml), []);
+    }
+
+    #[test]
+    fn nvidia_release_asks_for_the_default_policy_once() {
+        let nvml = nvml_with(ONE_FAN);
+        let mut fan = nvidia_fan(&nvml, GPU, 0);
+        fan.take_control().unwrap();
+        fan.set_duty(50).unwrap();
+
+        fan.release().unwrap();
+        fan.release().unwrap();
+
+        assert_eq!(sets_of(&nvml), [Call::SetFanSpeed(GPU.into(), 0, 50), Call::SetDefaultFanSpeed(GPU.into(), 0)]);
+    }
+
+    #[test]
+    fn nvidia_release_sets_the_maximum_when_the_default_policy_fails() {
+        let failing = FakeNvml { failing: Some(NvmlOp::SetDefaultFanSpeed), ..FakeNvml::with_gpu(GPU, FakeGpu { limits: (30, 90), ..ONE_FAN }) };
+        let nvml = Arc::new(failing);
+        let mut fan = nvidia_fan(&nvml, GPU, 0);
+        fan.take_control().unwrap();
+        fan.set_duty(40).unwrap();
+
+        let result = fan.release();
+
+        assert!(matches!(&result, Err(Error::Nvml { gpu, .. }) if gpu == GPU), "{:?}", result);
+        assert_eq!(sets_of(&nvml)[1..], [Call::SetDefaultFanSpeed(GPU.into(), 0), Call::SetFanSpeed(GPU.into(), 0, 90)]);
+    }
+
+    #[test]
+    fn nvidia_take_control_of_a_missing_fan_fails() {
+        let nvml = nvml_with(ONE_FAN);
+        let mut fan = nvidia_fan(&nvml, GPU, 1);
+
+        let result = fan.take_control();
+        fan.release().unwrap();
+
+        let Err(error) = result else {
+            panic!("expected an error, got {:?}", result);
+        };
+        assert!(matches!(&error, Error::NvidiaFanMissing { gpu, fan: 1, count: 1 } if gpu == GPU), "{:?}", error);
+        assert!(error.to_string().contains(GPU), "{}", error);
+        assert!(error.to_string().contains("has 1 fan"), "{}", error);
+        assert_eq!(sets_of(&nvml), []);
+    }
+
+    #[test]
+    fn nvidia_take_control_of_an_unknown_bus_id_fails() {
+        let nvml = nvml_with(ONE_FAN);
+        let mut fan = nvidia_fan(&nvml, "00000000:02:00.0", 0);
+
+        let result = fan.take_control();
+        fan.release().unwrap();
+
+        let Err(error) = result else {
+            panic!("expected an error, got {:?}", result);
+        };
+        assert!(error.to_string().contains("00000000:02:00.0"), "{}", error);
+        assert_eq!(sets_of(&nvml), []);
+    }
+
+    #[test]
+    fn nvidia_release_without_take_control_sends_nothing() {
+        let nvml = nvml_with(ONE_FAN);
+        let mut fan = nvidia_fan(&nvml, GPU, 0);
+
+        fan.release().unwrap();
+
+        assert_eq!(nvml.calls(), []);
+    }
+
+    #[test]
+    fn nvidia_take_control_rejects_inverted_limits() {
+        let nvml = nvml_with(FakeGpu { limits: (60, 40), ..ONE_FAN });
+        let mut fan = nvidia_fan(&nvml, GPU, 0);
+
+        let result = fan.take_control();
+        fan.release().unwrap();
+
+        assert!(matches!(&result, Err(Error::NvidiaFanLimits { min: 60, max: 40, .. })), "{:?}", result);
+        assert_eq!(sets_of(&nvml), []);
+    }
+
+    #[test]
+    fn nvidia_take_control_rejects_a_maximum_above_100() {
+        let nvml = nvml_with(FakeGpu { limits: (30, 101), ..ONE_FAN });
+        let mut fan = nvidia_fan(&nvml, GPU, 0);
+
+        let result = fan.take_control();
+        fan.release().unwrap();
+
+        assert!(matches!(&result, Err(Error::NvidiaFanLimits { min: 30, max: 101, .. })), "{:?}", result);
+        assert_eq!(sets_of(&nvml), []);
+    }
+
+    #[test]
+    fn dropped_guard_releases_an_nvidia_fan() {
+        let nvml = nvml_with(ONE_FAN);
+
+        {
+            let mut guard = FanGuard::new();
+            guard.add(Box::new(nvidia_fan(&nvml, GPU, 0))).unwrap();
+            guard.set_duty(50).unwrap();
+        }
+
+        assert_eq!(sets_of(&nvml), [Call::SetFanSpeed(GPU.into(), 0, 50), Call::SetDefaultFanSpeed(GPU.into(), 0)]);
+    }
+
+    #[test]
+    fn nvidia_fan_is_built_without_a_session() {
+        let nvml = nvml_with(ONE_FAN);
+        let shared: Arc<dyn Nvml> = nvml.clone();
+        let config = FanConfig::Nvidia { gpu: GPU.into(), fan: 0 };
+
+        let mut fan = build_fan(&config, None, &HwmonRoot::default(), &shared).unwrap();
+        fan.take_control().unwrap();
+
+        assert_eq!(fan.describe(), "nvidia gpu 00000000:01:00.0 fan 0");
+        assert_eq!(nvml.calls()[0], Call::FanCount(GPU.into()));
     }
 }

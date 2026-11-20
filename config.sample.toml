@@ -35,7 +35,8 @@ hysteresis = 3
 # IPMI session. If unspecified, the `default` session is used, which uses the
 # local in-band IPMI device (eg. /dev/ipmi0). Sessions are defined below in the
 # `sessions` section. A session opens only when a zone on it has a
-# `supermicro` fan, so a config with only `hwmon` fans needs no IPMI device.
+# `supermicro` fan, so a config with only `hwmon` and `nvidia` fans needs no
+# IPMI device.
 session = "default"
 
 # Fans driven by this logical zone, each set to the zone's duty cycle. A
@@ -54,6 +55,24 @@ session = "default"
 # reads 0 as fan off.
 # Two zones cannot drive the same chip and channel. See the hwmon zone example
 # below.
+#
+# An `nvidia` fan, `{ type = "nvidia", gpu = "00000000:01:00.0", fan = 0 }`,
+# is fan `fan` of the NVIDIA GPU at PCI bus id `gpu`. `fan` starts at 0. The
+# GPU is selected by PCI bus id only; a GPU UUID is rejected. The domain may
+# have four or eight hex digits, so `0000:01:00.0` names the same GPU, and two
+# zones cannot drive the same fan of one GPU. To list the bus ids, run
+# `nvidia-smi --query-gpu=pci.bus_id --format=csv`.
+#
+# The program drives the fan through NVML. It loads libnvidia-ml.so.1 of the
+# host's NVIDIA driver when the zone starts, and it must run as root to set a
+# GPU fan speed. On startup it reads the fan's speed limits and changes
+# nothing; its first update switches the fan to manual control. A duty cycle
+# below the fan's minimum is raised to the minimum, because NVML refuses a
+# lower speed: with a minimum of 30%, a duty cycle of 20% runs the fan at 30%.
+# A duty cycle above the maximum is capped at the maximum. On exit it gives
+# the fan back to the driver's default fan policy. If that fails, it sets the
+# fan to its maximum, which leaves the fan in manual control at full speed.
+# See the NVIDIA zone example below.
 fans = [
   { type = "supermicro", zone = 0 },
   { type = "supermicro", zone = 1 },
@@ -296,6 +315,17 @@ steps = [
 #steps = [
 #    { temp = 40, dcycle = 30 },
 #    { temp = 80, dcycle = 100 },
+#]
+
+# A zone that drives the fan of an NVIDIA GPU from the GPU's own temperature.
+# It needs no IPMI device, but the program must run as root. The `nvidia`
+# source runs nvidia-smi, as described with the sources above.
+#[[zones]]
+#fans = [{ type = "nvidia", gpu = "00000000:01:00.0", fan = 0 }]
+#sources = [{ type = "nvidia", gpu = "00000000:01:00.0" }]
+#steps = [
+#    { temp = 50, dcycle = 30 },
+#    { temp = 85, dcycle = 100 },
 #]
 
 # Optional section for defining other IPMI sessions. This is not needed when

@@ -36,6 +36,7 @@ use {
     fan::{build_fan, FanGuard},
     freeipmi::SensorReading,
     hwmon::HwmonRoot,
+    nvml::{Nvml, RealNvml},
     session::IpmiSession,
     source::{read_zone_sources, ZoneReaders},
 };
@@ -72,6 +73,9 @@ async fn interrupted() -> io::Result<()> {
 struct MainApp {
     config: Config,
     sessions: HashMap<String, Arc<IpmiSession>>,
+    /// The one NVML of the process, which every zone shares. It loads the
+    /// library only when a fan first calls it.
+    nvml: Arc<dyn Nvml>,
 }
 
 impl MainApp {
@@ -88,6 +92,7 @@ impl MainApp {
         Ok(Self {
             config,
             sessions,
+            nvml: Arc::new(RealNvml::new()),
         })
     }
 
@@ -100,6 +105,7 @@ impl MainApp {
             loops.spawn(Self::zone_loop(
                 // Only a zone with a Supermicro fan has an open session
                 self.sessions.get(&zone_config.session.0).cloned(),
+                self.nvml.clone(),
                 // Cloned since there's no structured concurrency support yet
                 Arc::new(zone_config.clone()),
             ));
@@ -156,6 +162,7 @@ impl MainApp {
     /// polled.
     async fn zone_loop(
         session: Option<Arc<IpmiSession>>,
+        nvml: Arc<dyn Nvml>,
         zone_config: Arc<Zone>,
     ) -> Result<()> {
         // Each Supermicro fan holds an Arc of the session, so this guard
@@ -167,7 +174,7 @@ impl MainApp {
         let hwmon = HwmonRoot::default();
 
         for fan_config in &zone_config.fan_list {
-            fans.add(build_fan(fan_config, session.as_ref(), &hwmon)?)?;
+            fans.add(build_fan(fan_config, session.as_ref(), &hwmon, &nvml)?)?;
         }
 
         info!("[{}] Starting loop for fans {:?}", zone_label(session.as_deref()), fans.descriptions());
@@ -254,7 +261,7 @@ fn sessions_to_open(config: &Config) -> Vec<(String, Vec<u8>)> {
             .flat_map(|z| &z.fan_list)
             .filter_map(|fan| match fan {
                 FanConfig::Supermicro { zone } => Some(*zone),
-                FanConfig::Hwmon { .. } => None,
+                FanConfig::Hwmon { .. } | FanConfig::Nvidia { .. } => None,
             })
             .collect();
 
@@ -447,6 +454,25 @@ mod tests {
         ));
 
         assert_eq!(sessions_to_open(&config), [("default".to_owned(), vec![1])]);
+    }
+
+    #[test]
+    fn session_restores_no_nvidia_fan() {
+        let config = parse(concat!(
+            "[[zones]]\n",
+            "fans = [{ type = \"nvidia\", gpu = \"00000000:01:00.0\", fan = 0 }, { type = \"supermicro\", zone = 1 }]\n",
+            "sources = [{ type = \"ipmi\", sensor = \"CPU Temp\" }]\n",
+            "steps = [{ temp = 40, dcycle = 40 }]\n",
+            "[[zones]]\n",
+            "session = \"bmc\"\n",
+            "fans = [{ type = \"nvidia\", gpu = \"00000000:81:00.0\", fan = 0 }]\n",
+            "sources = [{ type = \"nvidia\", gpu = \"00000000:81:00.0\" }]\n",
+            "steps = [{ temp = 40, dcycle = 40 }]\n",
+            "[sessions]\n",
+            "bmc = { type = \"remote\", hostname = \"bmc.lan\", username = \"admin\", password = \"secret\" }\n",
+        ));
+
+        assert_eq!(sorted_sessions(&config), [("default".to_owned(), vec![1])]);
     }
 
     #[test]
