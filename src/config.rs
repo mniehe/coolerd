@@ -956,8 +956,8 @@ fn check_steps(steps: &[Step], key: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use {
-        std::path::Path,
-        super::{Aggregation, Config, FanConfig, LogLevel, OnFailure, parse_config, SessionType, Source},
+        std::{fs, path::{Path, PathBuf}},
+        super::{Aggregation, Config, FanConfig, load_config, LogLevel, OnFailure, parse_config, SessionType, Source, Zone},
         crate::{
             curve::{SourceReading, ZoneState},
             error::{Error, Result},
@@ -1005,9 +1005,39 @@ mod tests {
         }
     }
 
+    /// A file of the repository, named by its path from the repository root
+    fn repo_file(relative: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
+    }
+
+    /// The source types of a zone, in the order of its `sources`
+    fn source_types(zone: &Zone) -> Vec<&'static str> {
+        zone.sources.iter()
+            .map(|source| match source.kind {
+                Source::Ipmi { .. } => "ipmi",
+                Source::File { .. } => "file",
+                Source::Smart { .. } => "smart",
+                Source::Hdparm { .. } => "hdparm",
+                Source::Nvidia { .. } => "nvidia",
+                Source::Hwmon { .. } => "hwmon",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_example_config_loads() {
+        for example in ["supermicro", "hwmon-desktop", "nvidia", "mixed"] {
+            let path = repo_file(&format!("docs/examples/{}.toml", example));
+
+            if let Err(e) = load_config(&path) {
+                panic!("{}", e);
+            }
+        }
+    }
+
     #[test]
     fn sample_config_loads() {
-        let config = parse(include_str!("../config.sample.toml")).unwrap();
+        let config = load_config(&repo_file("config.sample.toml")).unwrap();
 
         assert_eq!(config.zones.len(), 1);
         assert_eq!(config.zones[0].fan_list, [FanConfig::Supermicro { zone: 0 }, FanConfig::Supermicro { zone: 1 }]);
@@ -1136,12 +1166,8 @@ mod tests {
     }
 
     #[test]
-    fn readme_nvidia_fan_example_loads() {
-        let blocks = readme_toml_blocks();
-        let block = blocks.iter()
-            .find(|b| b.contains(r#"fans = [{ type = "nvidia""#))
-            .expect("the README has a TOML example of an nvidia fan");
-        let config = parse(block).unwrap();
+    fn nvidia_example_fan_loads() {
+        let config = example("nvidia");
 
         assert_eq!(config.zones[0].fan_list, [FanConfig::Nvidia { gpu: "00000000:01:00.0".into(), fan: 0 }]);
     }
@@ -1160,23 +1186,32 @@ mod tests {
         assert!(sources[..sources.len() - 1].iter().all(|s| s.smoothing_samples == 1));
     }
 
-    /// Every TOML block of the README
-    fn readme_toml_blocks() -> Vec<&'static str> {
+    /// The config of `docs/examples/<name>.toml`
+    fn example(name: &str) -> Config {
+        let path = repo_file(&format!("docs/examples/{}.toml", name));
+
+        load_config(&path).unwrap_or_else(|e| panic!("{}", e))
+    }
+
+    /// Every TOML block of a page, named by its path from the repository root
+    fn page_toml_blocks(page: &str) -> Vec<String> {
         const FENCE: &str = "```toml\n";
 
-        include_str!("../README.md")
-            .split(FENCE)
+        let path = repo_file(page);
+        let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {}", path.display(), e));
+
+        text.split(FENCE)
             .skip(1)
-            .filter_map(|rest| rest.split_once("```").map(|(block, _)| block))
+            .filter_map(|rest| rest.split_once("```").map(|(block, _)| block.to_owned()))
             .collect()
     }
 
     #[test]
-    fn readme_on_failure_example_loads() {
-        let blocks = readme_toml_blocks();
+    fn failure_page_on_failure_example_loads() {
+        let blocks = page_toml_blocks("docs/failure.md");
         let block = blocks.iter()
             .find(|b| b.contains("on_failure"))
-            .expect("the README has a TOML example with on_failure");
+            .expect("the failure page has a TOML example with on_failure");
         let config = parse(block).unwrap();
         let sources = &config.zones[0].sources;
 
@@ -1185,11 +1220,12 @@ mod tests {
     }
 
     #[test]
-    fn readme_curve_example_loads() {
-        let readme = include_str!("../README.md");
-        let start = readme.find("```toml\n").expect("the README has a TOML example") + "```toml\n".len();
-        let end = start + readme[start..].find("```").unwrap();
-        let config = parse(&readme[start..end]).unwrap();
+    fn configuration_page_curve_example_loads() {
+        let blocks = page_toml_blocks("docs/configuration.md");
+        let block = blocks.iter()
+            .find(|b| b.contains("duty_aggregation"))
+            .expect("the configuration page has a TOML example with duty_aggregation");
+        let config = parse(block).unwrap();
         let zone = &config.zones[0];
 
         assert!(zone.sources[0].steps.is_none());
@@ -1199,27 +1235,77 @@ mod tests {
     }
 
     #[test]
-    fn readme_fans_example_loads() {
-        let blocks = readme_toml_blocks();
-        let block = blocks.iter()
-            .find(|b| b.contains("fans = "))
-            .expect("the README has a TOML example with fans");
-        let config = parse(block).unwrap();
+    fn supermicro_example_fans_load() {
+        let config = example("supermicro");
+        // The example gives each IPMI zone a zone of its own
+        let fans: Vec<&FanConfig> = config.zones.iter().flat_map(|zone| &zone.fan_list).collect();
 
-        assert_eq!(config.zones[0].fan_list, [FanConfig::Supermicro { zone: 0 }, FanConfig::Supermicro { zone: 1 }]);
+        assert_eq!(fans, [&FanConfig::Supermicro { zone: 0 }, &FanConfig::Supermicro { zone: 1 }]);
     }
 
     #[test]
-    fn readme_named_curve_example_loads() {
-        let blocks = readme_toml_blocks();
+    fn configuration_page_named_curve_example_loads() {
+        let blocks = page_toml_blocks("docs/configuration.md");
         let block = blocks.iter()
             .find(|b| b.contains("[curves."))
-            .expect("the README has a TOML example with a curves table");
+            .expect("the configuration page has a TOML example with a curves table");
         let config = parse(block).unwrap();
         let named: Vec<_> = config.zones[0].sources.iter().filter(|s| s.curve.is_some()).collect();
 
         assert!(named.len() >= 2, "{:?}", named);
         assert!(named.iter().all(|s| s.steps.is_some() && s.curve_hysteresis.is_some()));
+    }
+
+    #[test]
+    fn every_page_toml_block_loads() {
+        for page in ["docs/configuration.md", "docs/failure.md"] {
+            for block in page_toml_blocks(page) {
+                if let Err(e) = parse(&block) {
+                    panic!("{}: {}\n{}", page, e, block);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn supermicro_example_has_ipmi_and_smart_sources() {
+        let config = example("supermicro");
+
+        assert_eq!(config.zones.len(), 2);
+        assert_eq!(source_types(&config.zones[0]), ["ipmi"]);
+        assert_eq!(source_types(&config.zones[1]), ["smart", "smart"]);
+    }
+
+    #[test]
+    fn hwmon_desktop_example_has_hwmon_source_and_fan() {
+        let config = example("hwmon-desktop");
+
+        assert_eq!(config.zones.len(), 1);
+        assert_eq!(source_types(&config.zones[0]), ["hwmon"]);
+        assert_eq!(config.zones[0].fan_list, [FanConfig::Hwmon { chip: "nct6798".into(), pwm: 2 }]);
+    }
+
+    #[test]
+    fn nvidia_example_has_nvidia_source_and_fan() {
+        let config = example("nvidia");
+
+        assert_eq!(config.zones.len(), 1);
+        assert_eq!(source_types(&config.zones[0]), ["nvidia"]);
+        assert!(matches!(&config.zones[0].fan_list[..], [FanConfig::Nvidia { .. }]));
+    }
+
+    #[test]
+    fn mixed_example_zones_share_one_curve() {
+        let config = example("mixed");
+        let nvidia_fan = FanConfig::Nvidia { gpu: "00000000:01:00.0".into(), fan: 0 };
+
+        assert_eq!(config.zones.len(), 2);
+        assert_eq!(source_types(&config.zones[0]), ["ipmi", "nvidia"]);
+        assert_eq!(config.zones[0].fan_list, [FanConfig::Supermicro { zone: 0 }, FanConfig::Supermicro { zone: 1 }]);
+        assert_eq!(source_types(&config.zones[1]), ["nvidia"]);
+        assert_eq!(config.zones[1].fan_list, [nvidia_fan]);
+        assert_eq!(config.zones[0].curve.as_deref(), Some("gpu"));
+        assert_eq!(config.zones[0].curve, config.zones[1].curve);
     }
 
     #[test]

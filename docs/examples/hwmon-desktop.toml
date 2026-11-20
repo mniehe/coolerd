@@ -1,0 +1,43 @@
+# coolerd example: a desktop or a server without IPMI.
+#
+# coolerd reads the CPU temperature from one hwmon chip and drives one PWM
+# channel of another. It opens no IPMI session. Copy this file, change each
+# value under a REPLACE comment, and start coolerd with
+# `coolerd --config <file>`.
+#
+# docs/hwmon.md shows how to find the chip names and the PWM channels of your
+# machine. Do not configure a channel before you know which fan it drives.
+#
+# Every key is described in docs/configuration.md. What coolerd does when a
+# source fails, and what the fans get when it stops, is in docs/failure.md.
+
+log_level = "info"
+
+[[zones]]
+fans = [
+  # REPLACE: the chip that drives your fan and the PWM channel of the fan.
+  # `chip` is the text of the chip's `name` file. `pwm = 2` is the file `pwm2`.
+  # Add one line for each further channel that this zone drives.
+  { type = "hwmon", chip = "nct6798", pwm = 2 },
+]
+
+# Seconds between updates.
+interval = 2
+
+sources = [
+  # REPLACE: the chip that measures your CPU and the number of its input.
+  # `k10temp` is the sensor of an AMD CPU; an Intel CPU has `coretemp`.
+  # `input = 1` is the file `temp1_input`.
+  { type = "hwmon", chip = "k10temp", input = 1 },
+]
+
+# REPLACE: the curve for your CPU and fan. Below 40 °C the fan runs at 30%,
+# above 80 °C at 100%, and in between on a straight line. Many fans stall at a
+# low duty cycle, so find the lowest value at which yours still turn.
+steps = [
+  { temp = 40, dcycle = 30 },
+  { temp = 80, dcycle = 100 },
+]
+
+# The fan slows down only after the temperature has fallen by 3 °C.
+hysteresis = 3

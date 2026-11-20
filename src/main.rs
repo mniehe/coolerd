@@ -414,8 +414,9 @@ mod tests {
     use {
         std::{
             cell::{Cell, RefCell},
+            fs,
             io,
-            path::Path,
+            path::{Path, PathBuf},
             process,
             time::Duration,
         },
@@ -423,7 +424,7 @@ mod tests {
         tokio::time::timeout,
         super::{exit_result, Opt, query_sensors, sessions_to_open, Signals, start_up},
         crate::{
-            config::{Config, FanConfig, parse_config},
+            config::{Config, FanConfig, load_config, parse_config},
             error::Error,
             fan::ReleaseOutcome,
         },
@@ -431,6 +432,13 @@ mod tests {
 
     fn parse(contents: &str) -> Config {
         parse_config(contents, Path::new("/etc/coolerd.toml")).unwrap()
+    }
+
+    /// The config of `docs/examples/<name>.toml`
+    fn example(name: &str) -> Config {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("docs/examples/{}.toml", name));
+
+        load_config(&path).unwrap_or_else(|e| panic!("{}", e))
     }
 
     /// `sessions_to_open` sorted by session name, because sessions are a map
@@ -491,17 +499,140 @@ mod tests {
     }
 
     #[test]
-    fn readme_hwmon_zone_opens_no_session() {
-        let readme = include_str!("../README.md");
-        let block = readme.split("```toml\n")
-            .skip(1)
-            .filter_map(|rest| rest.split_once("```").map(|(block, _)| block))
-            .find(|b| b.contains("type = \"hwmon\"") && !b.contains("supermicro"))
-            .expect("the README has a TOML example of a hwmon zone");
-        let config = parse(block);
+    fn hwmon_desktop_example_opens_no_session() {
+        let config = example("hwmon-desktop");
 
         assert_eq!(config.zones[0].fan_list, [FanConfig::Hwmon { chip: "nct6798".into(), pwm: 2 }]);
         assert_eq!(sessions_to_open(&config), []);
+    }
+
+    #[test]
+    fn nvidia_example_opens_no_session() {
+        assert_eq!(sessions_to_open(&example("nvidia")), []);
+    }
+
+    #[test]
+    fn supermicro_example_opens_the_default_session() {
+        assert_eq!(sessions_to_open(&example("supermicro")), [("default".to_owned(), vec![0, 1])]);
+    }
+
+    #[test]
+    fn mixed_example_opens_the_default_session() {
+        assert_eq!(sessions_to_open(&example("mixed")), [("default".to_owned(), vec![0, 1])]);
+    }
+
+    const UPSTREAM_URL: &str = "https://github.com/chenxiaolong/ipmi-fan-control";
+    const README_MAX_LINES: usize = 150;
+    const EXAMPLES: [&str; 4] = ["supermicro", "hwmon-desktop", "nvidia", "mixed"];
+
+    /// The targets of the inline markdown links of `text` that name a file:
+    /// links inside fenced code and links to a URL or to a fragment of the
+    /// same page are left out, and a fragment after a file is cut off
+    fn file_link_targets(text: &str) -> Vec<String> {
+        let mut targets = Vec::new();
+        let mut in_fence = false;
+
+        for line in text.lines() {
+            if line.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+                continue;
+            }
+            if in_fence {
+                continue;
+            }
+
+            for rest in line.split("](").skip(1) {
+                let Some((target, _)) = rest.split_once(')') else {
+                    continue;
+                };
+                let file = target.split('#').next().unwrap_or_default();
+
+                if file.is_empty() || file.contains("://") || file.starts_with("mailto:") {
+                    continue;
+                }
+
+                targets.push(file.to_owned());
+            }
+        }
+
+        targets
+    }
+
+    /// `README.md` and every `docs/*.md` page, each with its path from the
+    /// repository root
+    fn documentation_pages() -> Vec<PathBuf> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut pages: Vec<PathBuf> = fs::read_dir(root.join("docs"))
+            .expect("the repository has a docs directory")
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+            .map(|path| path.strip_prefix(root).unwrap().to_owned())
+            .collect();
+
+        pages.sort();
+        pages.insert(0, PathBuf::from("README.md"));
+        pages
+    }
+
+    fn read_repo_file(relative: &Path) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {}", path.display(), e))
+    }
+
+    #[test]
+    fn file_link_targets_skips_code_urls_and_fragments() {
+        let text = concat!(
+            "See [the keys](docs/configuration.md#zones) and [upstream](https://example.com/a).\n",
+            "```sh\n",
+            "echo [not a link](missing.md)\n",
+            "```\n",
+            "Back to [the top](#top), then [one](a.md) and [two](../b.toml).\n",
+        );
+
+        assert_eq!(file_link_targets(text), ["docs/configuration.md", "a.md", "../b.toml"]);
+    }
+
+    #[test]
+    fn documentation_links_name_existing_files() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut missing = Vec::new();
+
+        for page in documentation_pages() {
+            let directory = root.join(&page).parent().unwrap().to_owned();
+
+            for target in file_link_targets(&read_repo_file(&page)) {
+                if !directory.join(&target).exists() {
+                    missing.push(format!("{}: {}", page.display(), target));
+                }
+            }
+        }
+
+        assert_eq!(missing, Vec::<String>::new(), "links to files that do not exist");
+    }
+
+    #[test]
+    fn readme_links_every_page_and_example() {
+        let pages = documentation_pages();
+        let targets = file_link_targets(&read_repo_file(Path::new("README.md")));
+        let mut wanted: Vec<String> = pages[1..].iter().map(|page| page.display().to_string()).collect();
+
+        wanted.extend(EXAMPLES.iter().map(|name| format!("docs/examples/{}.toml", name)));
+
+        // A README with no page to link would pass on an empty docs directory
+        assert!(pages.len() > 1, "docs holds no page");
+
+        let unlinked: Vec<&String> = wanted.iter().filter(|page| !targets.contains(page)).collect();
+
+        assert_eq!(unlinked, Vec::<&String>::new(), "README.md does not link these files");
+    }
+
+    #[test]
+    fn readme_is_a_short_entry_page_that_credits_upstream() {
+        let readme = read_repo_file(Path::new("README.md"));
+
+        assert!(readme.lines().count() <= README_MAX_LINES, "README.md has {} lines", readme.lines().count());
+        assert!(readme.contains(UPSTREAM_URL));
     }
 
     #[test]

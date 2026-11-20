@@ -1,0 +1,67 @@
+# coolerd example: a Supermicro server.
+#
+# coolerd reaches the board through the local IPMI device, /dev/ipmi0, and
+# drives the board's two fan zones. Copy this file, change each value under a
+# REPLACE comment, and start coolerd with `coolerd --config <file>`.
+#
+# Every key is described in docs/configuration.md. What coolerd does when a
+# source fails, and what the fans get when it stops, is in docs/failure.md.
+
+log_level = "info"
+
+# The CPU zone. On most Supermicro boards, IPMI zone 0 holds the fan headers
+# FAN1, FAN2 and so on. Check the manual of your board.
+[[zones]]
+fans = [{ type = "supermicro", zone = 0 }]
+
+# Seconds between updates.
+interval = 2
+
+sources = [
+  # REPLACE: the name of a temperature sensor of your board, as
+  # `ipmi-sensors --sensor-types=Temperature` prints it. A board with two CPUs
+  # needs one line for each, such as "CPU1 Temp" and "CPU2 Temp".
+  { type = "ipmi", sensor = "CPU Temp" },
+]
+
+# REPLACE: the curve for your CPU and fans. Below 40 °C the fans run at 30%,
+# above 75 °C at 100%, and in between on a straight line.
+steps = [
+  { temp = 40, dcycle = 30 },
+  { temp = 75, dcycle = 100 },
+]
+
+# The fans slow down only after the temperature has fallen by 3 °C.
+hysteresis = 3
+
+# The peripheral zone. On most Supermicro boards, IPMI zone 1 holds the fan
+# headers FANA, FANB and so on. Here it cools the drives.
+[[zones]]
+fans = [{ type = "supermicro", zone = 1 }]
+
+# Drive temperatures change slowly.
+interval = 30
+
+sources = [
+  # REPLACE: one line for each drive. Use the names under /dev/disk/by-id,
+  # which do not change between boots. This source runs smartctl, so
+  # smartmontools must be installed.
+  #
+  # A drive that cannot be read does not stop coolerd here. The zone runs at
+  # 60% or more until the drive reads again.
+  { type = "smart", block_dev = "/dev/disk/by-id/ata-REPLACE-drive-1", on_failure = { type = "dcycle", dcycle = 60 } },
+  { type = "smart", block_dev = "/dev/disk/by-id/ata-REPLACE-drive-2", on_failure = { type = "dcycle", dcycle = 60 } },
+]
+
+# REPLACE: the curve for your drives. The zone temperature is the hottest
+# drive, because `aggregation` defaults to the maximum.
+steps = [
+  { temp = 30, dcycle = 30 },
+  { temp = 45, dcycle = 100 },
+]
+
+# A board in another machine is reached through a remote session. Define the
+# session here and name it in a zone with `session = "bmc"`. The password is
+# stored in this file as plain text, so keep the file readable by root only.
+#[sessions]
+#bmc = { type = "remote", hostname = "bmc.example.com", username = "REPLACE", password = "REPLACE" }
