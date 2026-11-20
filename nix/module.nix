@@ -113,8 +113,8 @@ with lib; let
   # The package is an attribute rather than part of the script, so a test can
   # run the script against another package.
   packageCheck = pkgs.runCommand "coolerd-package-check" {inherit (cfg) package;} ''
-    if [ ! -x "$package/bin/coolerd" ]; then
-      echo "services.coolerd.package: $package/bin/coolerd does not exist or is not executable; the package must provide bin/coolerd" >&2
+    if [ ! -f "$package/bin/coolerd" ] || [ ! -x "$package/bin/coolerd" ]; then
+      echo "services.coolerd.package: $package/bin/coolerd is not an executable regular file; the package must provide bin/coolerd" >&2
       exit 1
     fi
     touch "$out"

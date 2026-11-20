@@ -403,20 +403,58 @@
               exit 1
             fi
 
-            # The inert host's check passes once built; the old-name host's
-            # check script, run as its builder would run it, fails
+            # The inert host's check passes once built
             ${lib.optionalString (lib.isDerivation inertCheck) ": ${inertCheck}"}
-            if package=${oldNamePackage} out="$TMPDIR/old-name-check" \
-              bash -c ${lib.escapeShellArg oldNameCheck.buildCommand} 2> "$TMPDIR/old-name-stderr"; then
-              echo "old name: the package check passed a package without bin/coolerd" >&2
-              exit 1
-            fi
-            for expected in services.coolerd.package ${oldNamePackage}/bin/coolerd; do
-              if ! grep -q -F -- "$expected" "$TMPDIR/old-name-stderr"; then
-                echo "old name: the package check message does not name $expected: $(cat "$TMPDIR/old-name-stderr")" >&2
+
+            # Runs the package check's script as its builder would, against the
+            # package directory $1; sets gate_status
+            run_gate() {
+              rm -f "$TMPDIR/gate-out"
+              if package="$1" out="$TMPDIR/gate-out" \
+                bash -c ${lib.escapeShellArg oldNameCheck.buildCommand} 2> "$TMPDIR/gate-stderr"; then
+                gate_status=0
+              else
+                gate_status=$?
+              fi
+            }
+            expect_gate_fails() {
+              run_gate "$2"
+              if [ "$gate_status" -eq 0 ]; then
+                echo "$1: the package check passed a package without an executable bin/coolerd file" >&2
                 exit 1
               fi
+              for expected in services.coolerd.package "$2/bin/coolerd"; do
+                if ! grep -q -F -- "$expected" "$TMPDIR/gate-stderr"; then
+                  echo "$1: the package check message does not name $expected: $(cat "$TMPDIR/gate-stderr")" >&2
+                  exit 1
+                fi
+              done
+            }
+            expect_gate_passes() {
+              run_gate "$2"
+              if [ "$gate_status" -ne 0 ] || [ ! -e "$TMPDIR/gate-out" ]; then
+                echo "$1: the package check failed a package with an executable bin/coolerd file: $(cat "$TMPDIR/gate-stderr")" >&2
+                exit 1
+              fi
+            }
+
+            # Package directories for the check; no bin/coolerd in them is run
+            fixtures="$TMPDIR/package-fixtures"
+            for fixture in directory non-executable executable symlink; do
+              mkdir -p "$fixtures/$fixture/bin"
             done
+            mkdir "$fixtures/directory/bin/coolerd"
+            printf '#!/bin/sh\nexit 1\n' > "$fixtures/non-executable/bin/coolerd"
+            chmod 644 "$fixtures/non-executable/bin/coolerd"
+            printf '#!/bin/sh\nexit 1\n' > "$fixtures/executable/bin/coolerd"
+            chmod 755 "$fixtures/executable/bin/coolerd"
+            ln -s "$fixtures/executable/bin/coolerd" "$fixtures/symlink/bin/coolerd"
+
+            expect_gate_fails "old name" ${oldNamePackage}
+            expect_gate_fails "directory" "$fixtures/directory"
+            expect_gate_fails "non-executable" "$fixtures/non-executable"
+            expect_gate_passes "executable" "$fixtures/executable"
+            expect_gate_passes "symlink" "$fixtures/symlink"
             touch $out
           '';
 
