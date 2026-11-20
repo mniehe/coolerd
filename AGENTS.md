@@ -4,7 +4,8 @@ coolerd is a Rust daemon that controls fan duty on Linux. It reads
 temperatures from IPMI sensors, files, hwmon, `smartctl`, `hdparm` and
 `nvidia-smi`, maps them through curves, and writes the duty to a fan backend:
 Supermicro zones, with OEM raw commands through libfreeipmi, hwmon PWM
-files, or NVIDIA GPU fans through the host's NVML library. This repository is a fork of the archived
+files, or NVIDIA GPU fans through the host's NVML library. This repository
+is a fork of the archived
 `chenxiaolong/ipmi-fan-control`, so nothing goes upstream. It was named
 ipmi-fan-control until the rename; the NixOS module and the overlay keep that
 name as option and package aliases. It runs on a real server through the NixOS module in
@@ -49,8 +50,9 @@ Ask first, naming the exact action, before:
   the fans: a Supermicro fan switches the board to full fan mode, and a hwmon
   fan switches `pwm<N>_enable` of this machine's own chip to manual. An
   NVIDIA fan is set to a manual speed through NVML. A killed process leaves
-  them that way. The same holds for `nvidia-smi` and any other program that
-  loads `libnvidia-ml` on a machine with an NVIDIA GPU. `testing.md` holds raw commands aimed at a
+  them that way. Ask as well before running `nvidia-smi` or any other
+  program that loads `libnvidia-ml`, because it reaches a GPU's fans through
+  the same driver. `testing.md` holds raw commands aimed at a
   live machine;
 - any command on a deployed host, and any `nixos-rebuild` or other activation;
 - pushing, merging, or anything that lands on `master`. The server's

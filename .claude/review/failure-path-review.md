@@ -28,7 +28,8 @@ termination owner.
   passes its limit and `CommandStillRunning` while a killed program has not
   exited.
 - `src/nvml.rs`: `RealNvml` returns `NvmlTimeout` when a call passes its
-  limit and `NvmlStalled` or `NvmlNoReply` for every call after that.
+  limit and `NvmlStalled` or `NvmlNoReply` for every call after that, and
+  `NvmlThread` when the worker cannot start.
   `NvidiaFan::set_duty` in `src/fan.rs` returns those from its speed read;
   any other failed speed read is logged and the write goes ahead.
 - `src/curve.rs`: a failed source that did not end the read is dropped from
@@ -38,9 +39,12 @@ termination owner.
   not absorb, `run` aborts the other loops through a `JoinSet`, and
   `main` exits 1 after `MainApp` drops. `FanGuard::drop` in `src/fan.rs` and
   `IpmiSession::drop` in `src/session.rs` are the cleanup. The first
-  releases its fan (a hwmon fan writes 255, then restores a saved automatic
-  mode). The second sets every Supermicro zone to 100% and restores the fan
-  mode. Both log their own errors and do not return them.
+  releases each of its fans (a hwmon fan writes 255, then restores a saved
+  automatic mode; an NVIDIA fan asks for the default policy, then falls
+  back to its maximum). It logs each failed or panicking release and records
+  it in `ReleaseFailures`, and `exit_result` then turns a clean run into
+  `FansNotReleased`. The second sets every Supermicro zone to 100% and
+  restores the fan mode. It logs its own errors and does not record them.
 - A failure that ends in a lower or unchanged fan duty with no log line is
   the disguised success that matters most here.
 

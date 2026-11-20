@@ -21,8 +21,9 @@ names the physical or privilege consequence.
   name. `NvidiaFan` sets a GPU fan's speed through the `Nvml` trait in
   `src/nvml.rs`, where `RealNvml` runs each call on one worker thread under
   a time limit and fails every later call at once after a timeout.
-  `FanGuard` owns one fan, releases it on drop and records a failed release,
-  which makes the process exit with a failure status.
+  `FanGuard` holds the fans of one zone. On drop it releases every one, last
+  added first, even after one fails or panics, and records each failed
+  release, which makes the process exit with a failure status.
 - `nix/module.nix` sets the unit's user, groups, PATH, udev rule and ambient
   capabilities (`CAP_SYS_RAWIO`, `CAP_SYS_ADMIN`). Its hwmon access helper
   runs as root before each start and makes the listed PWM files
@@ -33,7 +34,7 @@ names the physical or privilege consequence.
 1. Fail-safe: any exit path, including a failed zone loop, a panic and a
    signal, that does not reach `FanGuard::drop` and `IpmiSession::drop`.
    `IpmiSession::drop` sets every Supermicro zone to 100% and restores the
-   fan mode. `FanGuard::drop` releases its fan: a hwmon fan writes 255 to
+   fan mode. `FanGuard::drop` releases each of its fans: a hwmon fan writes 255 to
    `pwm<N>`, then restores a saved `pwm<N>_enable` of 2 or more; an NVIDIA
    fan asks for the driver's default policy and, when that fails, sets its
    maximum. A config with no Supermicro fan opens no `IpmiSession`, so
