@@ -228,16 +228,41 @@
           lib.any (a: !a.assertion && lib.hasInfix "services.coolerd.hwmon.pwmChannels" a.message)
           badChipConfig.assertions;
 
-        # A host with an NVIDIA fan that leaves enableNvidiaFans off. Only its
+        # Hosts that leave enableNvidiaFans off, each with one zone. Only their
         # assertions are read.
-        nvidiaWithoutOptionConfig =
-          (evalHost {
-            services.coolerd.settings.zones = [nvidiaZone];
-          })
-          .config;
-        rejectsNvidiaWithoutOption =
-          lib.any (a: !a.assertion && lib.hasInfix "services.coolerd.enableNvidiaFans" a.message)
-          nvidiaWithoutOptionConfig.assertions;
+        failedWithZone = zone:
+          map (a: a.message)
+          (lib.filter (a: !a.assertion && lib.hasInfix "services.coolerd" a.message)
+            (evalHost {services.coolerd.settings.zones = [zone];}).config.assertions);
+        rejectsWithoutNvidiaOption = zone: lib.any (lib.hasInfix "services.coolerd.enableNvidiaFans") (failedWithZone zone);
+        # A source that is not an NVIDIA one, so only the fan can need the option
+        hwmonSource = {
+          type = "hwmon";
+          chip = "k10temp";
+          input = 1;
+        };
+        nvidiaFanTableZone =
+          nvidiaZone
+          // {
+            sources = [hwmonSource];
+          };
+        # The fan as a list in field order, which the daemon also accepts
+        nvidiaFanPositionalZone =
+          nvidiaFanTableZone
+          // {
+            fans = [["nvidia" "00000000:01:00.0" 0]];
+          };
+        nvidiaSourceOnlyZone =
+          nvidiaZone
+          // {
+            fans = [
+              {
+                type = "hwmon";
+                chip = "nct6798";
+                pwm = 2;
+              }
+            ];
+          };
         # The message of each failed assertion of the module on a host
         failedAssertions = host:
           map (a: a.message)
@@ -472,8 +497,11 @@
           "hwmon: ExecStartPre does not run the helper derivation that hwmon-access exercises"
           ++ lib.optional (execStartPreDrvs hosts.nvidia != [accessHelper.drvPath])
           "nvidia: ExecStartPre does not run the helper derivation that hwmon-access exercises"
-          ++ lib.optional (!rejectsNvidiaWithoutOption)
-          "nvidia without enableNvidiaFans: no failed assertion names services.coolerd.enableNvidiaFans"
+          ++ lib.optional (!rejectsWithoutNvidiaOption nvidiaFanTableZone)
+          "nvidia fan as a table without enableNvidiaFans: no failed assertion names services.coolerd.enableNvidiaFans"
+          ++ lib.optional (!rejectsWithoutNvidiaOption nvidiaFanPositionalZone)
+          "nvidia fan as a list without enableNvidiaFans: no failed assertion names services.coolerd.enableNvidiaFans"
+          ++ map (message: "nvidia source without an NVIDIA fan: an assertion fails: ${message}") (failedWithZone nvidiaSourceOnlyZone)
           ++ lib.optional (lib.hasInfix "KERNEL==\"ipmi" hwmonConfig.services.udev.extraRules || lib.elem "ipmi" hwmonConfig.users.users.coolerd.extraGroups || hwmonConfig.users.groups ? ipmi || hasIpmiModule hwmonConfig.boot.kernelModules)
           "hwmon: an IPMI udev rule, ipmi group or IPMI kernel module is present with enableIpmi = false"
           ++ lib.optional (!rejectsBadChip)

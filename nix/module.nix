@@ -127,9 +127,17 @@ with lib; let
   settingsZones = listOrEmpty (cfg.settings.zones or null);
   zoneFans = zone:
     if isAttrs zone
-    then filter isAttrs (listOrEmpty (zone.fans or null))
+    then listOrEmpty (zone.fans or null)
     else [];
-  listsNvidiaFan = any (fan: (fan.type or null) == "nvidia") (concatMap zoneFans settingsZones);
+  # The daemon also reads a fan written as a list in field order, such as
+  # [ "nvidia" "00000000:01:00.0" 0 ], whose first element is the type
+  fanType = fan:
+    if isAttrs fan
+    then fan.type or null
+    else if isList fan && fan != []
+    then head fan
+    else null;
+  listsNvidiaFan = any (fan: fanType fan == "nvidia") (concatMap zoneFans settingsZones);
 
   # Fails the system build when the package lacks the program that ExecStart
   # runs, so a switch never stops the running unit for one that cannot start.
