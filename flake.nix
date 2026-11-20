@@ -399,19 +399,13 @@
         chipsFound = scriptMatches "find_chip (.*)";
         grantedFiles = filesGranted accessScript;
         execStartPre = host: lib.toList ((unit host).serviceConfig.ExecStartPre or []);
-        # The helper with the + prefix, then the hwmon root and the service group
-        runsAccessHelper = host: command: let
-          words = lib.splitString " " command;
-        in
-          lib.length words
-          == 3
-          && lib.hasPrefix "+" (lib.elemAt words 0)
-          && lib.hasSuffix "-coolerd-hwmon-access" (lib.elemAt words 0)
-          && lib.elemAt words 1 == "/sys/class/hwmon"
-          && lib.elemAt words 2 == lib.escapeShellArg (unit host).serviceConfig.Group;
+        # The ExecStartPre that runs helper with the + prefix on the hwmon root
+        # for group, as the module builds it
+        accessCommands = helper: group: ["+${helper} /sys/class/hwmon ${lib.escapeShellArg group}"];
         # The module builds the helper the same way, so on the hwmon host it is
         # this very derivation
         accessHelper = pkgs.writeShellScript "coolerd-hwmon-access" accessScript;
+        migrationHelper = pkgs.writeShellScript "coolerd-hwmon-access" migrationConfig.services.coolerd.hwmon.accessScript;
         # The derivations that a host's ExecStartPre commands run
         execStartPreDrvs = host: lib.concatMap (command: lib.attrNames (builtins.getContext command)) (execStartPre host);
         twoChipHelper = pkgs.writeShellScript "hwmon-access-helper-two-chips" twoChipScript;
@@ -432,6 +426,19 @@
         expectedLibraryPathLines = host:
           lib.optional (hostLibraryPath host != null) "Environment=\"LD_LIBRARY_PATH=${hostLibraryPath host}\"";
 
+        # A value for a failure message, without its store path context, so a
+        # failure that names the Rust package does not build it
+        shown = value: builtins.unsafeDiscardStringContext (builtins.toJSON value);
+
+        # ExecStart that runs bin/coolerd of the package the host's package
+        # check gates, or null when the host has no package check
+        expectedExecStart = host: let
+          gated = (packageCheck host.nixos.config).package;
+        in
+          if gated == null
+          then null
+          else "${gated}/bin/coolerd --config /etc/coolerd.toml";
+
         hostFailures = name: host:
           map (p: "${name}: ${lib.getName p} is not on the effective unit PATH") (missingFromPath host)
           ++ lib.optional (envSetsPath host)
@@ -444,8 +451,8 @@
           "${name}: the unit's environment.LD_LIBRARY_PATH is ${builtins.toJSON ((unit host).environment.LD_LIBRARY_PATH or null)}, expected ${builtins.toJSON (hostLibraryPath host)}"
           ++ lib.optional (libraryPathLines host != expectedLibraryPathLines host)
           "${name}: the unit file's LD_LIBRARY_PATH lines are ${builtins.toJSON (libraryPathLines host)}, expected ${builtins.toJSON (expectedLibraryPathLines host)}"
-          ++ lib.optional (!lib.hasSuffix "/bin/coolerd --config /etc/coolerd.toml" (unit host).serviceConfig.ExecStart)
-          "${name}: ExecStart does not run bin/coolerd with /etc/coolerd.toml"
+          ++ lib.optional ((unit host).serviceConfig.ExecStart != expectedExecStart host)
+          "${name}: ExecStart is ${shown (unit host).serviceConfig.ExecStart}, expected ${shown (expectedExecStart host)}, bin/coolerd of the package that system.checks gates"
           ++ lib.optional (!(host.nixos.config.environment.etc ? "coolerd.toml"))
           "${name}: /etc/coolerd.toml is not defined"
           ++ lib.optional (configFileAccess host != unitOnlyAccess host)
@@ -480,16 +487,15 @@
           # hwmon-access fails the chip found last; it must be nct6798
           ++ lib.optional (chipsFound twoChipScript != map lib.escapeShellArg ["it8792" "nct6798"] || filesGranted twoChipScript != ["pwm1" "pwm1_enable" "pwm2" "pwm2_enable"])
           "two chips: the access helper does not find it8792 and then nct6798, granting pwm1 and pwm1_enable and then pwm2 and pwm2_enable"
-          ++ lib.optional (!lib.any (runsAccessHelper hosts.hwmon) (execStartPre hosts.hwmon))
-          "hwmon: ExecStartPre does not run the access helper with the + prefix on /sys/class/hwmon and the service group"
+          ++ lib.optional (execStartPre hosts.hwmon != accessCommands accessHelper (hostUser hosts.hwmon))
+          "hwmon: ExecStartPre is ${shown (execStartPre hosts.hwmon)}, expected ${shown (accessCommands accessHelper (hostUser hosts.hwmon))}"
           ++ lib.optional (((unit hosts.nvidia).serviceConfig.AmbientCapabilities or []) != [] || lib.hasInfix "AmbientCapabilities" (unitText hosts.nvidia))
           "nvidia: the unit sets AmbientCapabilities"
           # Direct, so a change that drops the capabilities on every host fails
           ++ lib.optional (!lib.all (c: lib.elem c (lib.toList ((unit hosts.drives).serviceConfig.AmbientCapabilities or []))) ["CAP_SYS_RAWIO" "CAP_SYS_ADMIN"])
           "drives: AmbientCapabilities does not contain CAP_SYS_RAWIO and CAP_SYS_ADMIN"
-          # runsAccessHelper takes the group from the unit, which hostFailures requires to be root
-          ++ lib.optional (!lib.any (runsAccessHelper hosts.nvidia) (execStartPre hosts.nvidia))
-          "nvidia: ExecStartPre does not run the access helper with the + prefix on /sys/class/hwmon and the unit's group"
+          ++ lib.optional (execStartPre hosts.nvidia != accessCommands accessHelper (hostUser hosts.nvidia))
+          "nvidia: ExecStartPre is ${shown (execStartPre hosts.nvidia)}, expected ${shown (accessCommands accessHelper (hostUser hosts.nvidia))}"
           ++ lib.optional (!lib.isDerivation nvidiaCheck || !checksPackage nvidiaCheck pkgs.coolerd)
           "nvidia: system.checks has no coolerd-package-check of pkgs.coolerd"
           # hwmon-access runs accessHelper; both hosts must run that derivation
@@ -517,8 +523,8 @@
           # Direct, as a fault common to both twins passes the comparison
           ++ lib.optional ((migrationOld.enableSmartMonTools || migrationOld.enableHdparm) && !lib.elem "disk" migrationConfig.users.users.coolerd.extraGroups)
           "migration: the service user is not in the disk group"
-          ++ lib.optional (migrationOld.hwmon.pwmChannels != {} && !lib.any (runsAccessHelper hosts.migration) (execStartPre hosts.migration))
-          "migration: ExecStartPre does not run the access helper with the + prefix on /sys/class/hwmon and the service group"
+          ++ lib.optional (migrationOld.hwmon.pwmChannels != {} && execStartPre hosts.migration != accessCommands migrationHelper (hostUser hosts.migration))
+          "migration: ExecStartPre is ${shown (execStartPre hosts.migration)}, expected ${shown (accessCommands migrationHelper (hostUser hosts.migration))}"
           ++ lib.optional (pkgs.ipmi-fan-control.drvPath != pkgs.coolerd.drvPath)
           "overlay: ipmi-fan-control is not the coolerd derivation"
           ++ lib.optional ((pkgs.coolerd.meta.mainProgram or null) != "coolerd")
