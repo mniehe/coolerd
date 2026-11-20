@@ -41,6 +41,18 @@ final: prev: {
       patchelf --set-rpath "${final.lib.makeLibraryPath [final.freeipmi]}" $out/bin/*
     '';
 
+    # The NixOS module runs bin/coolerd. The check does not run it, because the
+    # daemon would take over the fans of the build machine.
+    doInstallCheck = true;
+    installCheckPhase = ''
+      runHook preInstallCheck
+      if [ ! -f "$out/bin/coolerd" ] || [ ! -x "$out/bin/coolerd" ]; then
+        echo "$out/bin/coolerd is not an executable regular file" >&2
+        exit 1
+      fi
+      runHook postInstallCheck
+    '';
+
     meta.mainProgram = "coolerd";
   };
 

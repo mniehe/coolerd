@@ -203,6 +203,13 @@
           printf '#!/bin/sh\n' > $out/bin/ipmi-fan-control
           chmod +x $out/bin/ipmi-fan-control
         '';
+        # A package with an executable bin/coolerd that is never run, so the
+        # package check can be built without building the Rust package
+        inertPackage = pkgs.runCommand "coolerd-inert-package" {} ''
+          mkdir -p $out/bin
+          printf '#!/bin/sh\necho "inert test package, not coolerd" >&2\nexit 1\n' > $out/bin/coolerd
+          chmod +x $out/bin/coolerd
+        '';
         # The module's package check of a host, or an empty stand-in when it has none
         packageCheck = config:
           lib.findFirst (c: c.name == "coolerd-package-check") {
@@ -212,6 +219,8 @@
           config.system.checks;
         # Only the old-name host's package check is read: its system build must fail
         oldNameCheck = packageCheck (evalHost {services.coolerd.package = oldNamePackage;}).config;
+        inertCheck = packageCheck (evalHost {services.coolerd.package = inertPackage;}).config;
+        # Only evaluated: building it would build the Rust package
         defaultCheck = packageCheck hosts.default.nixos.config;
         checksPackage = check: expected: check.package != null && "${check.package}" == "${expected}";
 
@@ -376,8 +385,10 @@
           "overlay: the coolerd version is not the version in Cargo.toml"
           ++ lib.optional (self.packages.${system}.ipmi-fan-control.drvPath != self.packages.${system}.default.drvPath)
           "packages: ipmi-fan-control is not the default package"
-          ++ lib.optional (!checksPackage defaultCheck pkgs.coolerd)
+          ++ lib.optional (!lib.isDerivation defaultCheck || !checksPackage defaultCheck pkgs.coolerd)
           "default: system.checks has no coolerd-package-check of pkgs.coolerd"
+          ++ lib.optional (!lib.isDerivation inertCheck || !checksPackage inertCheck inertPackage)
+          "inert: system.checks has no coolerd-package-check of the package"
           ++ lib.optional (!checksPackage oldNameCheck oldNamePackage)
           "old name: system.checks has no coolerd-package-check of the package";
       in {
@@ -392,9 +403,9 @@
               exit 1
             fi
 
-            # The default host's check passes once built; the old-name host's
+            # The inert host's check passes once built; the old-name host's
             # check script, run as its builder would run it, fails
-            ${lib.optionalString (lib.isDerivation defaultCheck) ": ${defaultCheck}"}
+            ${lib.optionalString (lib.isDerivation inertCheck) ": ${inertCheck}"}
             if package=${oldNamePackage} out="$TMPDIR/old-name-check" \
               bash -c ${lib.escapeShellArg oldNameCheck.buildCommand} 2> "$TMPDIR/old-name-stderr"; then
               echo "old name: the package check passed a package without bin/coolerd" >&2
