@@ -473,6 +473,15 @@
           "${name}: hwmon.pwmChannels is ${builtins.toJSON cfg.hwmon.pwmChannels}, but the hwmon fans of docs/examples/${host.recipe}.toml are ${builtins.toJSON (settingsPwmChannels cfg.settings)}"
           ++ lib.optional (execStartPre host != expectedPre)
           "${name}: ExecStartPre is ${shown (execStartPre host)}, expected ${shown expectedPre}";
+        # A file added to docs/examples without a recipe host above would
+        # otherwise pass this check unevaluated
+        exampleNames = suffix:
+          lib.sort lib.lessThan (map (lib.removeSuffix suffix)
+            (lib.filter (lib.hasSuffix suffix) (lib.attrNames (builtins.readDir ./docs/examples))));
+        hostedRecipes = lib.sort lib.lessThan (lib.mapAttrsToList (_: host: host.recipe) recipeHosts);
+        unhostedFailures =
+          lib.optional (exampleNames ".nix" != hostedRecipes)
+          "docs/examples holds the recipes ${builtins.toJSON (exampleNames ".nix")}, but the check hosts evaluate ${builtins.toJSON hostedRecipes}";
         recipeConfig = host: host.nixos.config;
 
         configFileAccess = host: {inherit (host.nixos.config.environment.etc."coolerd.toml") user group mode;};
@@ -531,6 +540,7 @@
           lib.concatLists (lib.mapAttrsToList hostFailures hosts)
           ++ map (leaf: "docs/nixos.md: no heading ${optionHeading leaf}") undocumentedLeaves
           ++ lib.concatLists (lib.mapAttrsToList recipeFailures recipeHosts)
+          ++ unhostedFailures
           ++ lib.optional (!((recipeConfig hosts.recipeSupermicro).users.groups ? ipmi) || !lib.elem "ipmi" (recipeConfig hosts.recipeSupermicro).users.users.coolerd.extraGroups)
           "recipeSupermicro: the service user is not in an ipmi group"
           ++ lib.optional (!lib.all (m: lib.elem m (recipeConfig hosts.recipeSupermicro).boot.kernelModules) ipmiModules)

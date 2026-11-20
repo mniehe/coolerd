@@ -1034,11 +1034,27 @@ mod tests {
             .collect()
     }
 
+    /// Every `.toml` file of `docs/examples`, read from the directory so
+    /// that a new example is loaded without a change to a test
+    fn example_config_paths() -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = fs::read_dir(repo_file("docs/examples"))
+            .expect("the repository has a docs/examples directory")
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+            .collect();
+
+        paths.sort();
+        paths
+    }
+
     #[test]
     fn every_example_config_loads() {
-        for example in ["supermicro", "hwmon-desktop", "nvidia", "mixed"] {
-            let path = repo_file(&format!("docs/examples/{}.toml", example));
+        let paths = example_config_paths();
 
+        // An empty directory would pass the loop below
+        assert!(!paths.is_empty(), "docs/examples holds no config");
+
+        for path in paths {
             if let Err(e) = load_config(&path) {
                 panic!("{}", e);
             }

@@ -523,7 +523,6 @@ mod tests {
 
     const UPSTREAM_URL: &str = "https://github.com/chenxiaolong/ipmi-fan-control";
     const README_MAX_LINES: usize = 150;
-    const EXAMPLES: [&str; 4] = ["supermicro", "hwmon-desktop", "nvidia", "mixed"];
 
     /// The targets of the inline markdown links of `text` that name a file:
     /// links inside fenced code and links to a URL or to a fragment of the
@@ -574,6 +573,20 @@ mod tests {
         pages
     }
 
+    /// Every file of `docs/examples`, each with its path from the repository
+    /// root
+    fn example_files() -> Vec<PathBuf> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files: Vec<PathBuf> = fs::read_dir(root.join("docs/examples"))
+            .expect("the repository has a docs/examples directory")
+            .map(|entry| entry.unwrap().path())
+            .map(|path| path.strip_prefix(root).unwrap().to_owned())
+            .collect();
+
+        files.sort();
+        files
+    }
+
     fn read_repo_file(relative: &Path) -> String {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
 
@@ -617,17 +630,27 @@ mod tests {
         let targets = file_link_targets(&read_repo_file(Path::new("README.md")));
         let mut wanted: Vec<String> = pages[1..].iter().map(|page| page.display().to_string()).collect();
 
-        for name in EXAMPLES {
-            wanted.push(format!("docs/examples/{}.toml", name));
-            wanted.push(format!("docs/examples/{}.nix", name));
-        }
+        let examples = example_files();
+
+        wanted.extend(examples.iter().map(|file| file.display().to_string()));
 
         // A README with no page to link would pass on an empty docs directory
         assert!(pages.len() > 1, "docs holds no page");
+        assert!(!examples.is_empty(), "docs/examples holds no file");
 
         let unlinked: Vec<&String> = wanted.iter().filter(|page| !targets.contains(page)).collect();
 
         assert_eq!(unlinked, Vec::<&String>::new(), "README.md does not link these files");
+    }
+
+    #[test]
+    fn every_example_config_has_a_recipe() {
+        let files = example_files();
+        let lone: Vec<&PathBuf> = files.iter()
+            .filter(|file| !files.contains(&file.with_extension("toml")) || !files.contains(&file.with_extension("nix")))
+            .collect();
+
+        assert_eq!(lone, Vec::<&PathBuf>::new(), "an example is a .toml file and a .nix file of one name");
     }
 
     #[test]
