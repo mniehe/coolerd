@@ -41,8 +41,9 @@ pub const NVML_LIBRARY: &str = "libnvidia-ml.so.1";
 /// nvidia-smi gets
 pub const NVML_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The longest wait for a call that must load the library first, because
-/// nvmlInit can take much longer than a call
+/// The longest wait for the library to load, because nvmlInit can take much
+/// longer than a call. A call made before the load has succeeded waits this
+/// and [`NVML_CALL_TIMEOUT`] together.
 pub const NVML_LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The name of the worker thread, as it shows in a debugger or in /proc
@@ -53,7 +54,7 @@ const WORKER_NAME: &str = "nvml";
 pub struct Limits {
     /// For a call once the library is loaded
     pub call: Duration,
-    /// For a call that may have to load the library first
+    /// Added to [`Limits::call`] for a call made before the library is loaded
     pub load: Duration,
 }
 
@@ -73,8 +74,11 @@ pub trait Nvml: Send + Sync {
     fn set_default_fan_speed(&self, gpu: &str, fan: u32) -> Result<()>;
 }
 
+/// Set by the worker's backend once its library is loaded
+type Loaded = Arc<AtomicBool>;
+
 /// Builds the backend that the worker thread then owns and calls
-type OpenBackend = Arc<dyn Fn() -> Box<dyn Nvml> + Send + Sync>;
+type OpenBackend = Arc<dyn Fn(Loaded) -> Box<dyn Nvml> + Send + Sync>;
 
 /// One call for the worker thread to make on its backend
 type Job = Box<dyn FnOnce(&dyn Nvml) + Send>;
@@ -88,9 +92,9 @@ pub struct RealNvml {
     limits: Limits,
     /// The worker's queue, once the worker has started
     jobs: OnceLock<Sender<Job>>,
-    /// Whether a call has returned anything other than a failed load, which
-    /// means the library is loaded
-    loaded: AtomicBool,
+    /// Whether the worker's library is loaded, set by the worker as soon as
+    /// the load succeeds
+    loaded: Loaded,
     /// The call that timed out, once one has. The worker reads it too.
     stalled: Arc<OnceLock<String>>,
 }
@@ -104,12 +108,12 @@ impl RealNvml {
     pub fn with_library(library: &str) -> Self {
         let library = library.to_owned();
 
-        Self::with_backend(Arc::new(move || Box::new(LibraryNvml::new(&library))), LIMITS)
+        Self::with_backend(Arc::new(move |loaded| Box::new(LibraryNvml::new(&library, loaded))), LIMITS)
     }
 
     /// A worker over the backend that `open` builds, with the waits `limits`
     fn with_backend(open: OpenBackend, limits: Limits) -> Self {
-        Self { open, limits, jobs: OnceLock::new(), loaded: AtomicBool::new(false), stalled: Arc::new(OnceLock::new()) }
+        Self { open, limits, jobs: OnceLock::new(), loaded: Arc::new(AtomicBool::new(false)), stalled: Arc::new(OnceLock::new()) }
     }
 
     /// The worker's queue. Starts the worker on the first call.
@@ -121,11 +125,12 @@ impl RealNvml {
         let (jobs, queue) = mpsc::channel::<Job>();
         let open = self.open.clone();
         let stalled = self.stalled.clone();
+        let loaded = self.loaded.clone();
 
         thread::Builder::new()
             .name(WORKER_NAME.to_owned())
             .spawn(move || {
-                let backend = open();
+                let backend = open(loaded);
 
                 for job in queue {
                     // After a timeout no queued call runs, because its caller
@@ -147,7 +152,8 @@ impl RealNvml {
     }
 
     /// Make `call` on the worker's backend and wait for its result, for
-    /// [`Limits::load`] until the library is loaded and [`Limits::call`] after
+    /// [`Limits::call`] once the library is loaded and for [`Limits::load`]
+    /// more before
     fn request<T: Send + 'static>(
         &self,
         gpu: &str,
@@ -158,7 +164,11 @@ impl RealNvml {
             return Err(Error::NvmlStalled { gpu: gpu.to_owned(), operation, earlier: earlier.clone() });
         }
 
-        let limit = if self.loaded.load(Ordering::SeqCst) { self.limits.call } else { self.limits.load };
+        let limit = if self.loaded.load(Ordering::SeqCst) {
+            self.limits.call
+        } else {
+            self.limits.load.saturating_add(self.limits.call)
+        };
         // Room for the one reply, so the worker never waits for a caller
         let (reply, replies) = mpsc::sync_channel(1);
         let job: Job = Box::new(move |backend| {
@@ -170,13 +180,7 @@ impl RealNvml {
         self.jobs(gpu)?.send(job).map_err(|_| no_reply())?;
 
         match replies.recv_timeout(limit) {
-            Ok(result) => {
-                if !matches!(result, Err(Error::NvmlLoad { .. })) {
-                    self.loaded.store(true, Ordering::SeqCst);
-                }
-
-                result
-            }
+            Ok(result) => result,
             Err(RecvTimeoutError::Timeout) => {
                 let _ = self.stalled.set(format!("GPU {}: {}", gpu, operation));
 
@@ -218,6 +222,8 @@ impl Nvml for RealNvml {
 /// first call. Only the worker thread holds one.
 struct LibraryNvml {
     library: String,
+    /// Set once the load succeeds
+    on_load: Loaded,
     /// Never dropped. Its drop calls nvmlShutdown, which can hang in the
     /// same driver as any other call, and nvml-wrapper looks the symbol up
     /// through an `expect` that panics when the library lacks it. The
@@ -226,8 +232,8 @@ struct LibraryNvml {
 }
 
 impl LibraryNvml {
-    fn new(library: &str) -> Self {
-        Self { library: library.to_owned(), loaded: OnceLock::new() }
+    fn new(library: &str, on_load: Loaded) -> Self {
+        Self { library: library.to_owned(), on_load, loaded: OnceLock::new() }
     }
 
     /// Run `call` on a fresh handle of the GPU at bus id `gpu`, and load the
@@ -239,6 +245,7 @@ impl LibraryNvml {
             Some(library) => library,
             None => {
                 let library = ManuallyDrop::new(self.load(gpu)?);
+                self.on_load.store(true, Ordering::SeqCst);
                 self.loaded.get_or_init(|| library)
             }
         };
@@ -284,13 +291,17 @@ pub mod fake {
         std::{
             collections::HashMap,
             sync::{
+                atomic::Ordering,
                 mpsc::{self, Receiver, Sender},
                 Arc,
                 Mutex,
+                Once,
             },
+            thread,
+            time::Duration,
         },
         nvml_wrapper::error::NvmlError,
-        super::{Limits, Nvml, RealNvml},
+        super::{Limits, Loaded, Nvml, RealNvml},
         crate::error::{Error, Result},
     };
 
@@ -391,23 +402,46 @@ pub mod fake {
         }
     }
 
-    /// A [`FakeNvml`] whose `gated` operation waits for a token on `gate`
-    /// before it runs, as a call into a hung driver. A gate whose senders are
-    /// all gone lets every call through.
+    /// How long a fake backend takes
+    #[derive(Clone, Copy, Debug)]
+    pub struct Timing {
+        /// To load its library, on the first call
+        pub load: Duration,
+        /// For each call, after the load
+        pub call: Duration,
+    }
+
+    impl Timing {
+        pub const INSTANT: Timing = Timing { load: Duration::ZERO, call: Duration::ZERO };
+    }
+
+    /// A [`FakeNvml`] that loads on its first call, as a real library does,
+    /// and whose `gated` operation waits for a token on `gate` before it
+    /// runs, as a call into a hung driver. A gate whose senders are all gone
+    /// lets every call through.
     struct GatedNvml {
         inner: Arc<FakeNvml>,
-        gated: Op,
+        gated: Option<Op>,
+        timing: Timing,
         gate: Mutex<Receiver<()>>,
         /// A sender that is never used, which keeps the gate shut for good
         _shut: Option<Sender<()>>,
+        on_load: Loaded,
+        load: Once,
     }
 
     impl GatedNvml {
         fn pass<T>(&self, op: Op, call: impl FnOnce(&FakeNvml) -> Result<T>) -> Result<T> {
-            if op == self.gated {
+            self.load.call_once(|| {
+                thread::sleep(self.timing.load);
+                self.on_load.store(true, Ordering::SeqCst);
+            });
+
+            if self.gated == Some(op) {
                 let _ = self.gate.lock().unwrap().recv();
             }
 
+            thread::sleep(self.timing.call);
             call(&self.inner)
         }
     }
@@ -440,7 +474,7 @@ pub mod fake {
     pub fn stalling_worker(gpu: &str, reports: FakeGpu, stalls: Op, limits: Limits) -> RealNvml {
         let (shut, gate) = mpsc::channel();
 
-        worker_over(Arc::new(FakeNvml::with_gpu(gpu, reports)), stalls, gate, Some(shut), limits)
+        worker_over(Arc::new(FakeNvml::with_gpu(gpu, reports)), Some(stalls), Timing::INSTANT, (gate, Some(shut)), limits)
     }
 
     /// The worker NVML of production over a fake whose gated operation a
@@ -454,25 +488,36 @@ pub mod fake {
     }
 
     /// The worker NVML of production, with the waits `limits`, over a fake
-    /// that holds `gpu` and whose `gated` operation waits for a token from
-    /// [`GatedWorker::gate`]
-    pub fn gated_worker(gpu: &str, reports: FakeGpu, gated: Op, limits: Limits) -> GatedWorker {
+    /// that holds `gpu`, takes `timing`, and whose `gated` operation waits
+    /// for a token from [`GatedWorker::gate`]
+    pub fn gated_worker(gpu: &str, reports: FakeGpu, gated: Option<Op>, timing: Timing, limits: Limits) -> GatedWorker {
         let fake = Arc::new(FakeNvml::with_gpu(gpu, reports));
         let (tokens, gate) = mpsc::channel();
-        let nvml = worker_over(fake.clone(), gated, gate, None, limits);
+        let nvml = worker_over(fake.clone(), gated, timing, (gate, None), limits);
 
         GatedWorker { nvml, fake, gate: tokens }
     }
 
-    fn worker_over(fake: Arc<FakeNvml>, gated: Op, gate: Receiver<()>, shut: Option<Sender<()>>, limits: Limits) -> RealNvml {
-        let parts = Mutex::new(Some((gate, shut)));
+    /// The gate's receiver, and a sender to keep it shut for good
+    type Gate = (Receiver<()>, Option<Sender<()>>);
 
-        RealNvml::with_backend(Arc::new(move || {
+    fn worker_over(fake: Arc<FakeNvml>, gated: Option<Op>, timing: Timing, gate: Gate, limits: Limits) -> RealNvml {
+        let parts = Mutex::new(Some(gate));
+
+        RealNvml::with_backend(Arc::new(move |on_load| {
             // A second worker, which a race of first calls can start, gets an
             // open gate
             let (gate, shut) = parts.lock().unwrap().take().unwrap_or_else(|| (mpsc::channel().1, None));
 
-            Box::new(GatedNvml { inner: fake.clone(), gated, gate: Mutex::new(gate), _shut: shut })
+            Box::new(GatedNvml {
+                inner: fake.clone(),
+                gated,
+                timing,
+                gate: Mutex::new(gate),
+                _shut: shut,
+                on_load,
+                load: Once::new(),
+            })
         }), limits)
     }
 }
@@ -481,12 +526,12 @@ pub mod fake {
 mod tests {
     use {
         std::{
-            sync::Arc,
+            sync::{atomic::Ordering, Arc},
             thread,
             time::{Duration, Instant},
         },
         super::{
-            fake::{gated_worker, stalling_worker, Call, FakeGpu, GatedWorker, Op},
+            fake::{gated_worker, stalling_worker, Call, FakeGpu, GatedWorker, Op, Timing},
             Limits,
             Nvml,
             RealNvml,
@@ -589,16 +634,50 @@ mod tests {
     }
 
     #[test]
-    fn first_call_waits_for_the_load_limit() {
+    fn first_call_waits_for_the_load_and_call_limits() {
         let nvml = stalling_worker(GPU, ONE_FAN, Op::FanCount, SHORT);
 
         let start = Instant::now();
         let result = nvml.fan_count(GPU);
         let elapsed = start.elapsed();
 
+        let both = SHORT.load + SHORT.call;
         assert!(matches!(&result, Err(Error::NvmlTimeout { operation: "fan_count", limit, .. })
-            if *limit == SHORT.load), "{:?}", result);
-        assert!(elapsed >= SHORT.load && elapsed < SHORT.load + SLACK, "{:?}", elapsed);
+            if *limit == both), "{:?}", result);
+        assert!(elapsed >= both && elapsed < both + SLACK, "{:?}", elapsed);
+    }
+
+    #[test]
+    fn slow_load_and_call_end_within_both_limits() {
+        // Longer than the load limit together, shorter than each limit alone
+        let slow = Timing { load: SHORT.load - Duration::from_millis(100), call: SHORT.call - Duration::from_millis(50) };
+        let worker = gated_worker(GPU, ONE_FAN, None, slow, SHORT);
+
+        let start = Instant::now();
+        let result = worker.nvml.fan_count(GPU);
+        let elapsed = start.elapsed();
+
+        assert!(matches!(&result, Ok(1)), "{:?}", result);
+        assert!(elapsed > SHORT.load && elapsed < SHORT.load + SHORT.call, "{:?}", elapsed);
+    }
+
+    #[test]
+    fn call_after_the_load_waits_for_the_call_limit_alone() {
+        let GatedWorker { nvml, gate: _shut, .. } = gated_worker(GPU, ONE_FAN, Some(Op::FanCount), Timing::INSTANT, SHORT);
+        let nvml = Arc::new(nvml);
+        let first = {
+            let nvml = nvml.clone();
+            thread::spawn(move || nvml.fan_count(GPU))
+        };
+
+        // The first call has loaded the library but has not returned
+        wait_until(|| nvml.loaded.load(Ordering::SeqCst));
+        let second = nvml.fan_limits(GPU);
+        let first = first.join().unwrap();
+
+        assert!(matches!(&second, Err(Error::NvmlTimeout { operation: "fan_limits", limit, .. })
+            if *limit == SHORT.call), "{:?}", second);
+        assert!(matches!(&first, Err(Error::NvmlTimeout { operation: "fan_count", .. })), "{:?}", first);
     }
 
     #[test]
@@ -618,7 +697,7 @@ mod tests {
 
     #[test]
     fn call_queued_behind_a_timed_out_call_never_runs() {
-        let GatedWorker { nvml, fake, gate } = gated_worker(GPU, ONE_FAN, Op::FanSpeed, SHORT);
+        let GatedWorker { nvml, fake, gate } = gated_worker(GPU, ONE_FAN, Some(Op::FanSpeed), Timing::INSTANT, SHORT);
         let nvml = Arc::new(nvml);
         assert_eq!(nvml.fan_count(GPU).unwrap(), 1);
         let blocked = {
