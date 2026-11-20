@@ -268,6 +268,8 @@
         # Leaves the migration host leaves unset on the old path, so their
         # forwarding goes unchecked
         migrationOldOptions = hosts.migration.nixos.options.services.ipmi-fan-control;
+        # The values the migration host sets on the old path
+        migrationOld = migrationLeaves hosts.migration.nixos.pkgs;
         unsetOldLeaves =
           lib.filter (leaf: !(lib.attrByPath leaf {isDefined = false;} migrationOldOptions).isDefined)
           (publicLeaves [] defaultOptions.coolerd);
@@ -339,7 +341,10 @@
           ++ lib.optional (!(host.nixos.config.environment.etc ? "coolerd.toml"))
           "${name}: /etc/coolerd.toml is not defined"
           ++ lib.optional (configFileAccess host != serviceOnlyAccess)
-          "${name}: /etc/coolerd.toml is not owned by coolerd:coolerd with mode 0600";
+          "${name}: /etc/coolerd.toml is not owned by coolerd:coolerd with mode 0600"
+          # The unit text omits wantedBy, so the twin comparison cannot see it
+          ++ lib.optional (!lib.elem "multi-user.target" (unit host).wantedBy)
+          "${name}: multi-user.target does not want the unit";
 
         moduleFailures =
           lib.concatLists (lib.mapAttrsToList hostFailures hosts)
@@ -379,6 +384,11 @@
           ++ map (leaf: "migration: services.ipmi-fan-control.${lib.concatStringsSep "." leaf} is not an alias") unaliasedLeaves
           ++ map (leaf: "migration: the host does not set services.ipmi-fan-control.${lib.concatStringsSep "." leaf}") unsetOldLeaves
           ++ map (name: "migration: ${name} differs from the host that sets the new option paths") migrationDifferences
+          # Direct, as a fault common to both twins passes the comparison
+          ++ lib.optional ((migrationOld.enableSmartMonTools || migrationOld.enableHdparm) && !lib.elem "disk" migrationConfig.users.users.coolerd.extraGroups)
+          "migration: the service user is not in the disk group"
+          ++ lib.optional (migrationOld.hwmon.pwmChannels != {} && !lib.any (runsAccessHelper hosts.migration) (execStartPre hosts.migration))
+          "migration: ExecStartPre does not run the access helper with the + prefix on /sys/class/hwmon and the service group"
           ++ lib.optional (pkgs.ipmi-fan-control.drvPath != pkgs.coolerd.drvPath)
           "overlay: ipmi-fan-control is not the coolerd derivation"
           ++ lib.optional ((pkgs.coolerd.meta.mainProgram or null) != "coolerd")
