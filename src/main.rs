@@ -33,7 +33,7 @@ use {
     config::{Config, FanConfig, load_config, Zone},
     curve::{Transition, ZoneState},
     error::{Error, Result},
-    fan::{build_fan, FanGuard},
+    fan::{build_fan, FanGuard, ReleaseFailures, ReleaseOutcome},
     freeipmi::SensorReading,
     hwmon::HwmonRoot,
     nvml::{Nvml, RealNvml},
@@ -76,6 +76,8 @@ struct MainApp {
     /// The one NVML of the process, which every zone shares. It loads the
     /// library only when a fan first calls it.
     nvml: Arc<dyn Nvml>,
+    /// The failed releases of every zone's fans
+    release_failures: ReleaseFailures,
 }
 
 impl MainApp {
@@ -93,6 +95,7 @@ impl MainApp {
             config,
             sessions,
             nvml: Arc::new(RealNvml::new()),
+            release_failures: ReleaseFailures::default(),
         })
     }
 
@@ -106,6 +109,7 @@ impl MainApp {
                 // Only a zone with a Supermicro fan has an open session
                 self.sessions.get(&zone_config.session.0).cloned(),
                 self.nvml.clone(),
+                self.release_failures.clone(),
                 // Cloned since there's no structured concurrency support yet
                 Arc::new(zone_config.clone()),
             ));
@@ -163,6 +167,7 @@ impl MainApp {
     async fn zone_loop(
         session: Option<Arc<IpmiSession>>,
         nvml: Arc<dyn Nvml>,
+        release_failures: ReleaseFailures,
         zone_config: Arc<Zone>,
     ) -> Result<()> {
         // Each Supermicro fan holds an Arc of the session, so this guard
@@ -170,7 +175,7 @@ impl MainApp {
         // fan mode. A returned error, a panic and an abort of this task all
         // drop the guard; an abort takes effect once the poll in progress
         // returns.
-        let mut fans = FanGuard::new();
+        let mut fans = FanGuard::new(release_failures);
         let hwmon = HwmonRoot::default();
 
         for fan_config in &zone_config.fan_list {
@@ -246,6 +251,15 @@ impl MainApp {
                 }
             }
         }
+    }
+}
+
+/// The result of the process: an error from the zone loops is kept, and a
+/// clean run becomes an error when a fan failed to release
+fn exit_result(run: Result<()>, releases: ReleaseOutcome) -> Result<()> {
+    match (run, releases) {
+        (Ok(()), ReleaseOutcome::SomeFailed) => Err(Error::FansNotReleased),
+        (run, _) => run,
     }
 }
 
@@ -339,7 +353,10 @@ async fn main_wrapper() -> Result<()> {
     trace!("Loaded config: {:#?}", config);
 
     let mut app = MainApp::new(config)?;
-    app.run().await
+    let run = app.run().await;
+
+    // Every zone task has ended, so every guard has released its fans
+    exit_result(run, app.release_failures.outcome())
 }
 
 #[tokio::main]
@@ -362,10 +379,11 @@ mod tests {
     use {
         std::path::Path,
         clap::CommandFactory,
-        super::{Opt, query_sensors, sessions_to_open},
+        super::{exit_result, Opt, query_sensors, sessions_to_open},
         crate::{
             config::{Config, FanConfig, parse_config},
             error::Error,
+            fan::ReleaseOutcome,
         },
     };
 
@@ -473,6 +491,29 @@ mod tests {
         ));
 
         assert_eq!(sorted_sessions(&config), [("default".to_owned(), vec![1])]);
+    }
+
+    #[test]
+    fn clean_run_with_a_failed_release_is_an_error() {
+        let result = exit_result(Ok(()), ReleaseOutcome::SomeFailed);
+
+        assert!(matches!(result, Err(Error::FansNotReleased)), "{:?}", result);
+    }
+
+    #[test]
+    fn clean_run_with_every_fan_released_succeeds() {
+        let result = exit_result(Ok(()), ReleaseOutcome::AllReleased);
+
+        assert!(result.is_ok(), "{:?}", result);
+    }
+
+    #[test]
+    fn run_error_is_kept_whatever_the_releases_did() {
+        for releases in [ReleaseOutcome::SomeFailed, ReleaseOutcome::AllReleased] {
+            let result = exit_result(Err(Error::SensorsWithoutSession), releases);
+
+            assert!(matches!(result, Err(Error::SensorsWithoutSession)), "{:?}", result);
+        }
     }
 
     #[test]

@@ -132,6 +132,8 @@ pub enum Error {
     HwmonFault {
         path: PathBuf,
     },
+    #[error("Failed to release every fan; the errors logged before this one name each fan")]
+    FansNotReleased,
     #[error("{0}: not taken over")]
     FanNotTaken(String),
     #[error("IPMI sensors need an IPMI session, and the zone has none")]

@@ -313,11 +313,14 @@ pub mod fake {
     }
 
     /// An NVML that records its calls. A GPU it does not hold is not found,
-    /// as NVML reports an unknown bus id. One operation can fail.
+    /// as NVML reports an unknown bus id. One operation can fail, a test can
+    /// make another fail from some point on, and setting one speed can fail.
     #[derive(Default)]
     pub struct FakeNvml {
         pub gpus: HashMap<String, FakeGpu>,
         pub failing: Option<Op>,
+        pub failing_now: Mutex<Option<Op>>,
+        pub failing_speed: Option<u32>,
         pub calls: Mutex<Vec<Call>>,
     }
 
@@ -332,11 +335,16 @@ pub mod fake {
             self.calls.lock().unwrap().clone()
         }
 
+        /// Make `op` fail from now on, or no operation besides `failing`
+        pub fn set_failing(&self, op: Option<Op>) {
+            *self.failing_now.lock().unwrap() = op;
+        }
+
         /// Record `call`, then fail it when `op` fails, or find `gpu`
         fn call(&self, op: Op, gpu: &str, call: Call) -> Result<FakeGpu> {
             self.calls.lock().unwrap().push(call);
 
-            if self.failing == Some(op) {
+            if self.failing == Some(op) || *self.failing_now.lock().unwrap() == Some(op) {
                 return Err(Error::Nvml { gpu: gpu.to_owned(), source: NvmlError::Unknown });
             }
 
@@ -359,7 +367,13 @@ pub mod fake {
         }
 
         fn set_fan_speed(&self, gpu: &str, fan: u32, percent: u32) -> Result<()> {
-            self.call(Op::SetFanSpeed, gpu, Call::SetFanSpeed(gpu.to_owned(), fan, percent)).map(|_| ())
+            self.call(Op::SetFanSpeed, gpu, Call::SetFanSpeed(gpu.to_owned(), fan, percent))?;
+
+            if self.failing_speed == Some(percent) {
+                return Err(Error::Nvml { gpu: gpu.to_owned(), source: NvmlError::Unknown });
+            }
+
+            Ok(())
         }
 
         fn set_default_fan_speed(&self, gpu: &str, fan: u32) -> Result<()> {

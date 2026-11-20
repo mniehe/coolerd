@@ -3,9 +3,12 @@ use {
         fs,
         panic::{catch_unwind, AssertUnwindSafe},
         path::{Path, PathBuf},
-        sync::Arc,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
     },
-    log::{error, info},
+    log::{debug, error, info},
     crate::{
         config::FanConfig,
         error::{Error, Result},
@@ -42,17 +45,45 @@ fn fan_error(description: &str, source: Error) -> Error {
     Error::Fan { fan: description.to_owned(), source: Box::new(source) }
 }
 
+/// Whether every fan release has succeeded so far
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReleaseOutcome {
+    AllReleased,
+    SomeFailed,
+}
+
+/// The record of failed releases that the guards of every zone share, so
+/// that a failed release can reach the exit status after the zones end
+#[derive(Clone, Debug, Default)]
+pub struct ReleaseFailures(Arc<AtomicBool>);
+
+impl ReleaseFailures {
+    fn record(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn outcome(&self) -> ReleaseOutcome {
+        if self.0.load(Ordering::SeqCst) {
+            ReleaseOutcome::SomeFailed
+        } else {
+            ReleaseOutcome::AllReleased
+        }
+    }
+}
+
 /// The fans of one zone. Dropping the guard releases every fan it holds, last
-/// added first, also after an error or a panic.
+/// added first, also after an error or a panic, and records each release that
+/// fails or panics.
 pub struct FanGuard {
     /// Each fan with the description taken when it was added, so that `Drop`
     /// can name a fan without calling into it
     fans: Vec<(String, Box<dyn Fan>)>,
+    failures: ReleaseFailures,
 }
 
 impl FanGuard {
-    pub fn new() -> Self {
-        Self { fans: Vec::new() }
+    pub fn new(failures: ReleaseFailures) -> Self {
+        Self { fans: Vec::new(), failures }
     }
 
     /// Hold `fan` and take it over. The fan is held before the take-over, so
@@ -85,8 +116,14 @@ impl Drop for FanGuard {
         for (description, fan) in self.fans.iter_mut().rev() {
             match catch_unwind(AssertUnwindSafe(|| fan.release())) {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => error!("Failed to release {}: {}", description, e),
-                Err(_) => error!("Release of {} panicked", description),
+                Ok(Err(e)) => {
+                    error!("Failed to release {}: {}", description, e);
+                    self.failures.record();
+                }
+                Err(_) => {
+                    error!("Release of {} panicked", description);
+                    self.failures.record();
+                }
             }
         }
     }
@@ -331,6 +368,8 @@ impl Fan for NvidiaFan {
     /// Check that the fan exists and keep its limits. Nothing is written, so
     /// a failed take-over leaves the fan under the driver's control.
     fn take_control(&mut self) -> Result<()> {
+        // A failed take-over must not leave a speed that the next duty skips
+        self.last_sent = None;
         let count = self.nvml.fan_count(&self.gpu)?;
 
         if self.fan >= count {
@@ -341,7 +380,6 @@ impl Fan for NvidiaFan {
 
         info!("[{}] Taking over fan {}, speed limits {}% to {}%", self.gpu, self.fan, min, max);
         self.limits = Some((min, max));
-        self.last_sent = None;
 
         Ok(())
     }
@@ -349,17 +387,25 @@ impl Fan for NvidiaFan {
     /// Send the target speed on the first call after take-over, whatever the
     /// fan reports, because the reported speed does not show whether the
     /// driver or this program controls the fan. Later calls send only a
-    /// changed target.
+    /// changed target. The reported speed only feeds the debug log, so a
+    /// failed read does not stop the write.
     fn set_duty(&mut self, duty: u8) -> Result<Applied> {
         let limits = self.limits.ok_or_else(|| Error::FanNotTaken(self.describe()))?;
-        let reported = self.nvml.fan_speed(&self.gpu, self.fan)?;
-        let before = Some(u8::try_from(reported).unwrap_or(u8::MAX));
+        let before = match self.nvml.fan_speed(&self.gpu, self.fan) {
+            Ok(reported) => Some(u8::try_from(reported).unwrap_or(u8::MAX)),
+            Err(e) => {
+                debug!("[{}] Failed to read the speed of fan {}: {}", self.gpu, self.fan, e);
+                None
+            }
+        };
         let target = nvidia_target(duty, limits);
 
         if self.last_sent == Some(target) {
             return Ok(Applied { before, sent: None });
         }
 
+        // A failed write leaves the fan's speed unknown, so nothing is cached
+        self.last_sent = None;
         self.nvml.set_fan_speed(&self.gpu, self.fan, target)?;
         self.last_sent = Some(target);
 
@@ -368,9 +414,11 @@ impl Fan for NvidiaFan {
     }
 
     /// Ask for the default fan policy. When that fails, run the fan at its
-    /// maximum under manual control, and return the first error.
+    /// maximum under manual control, and return the first error. The fan
+    /// stays taken over until one of the two calls succeeds, so a later
+    /// release tries again.
     fn release(&mut self) -> Result<()> {
-        let Some((_, max)) = self.limits.take() else {
+        let Some((_, max)) = self.limits else {
             return Ok(());
         };
 
@@ -378,14 +426,20 @@ impl Fan for NvidiaFan {
         info!("[{}] Giving fan {} back to the default fan policy", self.gpu, self.fan);
 
         let Err(default) = self.nvml.set_default_fan_speed(&self.gpu, self.fan) else {
+            self.limits = None;
             return Ok(());
         };
 
-        error!("Failed to give fan {} of GPU {} back to the default policy: {}; setting it to {}%",
-               self.fan, self.gpu, default, max);
-
-        if let Err(full) = self.nvml.set_fan_speed(&self.gpu, self.fan, max) {
-            error!("Failed to set fan {} of GPU {} to {}%: {}", self.fan, self.gpu, max, full);
+        match self.nvml.set_fan_speed(&self.gpu, self.fan, max) {
+            Ok(()) => {
+                self.limits = None;
+                error!("Failed to give fan {} of GPU {} back to the default policy: {}; set it to its maximum of {}% under manual control",
+                       self.fan, self.gpu, default, max);
+            }
+            Err(full) => {
+                error!("Failed to give fan {} of GPU {} back to the default policy: {}, and failed to set it to its maximum of {}%: {}; the fan's state is unknown",
+                       self.fan, self.gpu, default, max, full);
+            }
         }
 
         Err(default)
@@ -497,6 +551,8 @@ mod tests {
             FanGuard,
             HwmonPwm,
             NvidiaFan,
+            ReleaseFailures,
+            ReleaseOutcome,
             SupermicroZone,
         },
         crate::{
@@ -528,13 +584,69 @@ mod tests {
 
     /// Add `fans` in order as the zone loop does, returning at the first error
     fn guard_over(fans: Vec<FakeFan>) -> Result<FanGuard> {
-        let mut guard = FanGuard::new();
+        guard_recording(&ReleaseFailures::default(), fans)
+    }
+
+    /// As [`guard_over`], with a guard that records into `failures`
+    fn guard_recording(failures: &ReleaseFailures, fans: Vec<FakeFan>) -> Result<FanGuard> {
+        let mut guard = FanGuard::new(failures.clone());
 
         for fan in fans {
             guard.add(Box::new(fan))?;
         }
 
         Ok(guard)
+    }
+
+    #[test]
+    fn drop_records_a_failed_release() {
+        let calls = CallLog::default();
+        let failures = ReleaseFailures::default();
+        let failing = FakeFan { failing: Some(Op::Release), ..FakeFan::new("b", &calls) };
+        let guard = guard_recording(&failures, vec![FakeFan::new("a", &calls), failing]).unwrap();
+        let before_drop = failures.outcome();
+
+        drop(guard);
+
+        assert_eq!(before_drop, ReleaseOutcome::AllReleased);
+        assert_eq!(failures.outcome(), ReleaseOutcome::SomeFailed);
+    }
+
+    #[test]
+    fn drop_records_a_panicking_release() {
+        let calls = CallLog::default();
+        let failures = ReleaseFailures::default();
+        let panicking = FakeFan { panicking: Some(Op::Release), ..FakeFan::new("b", &calls) };
+        let guard = guard_recording(&failures, vec![panicking]).unwrap();
+
+        drop(guard);
+
+        assert_eq!(failures.outcome(), ReleaseOutcome::SomeFailed);
+    }
+
+    #[test]
+    fn drop_records_nothing_when_every_release_succeeds() {
+        let calls = CallLog::default();
+        let failures = ReleaseFailures::default();
+        let guard = guard_recording(&failures, vec![FakeFan::new("a", &calls), FakeFan::new("b", &calls)]).unwrap();
+
+        drop(guard);
+
+        assert_eq!(failures.outcome(), ReleaseOutcome::AllReleased);
+    }
+
+    #[test]
+    fn guards_of_two_zones_share_one_record() {
+        let calls = CallLog::default();
+        let failures = ReleaseFailures::default();
+        let failing = FakeFan { failing: Some(Op::Release), ..FakeFan::new("b", &calls) };
+        let first = guard_recording(&failures, vec![FakeFan::new("a", &calls)]).unwrap();
+        let second = guard_recording(&failures, vec![failing]).unwrap();
+
+        drop(second);
+        drop(first);
+
+        assert_eq!(failures.outcome(), ReleaseOutcome::SomeFailed);
     }
 
     /// The description of the fan that a [`Error::Fan`] names
@@ -684,7 +796,7 @@ mod tests {
 
         {
             let session = session_on(FakeBoard::new(FanMode::Standard, &calls));
-            let mut guard = FanGuard::new();
+            let mut guard = FanGuard::new(ReleaseFailures::default());
             guard.add(Box::new(SupermicroZone::new(session.clone(), 0))).unwrap();
         }
 
@@ -1083,6 +1195,66 @@ mod tests {
     }
 
     #[test]
+    fn nvidia_set_duty_sends_a_speed_again_after_a_failed_change() {
+        let nvml = Arc::new(FakeNvml { failing_speed: Some(70), ..FakeNvml::with_gpu(GPU, ONE_FAN) });
+        let mut fan = nvidia_fan(&nvml, GPU, 0);
+        fan.take_control().unwrap();
+
+        fan.set_duty(40).unwrap();
+        let failed = fan.set_duty(70);
+        let again = fan.set_duty(40).unwrap();
+
+        assert!(matches!(&failed, Err(Error::Nvml { .. })), "{:?}", failed);
+        assert_eq!(again.sent, Some(40));
+        assert_eq!(sets_of(&nvml), [
+            Call::SetFanSpeed(GPU.into(), 0, 40),
+            Call::SetFanSpeed(GPU.into(), 0, 70),
+            Call::SetFanSpeed(GPU.into(), 0, 40),
+        ]);
+    }
+
+    #[test]
+    fn nvidia_failed_take_control_forgets_the_speed_sent() {
+        let nvml = nvml_with(ONE_FAN);
+        let mut fan = nvidia_fan(&nvml, GPU, 0);
+        fan.take_control().unwrap();
+        fan.set_duty(40).unwrap();
+
+        nvml.set_failing(Some(NvmlOp::FanCount));
+        let retaken = fan.take_control();
+        nvml.set_failing(None);
+        let after = fan.set_duty(40).unwrap();
+
+        assert!(retaken.is_err(), "{:?}", retaken);
+        assert_eq!(after.sent, Some(40));
+        assert_eq!(sets_of(&nvml), [Call::SetFanSpeed(GPU.into(), 0, 40), Call::SetFanSpeed(GPU.into(), 0, 40)]);
+    }
+
+    #[test]
+    fn nvidia_set_duty_sends_when_the_speed_cannot_be_read() {
+        let nvml = Arc::new(FakeNvml { failing: Some(NvmlOp::FanSpeed), ..FakeNvml::with_gpu(GPU, ONE_FAN) });
+        let mut fan = nvidia_fan(&nvml, GPU, 0);
+        fan.take_control().unwrap();
+
+        let applied = fan.set_duty(50).unwrap();
+
+        assert_eq!(applied, Applied { before: None, sent: Some(50) });
+        assert_eq!(sets_of(&nvml), [Call::SetFanSpeed(GPU.into(), 0, 50)]);
+    }
+
+    #[test]
+    fn nvidia_fan_with_equal_limits_runs_at_that_speed() {
+        let nvml = nvml_with(FakeGpu { limits: (100, 100), ..ONE_FAN });
+        let mut fan = nvidia_fan(&nvml, GPU, 0);
+        fan.take_control().unwrap();
+
+        let applied = fan.set_duty(40).unwrap();
+
+        assert_eq!(applied.sent, Some(100));
+        assert_eq!(sets_of(&nvml), [Call::SetFanSpeed(GPU.into(), 0, 100)]);
+    }
+
+    #[test]
     fn nvidia_set_duty_before_take_control_sends_nothing() {
         let nvml = nvml_with(ONE_FAN);
         let mut fan = nvidia_fan(&nvml, GPU, 0);
@@ -1118,6 +1290,45 @@ mod tests {
 
         assert!(matches!(&result, Err(Error::Nvml { gpu, .. }) if gpu == GPU), "{:?}", result);
         assert_eq!(sets_of(&nvml)[1..], [Call::SetDefaultFanSpeed(GPU.into(), 0), Call::SetFanSpeed(GPU.into(), 0, 90)]);
+    }
+
+    #[test]
+    fn nvidia_release_after_the_maximum_is_set_sends_nothing_again() {
+        let failing = FakeNvml { failing: Some(NvmlOp::SetDefaultFanSpeed), ..FakeNvml::with_gpu(GPU, FakeGpu { limits: (30, 90), ..ONE_FAN }) };
+        let nvml = Arc::new(failing);
+        let mut fan = nvidia_fan(&nvml, GPU, 0);
+        fan.take_control().unwrap();
+        let _ = fan.release();
+
+        let again = fan.release();
+
+        assert!(again.is_ok(), "{:?}", again);
+        assert_eq!(sets_of(&nvml), [Call::SetDefaultFanSpeed(GPU.into(), 0), Call::SetFanSpeed(GPU.into(), 0, 90)]);
+    }
+
+    #[test]
+    fn nvidia_release_tries_again_after_both_calls_fail() {
+        let failing = FakeNvml {
+            failing: Some(NvmlOp::SetDefaultFanSpeed),
+            failing_speed: Some(90),
+            ..FakeNvml::with_gpu(GPU, FakeGpu { limits: (30, 90), ..ONE_FAN })
+        };
+        let nvml = Arc::new(failing);
+        let mut fan = nvidia_fan(&nvml, GPU, 0);
+        fan.take_control().unwrap();
+        fan.set_duty(40).unwrap();
+
+        let first = fan.release();
+        let second = fan.release();
+
+        assert!(first.is_err(), "{:?}", first);
+        assert!(second.is_err(), "{:?}", second);
+        assert_eq!(sets_of(&nvml)[1..], [
+            Call::SetDefaultFanSpeed(GPU.into(), 0),
+            Call::SetFanSpeed(GPU.into(), 0, 90),
+            Call::SetDefaultFanSpeed(GPU.into(), 0),
+            Call::SetFanSpeed(GPU.into(), 0, 90),
+        ]);
     }
 
     #[test]
@@ -1191,7 +1402,7 @@ mod tests {
         let nvml = nvml_with(ONE_FAN);
 
         {
-            let mut guard = FanGuard::new();
+            let mut guard = FanGuard::new(ReleaseFailures::default());
             guard.add(Box::new(nvidia_fan(&nvml, GPU, 0))).unwrap();
             guard.set_duty(50).unwrap();
         }
@@ -1230,7 +1441,7 @@ mod tests {
     fn dropped_guard_releases_another_fan_after_an_nvidia_timeout() {
         let calls = CallLog::default();
         let nvml = stalling_on_fan_speed();
-        let mut guard = FanGuard::new();
+        let mut guard = FanGuard::new(ReleaseFailures::default());
         guard.add(Box::new(FakeFan::new("a", &calls))).unwrap();
         // Added last, so released first
         guard.add(Box::new(NvidiaFan::new(nvml, GPU.into(), 0))).unwrap();

@@ -194,6 +194,8 @@ steps = [{ temp = 40, dcycle = 30 }, { temp = 80, dcycle = 100 }]
 
 The program finds the chip by name once, at startup, and keeps the chip's device path. If the chip's driver is unbound and bound again while the program runs, another chip can take that path, and the program then drives that chip. Restart the program after you rebind a hwmon driver.
 
+If the program fails to release a fan on exit, it logs the error and exits with status 1, also when a signal stopped it. Earlier versions exited with status 0 in that case.
+
 ### NVIDIA fans
 
 An `nvidia` fan, `{ type = "nvidia", gpu = "00000000:01:00.0", fan = 0 }`, is fan 0 of the NVIDIA GPU at PCI bus id `00000000:01:00.0`. `fan` starts at 0. A fan selects its GPU by PCI bus id only; a GPU UUID, which the `nvidia` source accepts, is rejected. The domain may have four or eight hex digits in either case, so `0000:01:00.0` and `00000000:01:00.0` name the same GPU, and two zones cannot drive the same fan of one GPU in either spelling. To list the bus ids, run `nvidia-smi --query-gpu=pci.bus_id --format=csv`.
@@ -202,7 +204,9 @@ The program drives the fan through NVML, the management library of the NVIDIA dr
 
 On startup the program reads the GPU's fan count and the fan's speed limits, and logs the limits. It fails when the fan does not exist or when the limits are not a range within 0 to 100%. It changes nothing at startup. Its first update sets the fan speed, which switches the fan to manual control; later updates set the speed only when it changes. NVML refuses a speed below the fan's minimum, so the program raises a lower duty cycle to the minimum: with a minimum of 30%, a duty cycle of 20% runs the fan at 30%. A duty cycle above the fan's maximum is capped at the maximum. The debug log shows the speed that NVML reports as the fan's speed before each update.
 
-On exit, also after an error, the program gives the fan back to the driver's default fan policy, so that the driver sets the speed from the GPU temperature again. If that call fails, the program sets the fan to its maximum instead. This leaves the fan in manual control at full speed until the program next starts and exits normally, or until the driver is reloaded.
+On exit, also after an error, the program gives the fan back to the driver's default fan policy. That policy is the GPU's own fan curve: the driver sets the speed from the GPU temperature again, and it may run the fan slower than the zone did. If that call fails, the program sets the fan to its maximum under manual control instead, and logs a line that starts with `Failed to give fan` and ends with `set it to its maximum of <max>% under manual control`. The fan then stays in manual control at its maximum until the program next starts and exits normally, or until the driver is reloaded. If setting the maximum fails as well, the line ends with `the fan's state is unknown` instead: the fan may keep the last speed that the program set. In both cases the program exits with status 1.
+
+Each NVML call has a time limit of 5 seconds, and 30 seconds for a call that loads the library. A call that does not return in time fails, and so does the zone. NVML calls cannot be stopped, so the program makes no further NVML call after that: every later call, including the release of each NVIDIA fan on exit, fails at once and is logged. Restart the program after the driver recovers.
 
 This zone drives fan 0 of a GPU from the GPU's own temperature:
 
@@ -226,7 +230,7 @@ On NixOS, set `services.coolerd.enableNvidiaFans = true`. It runs the service as
    ```
 
    The speed is the zone's duty cycle, or the fan's minimum when the duty cycle is lower. The unit logs the limits at startup in a line with `speed limits`; read it with `journalctl -u coolerd.service`.
-2. Stop the unit with `sudo systemctl stop coolerd.service`, and read the speed again with the same command. The speed follows the GPU temperature again. If the journal shows `Failed to give fan`, the default policy was not restored, and the fan stays in manual control at its maximum.
+2. Stop the unit with `sudo systemctl stop coolerd.service`, and read the speed again with the same command. The speed follows the GPU temperature again. If the journal shows a line that starts with `Failed to give fan`, the default policy was not restored. When that line ends with `under manual control`, the fan stays in manual control at its maximum; when it ends with `the fan's state is unknown`, the fan may keep the last speed that the program set, so restart the unit or reload the driver.
 
 NixOS
 -----
