@@ -13,7 +13,7 @@ use {
         config::FanConfig,
         error::{Error, Result},
         hwmon::{HwmonRoot, read_number, write_number},
-        nvml::Nvml,
+        nvml::{worker_failed, Nvml},
         session::IpmiSession,
     },
 };
@@ -388,11 +388,13 @@ impl Fan for NvidiaFan {
     /// fan reports, because the reported speed does not show whether the
     /// driver or this program controls the fan. Later calls send only a
     /// changed target. The reported speed only feeds the debug log, so a
-    /// failed read does not stop the write.
+    /// failed read does not stop the write, unless it shows that the NVML
+    /// worker failed: a zone that keeps one duty would never learn of that.
     fn set_duty(&mut self, duty: u8) -> Result<Applied> {
         let limits = self.limits.ok_or_else(|| Error::FanNotTaken(self.describe()))?;
         let before = match self.nvml.fan_speed(&self.gpu, self.fan) {
             Ok(reported) => Some(u8::try_from(reported).unwrap_or(u8::MAX)),
+            Err(e) if worker_failed(&e) => return Err(e),
             Err(e) => {
                 debug!("[{}] Failed to read the speed of fan {}: {}", self.gpu, self.fan, e);
                 None
@@ -562,7 +564,7 @@ mod tests {
             hwmon::HwmonRoot,
             ipmi::FanMode,
             nvml::{
-                fake::{stalling_worker, Call, FakeGpu, FakeNvml, Op as NvmlOp},
+                fake::{gated_worker, stalling_worker, Call, FakeGpu, FakeNvml, GatedWorker, Op as NvmlOp, Timing},
                 Limits,
                 Nvml,
             },
@@ -1419,6 +1421,37 @@ mod tests {
     /// An NVML worker over a fake that holds [`GPU`] and whose fan_speed never returns
     fn stalling_on_fan_speed() -> Arc<dyn Nvml> {
         Arc::new(stalling_worker(GPU, ONE_FAN, NvmlOp::FanSpeed, SHORT))
+    }
+
+    #[test]
+    fn nvidia_set_duty_returns_a_failed_worker_even_with_nothing_to_send() {
+        let GatedWorker { nvml, fake, gate } = gated_worker(GPU, ONE_FAN, Some(NvmlOp::FanSpeed), Timing::INSTANT, SHORT);
+        let mut fan = NvidiaFan::new(Arc::new(nvml), GPU.into(), 0);
+        fan.take_control().unwrap();
+        // Lets the first read through; the second never returns
+        gate.send(()).unwrap();
+        fan.set_duty(50).unwrap();
+
+        let timed_out = fan.set_duty(50);
+        let stalled = fan.set_duty(50);
+
+        assert!(matches!(&timed_out, Err(Error::NvmlTimeout { operation: "fan_speed", .. })), "{:?}", timed_out);
+        assert!(matches!(&stalled, Err(Error::NvmlStalled { operation: "fan_speed", .. })), "{:?}", stalled);
+        assert_eq!(sets_of(&fake), [Call::SetFanSpeed(GPU.into(), 0, 50)]);
+    }
+
+    #[test]
+    fn nvidia_set_duty_with_nothing_to_send_ignores_a_failed_read() {
+        let nvml = nvml_with(ONE_FAN);
+        let mut fan = nvidia_fan(&nvml, GPU, 0);
+        fan.take_control().unwrap();
+        fan.set_duty(50).unwrap();
+
+        nvml.set_failing(Some(NvmlOp::FanSpeed));
+        let repeated = fan.set_duty(50);
+
+        assert!(matches!(&repeated, Ok(Applied { before: None, sent: None })), "{:?}", repeated);
+        assert_eq!(sets_of(&nvml), [Call::SetFanSpeed(GPU.into(), 0, 50)]);
     }
 
     #[test]

@@ -74,6 +74,13 @@ pub trait Nvml: Send + Sync {
     fn set_default_fan_speed(&self, gpu: &str, fan: u32) -> Result<()>;
 }
 
+/// Whether `error` means the worker can make no more calls: a call timed out
+/// or is stuck, or the worker thread stopped or never started
+pub fn worker_failed(error: &Error) -> bool {
+    matches!(error,
+        Error::NvmlTimeout { .. } | Error::NvmlStalled { .. } | Error::NvmlNoReply { .. } | Error::NvmlThread { .. })
+}
+
 /// Set by the worker's backend once its library is loaded
 type Loaded = Arc<AtomicBool>;
 
@@ -526,12 +533,15 @@ pub mod fake {
 mod tests {
     use {
         std::{
+            io,
             sync::{atomic::Ordering, Arc},
             thread,
             time::{Duration, Instant},
         },
+        nvml_wrapper::error::NvmlError,
         super::{
             fake::{gated_worker, stalling_worker, Call, FakeGpu, GatedWorker, Op, Timing},
+            worker_failed,
             Limits,
             Nvml,
             RealNvml,
@@ -577,6 +587,28 @@ mod tests {
         let nvml = stalling_worker(GPU, ONE_FAN, Op::FanSpeed, SHORT);
         assert_eq!(nvml.fan_count(GPU).unwrap(), 1);
         nvml
+    }
+
+    #[test]
+    fn only_errors_of_the_worker_mean_it_failed() {
+        let gpu = || GPU.to_owned();
+        let failed = [
+            Error::NvmlTimeout { gpu: gpu(), operation: "fan_speed", limit: SHORT.call },
+            Error::NvmlStalled { gpu: gpu(), operation: "fan_speed", earlier: gpu() },
+            Error::NvmlNoReply { gpu: gpu(), operation: "fan_speed" },
+            Error::NvmlThread { gpu: gpu(), source: io::Error::other("no thread") },
+        ];
+        let working = [
+            Error::Nvml { gpu: gpu(), source: NvmlError::Unknown },
+            Error::NvmlLoad { gpu: gpu(), library: MISSING_LIBRARY.to_owned(), source: NvmlError::Unknown },
+        ];
+
+        for error in &failed {
+            assert!(worker_failed(error), "{:?}", error);
+        }
+        for error in &working {
+            assert!(!worker_failed(error), "{:?}", error);
+        }
     }
 
     #[test]
