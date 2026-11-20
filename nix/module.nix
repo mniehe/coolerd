@@ -12,6 +12,16 @@ with lib; let
   serviceUser = "coolerd";
   serviceGroup = "coolerd";
 
+  # The user and group the daemon runs as; NVML fan commands need root
+  unitUser =
+    if cfg.enableNvidiaFans
+    then "root"
+    else serviceUser;
+  unitGroup =
+    if cfg.enableNvidiaFans
+    then "root"
+    else serviceGroup;
+
   # Use pkgs.formats.toml to handle the conversion
   format = pkgs.formats.toml {};
   configFile = format.generate "coolerd-config.toml" cfg.settings;
@@ -121,7 +131,8 @@ with lib; let
   '';
 in {
   # One alias per option leaf: an alias of the whole subtree breaks
-  # lib.mkForce on an old path. hwmon.accessScript is internal and has none.
+  # lib.mkForce on an old path. hwmon.accessScript is internal and has none,
+  # and so does enableNvidiaFans, which came after the rename.
   imports = map (leaf: mkRenamedOptionModule (["services" "ipmi-fan-control"] ++ leaf) (["services" "coolerd"] ++ leaf)) [
     ["enable"]
     ["package"]
@@ -218,6 +229,21 @@ in {
       description = "Load the IPMI kernel modules and give the service access to the IPMI device. Turn it off on a host with no IPMI and only hwmon fans";
     };
 
+    enableNvidiaFans = mkOption {
+      type = types.bool;
+      default = false;
+      description = ''
+        Run the service as root so that it can drive NVIDIA GPU fans through
+        NVML. NVML fan commands were shown to work only as root, on driver
+        595.104.02, so the service runs as the user and group root with no
+        ambient capabilities, and /etc/coolerd.toml belongs to root. The
+        service loads libnvidia-ml.so.1 from the host's driver at run time,
+        so the library is not a package input: the service's LD_LIBRARY_PATH
+        is /run/opengl-driver/lib, which exists only when the host enables its
+        graphics driver packages, as hardware.graphics.enable does
+      '';
+    };
+
     hwmon = {
       kernelModules = mkOption {
         type = types.listOf types.str;
@@ -296,8 +322,8 @@ in {
     environment.etc."coolerd.toml" = {
       source = configFile;
       mode = "0600"; # Restrict access as it might contain credentials
-      user = serviceUser;
-      group = serviceGroup;
+      user = unitUser;
+      group = unitGroup;
     };
 
     systemd.services.coolerd = {
@@ -308,20 +334,26 @@ in {
 
       path = runtimeDeps;
 
+      environment.LD_LIBRARY_PATH = mkIf cfg.enableNvidiaFans "/run/opengl-driver/lib";
+
       serviceConfig = {
         Type = "simple";
-        User = serviceUser;
-        Group = serviceGroup;
-        # The + prefix runs the helper as root; the daemon keeps its user
-        ExecStartPre = mkIf (cfg.hwmon.pwmChannels != {}) "+${accessHelper} /sys/class/hwmon ${escapeShellArg serviceGroup}";
+        User = unitUser;
+        Group = unitGroup;
+        # The + prefix runs the helper as root; the daemon keeps its user. A
+        # root unit needs no grant, but the helper still stops the start when
+        # a listed chip or file is missing.
+        ExecStartPre = mkIf (cfg.hwmon.pwmChannels != {}) "+${accessHelper} /sys/class/hwmon ${escapeShellArg unitGroup}";
         ExecStart = "${cfg.package}/bin/coolerd --config /etc/coolerd.toml";
         Restart = "on-failure";
         RestartSec = "10s";
         # CAP_SYS_RAWIO: required for SATA SMART (SCSI passthrough) and hdparm
         # CAP_SYS_ADMIN: required for NVMe SMART (admin ioctl)
-        AmbientCapabilities =
+        # A root unit holds both already.
+        AmbientCapabilities = mkIf (!cfg.enableNvidiaFans) (
           lib.optionals (cfg.enableSmartMonTools || cfg.enableHdparm) ["CAP_SYS_RAWIO"]
-          ++ lib.optionals cfg.enableSmartMonTools ["CAP_SYS_ADMIN"];
+          ++ lib.optionals cfg.enableSmartMonTools ["CAP_SYS_ADMIN"]
+        );
       };
     };
   };
