@@ -23,7 +23,7 @@ To start from a working file, copy one of the [examples](examples/). [`config.sa
 coolerd --config /etc/coolerd.toml
 ```
 
-`--config`, or `-c`, is the only option, and it is required. coolerd checks the whole file before it touches a fan. When a key breaks a rule, coolerd prints the path of the file and the key, such as `zones[0].steps[1].dcycle: values are not increasing`, and exits with status 1. A key that coolerd does not know is an error, so a misspelt key never falls back to a default without a message.
+`--config`, or `-c`, is required. `--help` prints the usage and starts nothing. coolerd checks the whole file before it touches a fan. When a key breaks a rule, coolerd prints the path of the file and the key, such as `zones[0].steps[1].dcycle: values are not increasing`, and exits with status 1. A key that coolerd does not know is an error, so a misspelt key does not fall back to a default without a message. Two tables are not checked in this way yet: an `aggregation` or `duty_aggregation` of type `maximum`, and a session of type `local`, ignore keys that they do not know.
 
 coolerd needs the rights to reach its devices: the IPMI device for a Supermicro fan, write access to the `pwmN` and `pwmN_enable` files for a hwmon fan, and root for an NVIDIA fan. The [NixOS module](nixos.md) sets these up.
 
@@ -79,7 +79,9 @@ flowchart LR
     SE[(session)] -.-> Z
 ```
 
-This is a complete config for a machine with one hwmon chip:
+Write zones, sources and fans as tables, as this page shows. A list of values in the order of the keys also loads, for old configs, but do not use it in a new config.
+
+This is a complete config for a machine with two hwmon chips. One chip measures the CPU, and the other drives the fan:
 
 ```toml
 [[zones]]
@@ -100,10 +102,10 @@ steps = [{ temp = 40, dcycle = 30 }, { temp = 80, dcycle = 100 }]
 The log levels, from the least output to the most:
 
 - `error`: errors that stop coolerd, a source that starts to fail, and a fan that coolerd could not release.
-- `warn`: also a program that coolerd stopped and that did not exit.
+- `warn`: also an IPMI sensor entry that the board could not read, and a program that coolerd killed and that did not exit.
 - `info`: also the fan mode changes at start and stop, the start of each zone, and a source that reads again.
-- `debug`: also one line for each fan in each update, with the temperatures and the duty cycle. Use it to tune a curve.
-- `trace`: also the parsed config, each failed attempt to read a source, and the raw IPMI commands.
+- `debug`: also one line for each fan after each update that succeeds, with the temperatures and the duty cycle. Use it to tune a curve.
+- `trace`: also the parsed config, each failed attempt that is followed by a retry, and the raw IPMI commands.
 
 ## Zone keys
 
@@ -119,7 +121,7 @@ Each `[[zones]]` table is one zone.
 | `aggregation` | table | `{ type = "maximum" }` | How source temperatures become the zone temperature. `{ type = "average" }` or `{ type = "average", top = N }`, where `top` is greater than 0. |
 | `duty_aggregation` | table | `{ type = "maximum" }` | How the duty cycles of the zone's curves become one. Same values as `aggregation`. |
 | `hysteresis` | integer 0 to 255 | 0 | Degrees Celsius that the temperature of an inline curve must fall before the duty cycle follows. |
-| `interval` | integer 1 to 65535 | 1 | Seconds between updates. |
+| `interval` | integer 1 to 65535 | 1 | Seconds that the zone waits after each update. The reads and the retries of an update add to the time between two updates. |
 | `retries` | integer, 0 or more | 2 | Waits for another attempt that the sources of the zone share in one update. See [Failures and shutdown](failure.md#retries). |
 | `retry_delay_ms` | integer, 0 or more | 500 | Milliseconds of each such wait. |
 | `session` | string | `"default"` | The [session](#sessions) that reaches the board of the zone's Supermicro fans. The name must be a key of `sessions` or `default`. |
@@ -155,9 +157,9 @@ When every source has its own curve, the zone has no temperature. The zone's `st
 
 ### Hysteresis
 
-A curve follows a rise in temperature at once. It follows a fall only when the temperature is `hysteresis` degrees or more below the temperature that the curve holds. So the fans speed up without delay, and they do not slow down and speed up again around one temperature. The default is 0, which follows every reading.
+Each curve holds a temperature. A reading at or above the held temperature replaces it at once. A lower reading replaces it only when it is `hysteresis` degrees or more below the held temperature. So the fans speed up without delay, and they do not slow down and speed up again around one temperature. With a held temperature of 72 °C and `hysteresis = 3`, readings of 70 °C and then 71 °C both map as 72 °C. The default is 0, which follows every reading.
 
-Each curve holds its own temperature. The zone's `hysteresis` applies to inline `steps`: the zone's and those of each source. A [named curve](#named-curves) has its own `hysteresis` and never uses the zone's.
+The zone's `hysteresis` applies to inline `steps`: the zone's and those of each source. A [named curve](#named-curves) has its own `hysteresis` and never uses the zone's.
 
 ### Smoothing
 
@@ -167,7 +169,7 @@ The mean comes first: the zone temperature, the source's own curve and `hysteres
 
 With `smoothing_samples = 3` and steps from 40 °C at 40% to 80 °C at 100%, readings of 40, 70, 40 and 40 °C give 40%, 62%, 55% and 55%. The same readings without smoothing give 40%, 85%, 40% and 40%.
 
-Smoothing delays the response to real heat. `hysteresis` does not, because it follows every rise at once. The mean holds only the readings since coolerd started or since the source last failed, so the first reading after either acts at once. After that, the cooler readings still in the mean hold back a sustained rise, until the Nth hot reading pushes out the last of them. The duty cycle can reach its target sooner, because the mean can cross the top step first: with `smoothing_samples = 3` and the steps above, three readings of 70 °C and then one of 100 °C give a mean of 80 °C and 100% at the first hot reading.
+Smoothing delays the response to real heat. `hysteresis` does not, because a reading above the held temperature acts at once. The mean holds only the readings since coolerd started or since the source last failed, so the first reading after either acts at once. After that, the cooler readings still in the mean hold back a sustained rise, until the Nth hot reading pushes out the last of them. The duty cycle can reach its target sooner, because the mean can cross the top step first: with `smoothing_samples = 3` and the steps above, three readings of 70 °C and then one of 100 °C give a mean of 80 °C and 100% at the first hot reading.
 
 Use smoothing for a sensor whose readings jump, as some AMD CPU and GPU sensors do. Do not use it for a device that heats quickly.
 
@@ -204,7 +206,7 @@ A curve maps a temperature in this way:
 - A curve with one step gives a fixed duty cycle.
 - A curve with no steps gives 100%.
 
-At 0% the fans are off, and at 100% they run at full speed. Be careful with low values, because a fan can stall.
+A duty cycle is a request to the fan backend, not a measured speed. A fan may not stop at 0%, a fan can stall at a low value, and a backend can raise or cap the request, as [Failures and shutdown](failure.md#the-duty-cycle-that-a-fan-gets) describes. Check the real speeds and temperatures on the host.
 
 Three rules cover an empty or absent list:
 
@@ -430,9 +432,9 @@ A session can also be a list of `ipmitool` arguments, such as `["-I", "lanplus",
 
 ## Changes from earlier versions
 
-A config written for ipmi-fan-control loads in coolerd. These points behave in another way than they did in earlier versions:
+The format of the config file is the format of ipmi-fan-control. A config written for it loads in coolerd, unless two of its zones drive the same IPMI zone, as the second point says. These points behave in another way than they did in earlier versions:
 
-- **`average` with `top`.** An `average` `aggregation` divides by the number of temperatures it used; `top` only caps that number. Earlier versions divided by `top` even when the zone had fewer sources. A zone whose `top` is higher than its number of sources now runs its fans faster: readings of 80 °C and 80 °C with `top = 3` give 80 °C, where they gave 53 °C.
+- **`average` with `top`.** An `average` `aggregation` divides by the number of temperatures it used; `top` only caps that number. Earlier versions divided by `top` even when the zone had fewer sources. A zone whose `top` is higher than its number of sources now gets a higher zone temperature, and its fans can run faster: readings of 80 °C and 80 °C with `top = 3` give 80 °C, where they gave 53 °C.
 - **One fan, one zone.** Two zones on one session can no longer name the same IPMI zone. Earlier versions loaded such a config, and the zones overwrote each other's duty cycle.
 - **Retries.** Only a source that fails is read again. Earlier versions read every source of the zone again when one source failed.
 - **Time limits.** `smartctl` and `hdparm` are stopped after 30 seconds. Earlier versions waited for them without a limit.

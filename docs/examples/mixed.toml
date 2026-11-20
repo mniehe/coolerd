@@ -1,8 +1,9 @@
 # coolerd example: a Supermicro server with an NVIDIA GPU.
 #
 # One zone drives the chassis fans through the board, and one zone drives the
-# GPU's own fan through NVML. Both zones name the curve `gpu`, so the GPU
-# temperature moves the chassis fans and the GPU fan together. coolerd must
+# GPU's own fan through NVML. Both zones name the curve `gpu`, so one list of
+# steps maps the GPU temperature for the chassis fans and for the GPU fan.
+# Each zone reads the GPU on its own. coolerd must
 # run as root to set a GPU fan speed. Copy this file, change each value under
 # a REPLACE comment, and start coolerd with `coolerd --config <file>`.
 #
@@ -30,7 +31,8 @@ fans = [
   { type = "supermicro", zone = 1 },
 ]
 
-# Seconds between updates. Each update runs nvidia-smi once.
+# Seconds that the zone waits after each update. Each update runs
+# nvidia-smi.
 interval = 2
 
 sources = [
@@ -44,8 +46,8 @@ sources = [
   # `nvidia-smi --query-gpu=pci.bus_id --format=csv`. This source has no steps
   # of its own, so the zone's curve, `gpu`, maps it.
   #
-  # When the GPU temperature cannot be read, the chassis fans run at 80% or
-  # more until it reads again.
+  # When this zone cannot read the GPU temperature, the chassis fans run at
+  # 80% or more until it reads again.
   { type = "nvidia", gpu = "00000000:01:00.0", on_failure = { type = "dcycle", dcycle = 80 } },
 ]
 
@@ -62,9 +64,10 @@ fans = [
 interval = 2
 
 sources = [
-  # REPLACE: the same PCI bus id. When the temperature cannot be read,
-  # coolerd stops. On its way out it sets the chassis fans to 100% and gives
-  # the GPU fan back to the driver.
-  { type = "nvidia", gpu = "00000000:01:00.0" },
+  # REPLACE: the same PCI bus id. When this zone cannot read the GPU
+  # temperature, the GPU fan runs at its maximum until it reads again, and
+  # coolerd keeps running. Without `on_failure`, coolerd would stop here, and
+  # the 80% of the chassis fans above would never apply for long.
+  { type = "nvidia", gpu = "00000000:01:00.0", on_failure = { type = "dcycle", dcycle = 100 } },
 ]
 curve = "gpu"

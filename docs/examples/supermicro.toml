@@ -14,7 +14,7 @@ log_level = "info"
 [[zones]]
 fans = [{ type = "supermicro", zone = 0 }]
 
-# Seconds between updates.
+# Seconds that the zone waits after each update.
 interval = 2
 
 sources = [
@@ -62,6 +62,9 @@ steps = [
 
 # A board in another machine is reached through a remote session. Define the
 # session here and name it in a zone with `session = "bmc"`. The password is
-# stored in this file as plain text, so keep the file readable by root only.
+# stored in this file as plain text, so keep the file readable only by the
+# user that coolerd runs as. Do not put a real password in a file that the
+# NixOS recipe reads: NixOS copies it into the Nix store, which every user of
+# the host can read.
 #[sessions]
 #bmc = { type = "remote", hostname = "bmc.example.com", username = "REPLACE", password = "REPLACE" }

@@ -17,7 +17,7 @@ coolerd is a fork of [chenxiaolong/ipmi-fan-control](https://github.com/chenxiao
 
 The upstream project was tested mainly on a 6028U-TR4T+, which uses the X10DRU-i+ motherboard. Its author reported that the fan control IPMI commands did not change across five generations of Supermicro motherboards. This is a record of what was tested. It does not promise that coolerd works on your board.
 
-If you come from ipmi-fan-control, read [Migrating from ipmi-fan-control](docs/nixos.md#migrating-from-ipmi-fan-control). An existing config file loads unchanged.
+If you come from ipmi-fan-control, read [Migrating from ipmi-fan-control](docs/nixos.md#migrating-from-ipmi-fan-control). The format of the config file is unchanged.
 
 What coolerd supports
 ---------------------
@@ -73,9 +73,9 @@ Quick start
    sudo coolerd --config config.toml
    ```
 
-When coolerd starts, it takes over the fans that the config names. A Supermicro board is switched to its full fan mode, and a hwmon channel is switched to manual control at full speed. When coolerd stops, it sets these fans to full speed and gives back the control that it took. A process that is killed gives nothing back.
+When coolerd starts, it takes over the fans that the config names. A Supermicro board is switched to its full fan mode, and a hwmon channel is switched to manual control at full speed. When coolerd stops, it attempts to set these fans to full speed and to give back the control that it took. A process that is killed gives nothing back.
 
-A wrong curve or a wrong fan can overheat hardware. Watch the temperatures after the first start. `log_level = "debug"` logs the temperatures and the duty cycle of each update.
+A wrong curve or a wrong fan can overheat hardware. Watch the temperatures after the first start. `log_level = "debug"` logs the temperatures and the duty cycle after each update.
 
 Documentation
 -------------

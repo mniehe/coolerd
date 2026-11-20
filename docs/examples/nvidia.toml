@@ -19,18 +19,20 @@ fans = [
   { type = "nvidia", gpu = "00000000:01:00.0", fan = 0 },
 ]
 
-# Seconds between updates. Each update runs nvidia-smi once.
+# Seconds that the zone waits after each update. Each update runs
+# nvidia-smi.
 interval = 2
 
 sources = [
   # REPLACE: the same PCI bus id. When the temperature cannot be read, coolerd
-  # stops, and on its way out it gives the fan back to the driver.
+  # stops, and on its way out it attempts to give the fan back to the driver.
   { type = "nvidia", gpu = "00000000:01:00.0" },
 ]
 
 # REPLACE: the curve for your GPU. Below 50 °C the fan runs at 30%, above
 # 85 °C at 100%, and in between on a straight line. The driver sets a minimum
-# speed for the fan; coolerd raises a lower duty cycle to that minimum.
+# speed and a maximum speed for the fan; coolerd keeps the duty cycle
+# within the two.
 steps = [
   { temp = 50, dcycle = 30 },
   { temp = 85, dcycle = 100 },

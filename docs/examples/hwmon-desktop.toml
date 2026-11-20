@@ -21,7 +21,7 @@ fans = [
   { type = "hwmon", chip = "nct6798", pwm = 2 },
 ]
 
-# Seconds between updates.
+# Seconds that the zone waits after each update.
 interval = 2
 
 sources = [

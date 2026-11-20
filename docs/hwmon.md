@@ -60,11 +60,13 @@ find /sys/class/hwmon/hwmon3/ -maxdepth 1 -name 'pwm[0-9]*' | sort
 
 A chip that can drive fans has a `pwmN` file and a `pwmN_enable` file for each channel. `pwm = 2` in the config selects `pwm2` and `pwm2_enable`. A chip without these files, such as a CPU temperature sensor, cannot be a `hwmon` fan.
 
-To read the present state of each channel:
+To read the present state of one channel, here channel 2:
 
 ```sh
-grep -H . /sys/class/hwmon/hwmon3/pwm[0-9] /sys/class/hwmon/hwmon3/pwm[0-9]_enable
+grep -H . /sys/class/hwmon/hwmon3/pwm2 /sys/class/hwmon/hwmon3/pwm2_enable
 ```
+
+Put in the files of your channel, as the listing shows them.
 
 `pwmN` holds the duty cycle on a scale from 0 to 255. `pwmN_enable` holds the control mode. On most chips, 0 means no control, with the fan at full speed, 1 means manual control, and a value from 2 up is an automatic mode of the chip. The documentation of the kernel driver gives the modes of your chip.
 
@@ -94,4 +96,4 @@ Do not configure a channel that you have not identified. coolerd sets every fan 
 
 coolerd needs write access to `pwmN` and `pwmN_enable`, which the kernel gives to root only. On NixOS, [`hwmon.pwmChannels`](nixos.md#servicescoolerdhwmonpwmchannels) grants it to the service.
 
-After a reload of a hwmon driver, restart coolerd. coolerd keeps the device path that it found at the start.
+Stop coolerd before you reload a hwmon driver, and start it afterwards. coolerd keeps the device path that it found at the start.

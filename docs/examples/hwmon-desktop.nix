@@ -16,7 +16,8 @@
     hwmon.kernelModules = ["nct6775"];
 
     # REPLACE: every chip and PWM channel that a `hwmon` fan in
-    # hwmon-desktop.toml names. The service can write only these channels.
+    # hwmon-desktop.toml names. The service user gets write access to these
+    # channels and to no other.
     hwmon.pwmChannels.nct6798 = [2];
 
     settings = builtins.fromTOML (builtins.readFile ./hwmon-desktop.toml);

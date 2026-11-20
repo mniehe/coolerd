@@ -10,28 +10,30 @@ This page describes what coolerd does when a temperature source cannot be read, 
 
 ## When a source fails
 
-A zone reads each of its sources once in each update. It reads the sources that are not `ipmi` first, in the order of `sources`. It then reads all `ipmi` sources in one IPMI query, so that the sensor readings are fresh when the zone sets its duty cycle. Each sensor in that query can fail on its own.
+In each update a zone reads each of its sources, with the retries that are described below. It reads the sources that are not `ipmi` first, in the order of `sources`. It then reads all `ipmi` sources in one IPMI query, so that the sensor readings are fresh when the zone sets its duty cycle. Each sensor in that query can fail on its own.
 
 ### What counts as a failure
 
 | Source | The read fails when |
 |---|---|
-| `ipmi` | The query fails. The board has no temperature sensor with the name. The sensor has no reading. The sensor reports a unit other than degrees Celsius. The value is not a number from 0 to 255. |
+| `ipmi` | The query fails. The board has no temperature sensor with the name. The sensor has no reading. The sensor reports a unit other than degrees Celsius. The value is below 0, or is 256 or more. |
 | `file` | The path is not a regular file after symbolic links are followed, such as a FIFO, a directory or a device; coolerd does not read it. The file cannot be read. The content is not one whole number, or is negative. The number is 256000 or more. |
-| `hwmon` | No chip or more than one chip has the name. A `name` file exists but cannot be read. `tempN_input` is missing or does not hold a whole number. The reading is below 0 °C. The chip has a `tempN_fault` file, and it holds a value other than 0 or cannot be read or parsed. |
+| `hwmon` | No chip or more than one chip has the name. A `name` file exists but cannot be read. `tempN_input` is missing, cannot be read or does not hold a whole number. A file of the chip holds more than 64 bytes. The reading is below 0 °C. The chip has a `tempN_fault` file, and it holds a value other than 0 or cannot be read or parsed. |
 | `smart` | `smartctl` exits with a status other than 0 or 2, or does not exit within 30 seconds. The output is not JSON, has no current temperature, or has one that is not a whole number from 0 to 255. |
 | `hdparm` | `hdparm` exits with a status other than 0, or does not exit within 30 seconds. The output has no drive temperature line, reports bad or missing sense data, or has a temperature that is not a whole number from 0 to 127. |
 | `nvidia` | `nvidia-smi` exits with a status other than 0, or does not exit within 5 seconds. The output is not one whole number from 0 to 255; `[N/A]` fails. |
 
 A `hwmon` chip reports a negative value for a probe that is not connected. A real temperature below 0 °C fails the source as well.
 
-coolerd also limits the output that it reads from a program: 1 MiB from `smartctl` and `hdparm`, and 4096 bytes from `nvidia-smi`. Longer output fails the read.
+When a board reports two sensors with one name, an `ipmi` source with that name fails if either of them cannot be read or has no reading.
+
+coolerd also limits the standard output that it reads from a program: 1 MiB from `smartctl` and `hdparm`, and 4096 bytes from `nvidia-smi`. Longer output fails the read.
 
 ### Programs that do not answer
 
-coolerd stops a program that does not exit within its time limit. It stops only that program, not the processes that the program started. A wrapper script used in place of one of these tools must not leave helper processes behind.
+A program must exit and close its standard output within its time limit. Otherwise coolerd kills it and waits up to half a second for it to go. coolerd kills only that program, not the processes that the program started. A wrapper script used in place of one of these tools must not leave helper processes behind.
 
-A stopped program can fail to exit, as `nvidia-smi` can in a hung driver. Its source then does not start the program again until the old process is gone, and until then that source fails at once. Each source tracks only its own process. Other sources still run, including sources that run the same program.
+A killed program can fail to exit, as `nvidia-smi` can in a hung driver. Its source then does not start the program again until the old process is gone, and until then that source fails at once. Each source tracks only its own process. Other sources still run, including sources that run the same program.
 
 ### Retries
 
@@ -47,13 +49,13 @@ The `ipmi` sources of a zone share each IPMI query. A repeated query serves ever
 
 When a source still fails after its last attempt, its `on_failure` decides what the zone does:
 
-- `{ type = "exit" }`, the default: coolerd stops with an error. On its way out it releases every fan of every zone, as [the next section](#what-the-fans-get-when-coolerd-stops) describes.
+- `{ type = "exit" }`, the default: coolerd stops with an error at once. The zone reads no further source in that update and sets no new duty cycle. On its way out it releases every fan of every zone, as [the next section](#what-the-fans-get-when-coolerd-stops) describes.
 - `{ type = "ignore" }`: the zone leaves the source out. Its reading does not enter the zone temperature, and its own curve gives no duty cycle. The other sources keep driving the fans.
 - `{ type = "dcycle", dcycle = N }`: the zone leaves the source out as with `ignore`, and runs at N% or more until the source reads again. The other curves can still raise the fans above N%.
 
-A zone in which no source has a reading runs at 100%, whatever the `on_failure` of its sources.
+When no source of a zone has a reading, and no failed source has `exit`, the zone runs at 100%, whatever the `dcycle` of its sources.
 
-coolerd logs one error when a source starts to fail and one message when it reads again. A source that fails in every update is still tried once in every update. While it fails, its curve keeps its last temperature, so `hysteresis` applies from there when it reads again.
+coolerd logs one error when a source starts to fail and one message when it reads again. A source that fails in every update is still tried once in every update. While every source of a curve fails, the curve keeps its held temperature, so `hysteresis` applies from there when a source reads again.
 
 `ignore` has a risk: a hot device that cannot be read no longer raises the fans. Use `ignore` only for a source whose heat another source also measures, such as a second sensor on the same CPU. For a device that produces much heat, such as a GPU, use `dcycle` with a duty cycle that keeps the device cool under full load.
 
@@ -94,7 +96,7 @@ When the release of one fan fails, coolerd logs an error that names the fan, and
 
 ### Supermicro fan
 
-coolerd sets the IPMI zone of the fan to 100%. After every zone has stopped, coolerd sets each IPMI zone that it drove on the board to 100% once more, and then restores the fan mode that it saved at the start.
+coolerd sets the IPMI zone of the fan to 100%. After every zone has stopped, coolerd sets each IPMI zone that the config names on the board to 100% once more, and then restores the fan mode that it saved at the start.
 
 When the saved mode was the full mode, coolerd restores nothing: the board stays in the full mode at 100%.
 
@@ -112,25 +114,27 @@ A saved value of 0 or 1 is not written back, and the channel stays under manual 
 
 coolerd gives the fan back to the default fan policy of the driver. That policy is the GPU's own fan curve: the driver sets the speed from the GPU temperature again, and it may run the fan slower than the zone did.
 
-When that call fails, coolerd sets the fan to its maximum under manual control. It logs a line that starts with `Failed to give fan` and ends with `set it to its maximum of <max>% under manual control`. The fan then stays in manual control at its maximum until coolerd next starts and stops normally, or until the driver is reloaded.
+When that call fails, coolerd sets the fan to its maximum under manual control. It logs a line that starts with `Failed to give fan` and ends with `set it to its maximum of <max>% under manual control`. The fan then stays in manual control at its maximum until something sets it again. A later run of coolerd sets it in its first update and gives it back to the driver when it stops normally. A reload of the driver also ends the manual control.
 
 When the call that sets the maximum fails as well, the line ends with `the fan's state is unknown`. The fan may keep the last speed that coolerd set.
 
 In both cases coolerd exits with status 1.
 
+coolerd releases an NVIDIA fan only when the start of its zone got as far as reading the limits of the fan. Before that point coolerd has changed nothing on the fan, and it makes no call to release it.
+
 ## The duty cycle that a fan gets
 
-A backend does not always apply the duty cycle that the zone asks for.
+A duty cycle is a request, not a measured speed. A backend does not always apply the duty cycle that the zone asks for, and a fan does not always turn at the speed that the backend sets. A fan may not stop at 0%, and a fan can stall at a low value.
 
 | Fan | What the backend applies |
 |---|---|
 | `supermicro` | The duty cycle in percent, as it is. |
-| `hwmon` | The duty cycle on the scale from 0 to 255, rounded up, so the fan never runs slower than the zone asks. 50% is 128. |
+| `hwmon` | The duty cycle on the scale from 0 to 255, rounded up, so the value is never below the one that the zone asks for. 50% is 128. |
 | `nvidia` | The duty cycle, raised to the fan's minimum and capped at its maximum. NVML refuses a speed below the minimum. With a minimum of 30%, a duty cycle of 20% runs the fan at 30%. |
 
 coolerd reads the two limits of an `nvidia` fan from the driver when the zone starts, and logs them in a line with `speed limits`.
 
-A `supermicro` fan and a `hwmon` fan are read before each update, and coolerd writes only when the value differs from the one it wants. An `nvidia` fan is written in the first update and then whenever the speed that the zone asks for changes. The debug log shows, for each fan in each update, the duty cycle before the update, the new duty cycle and the value that coolerd sent.
+A `supermicro` fan and a `hwmon` fan are read before each update, and coolerd writes only when the value differs from the one it wants. An `nvidia` fan is written in the first update, and then whenever the speed after the limits differs from the last speed that coolerd sent. The debug log shows, for each fan after each update, the duty cycle that the fan reported before the update, the duty cycle of the zone and the value that coolerd sent. A `-` stands for a value that could not be read or for a write that was not needed. The values of a `hwmon` fan are shown in percent, rounded up.
 
 A `supermicro` or `hwmon` fan that cannot be read, and any fan that refuses a write, stops coolerd with an error. coolerd then releases every fan.
 
@@ -138,8 +142,9 @@ A `supermicro` or `hwmon` fan that cannot be read, and any fan that refuses a wr
 
 | Status | Meaning |
 |---|---|
-| 0 | SIGINT or SIGTERM stopped coolerd, and every fan was released. |
-| 1 | Anything else: a config error, a failed start, a source failure with `on_failure = { type = "exit" }`, a fan that refused a duty cycle, a panic, or a fan that could not be released. |
+| 0 | SIGINT or SIGTERM stopped coolerd, and every fan was released. Also after `--help`. |
+| 2 | The command line was wrong, such as a missing `--config`. |
+| 1 | Any other error: a config error, a failed start, a source failure with `on_failure = { type = "exit" }`, a fan that refused a duty cycle, a panic, or a fan that could not be released. |
 
 The [NixOS module](nixos.md) restarts the service 10 seconds after an exit with status 1.
 
@@ -147,12 +152,12 @@ The [NixOS module](nixos.md) restarts the service 10 seconds after an exit with 
 
 coolerd cannot cover these cases. Plan for them.
 
-- **A killed process releases nothing.** SIGKILL, a power loss and a crash of the machine end coolerd without the release. So does any signal other than SIGINT and SIGTERM that ends the process, such as SIGHUP. The fans keep the last state that coolerd set: a board stays in the full mode at its last duty cycle, a hwmon channel stays manual at its last value, and an NVIDIA fan stays manual at its last speed.
+- **A killed process releases nothing.** SIGKILL, a power loss and a crash of the machine end coolerd without the release. So does any signal other than SIGINT and SIGTERM that ends the process, such as SIGHUP. The fans keep the last state that coolerd set, for as long as the device keeps it: a board stays in the full mode at its last duty cycle, a hwmon channel stays manual at its last value, and an NVIDIA fan stays manual at its last speed.
 - **After a kill, the saved state is lost.** The next start of coolerd finds the board in the full mode, or the hwmon channel in manual control, and saves that. When it stops, it leaves the board in the full mode at 100%, or the channel in manual control at 255. To get the earlier fan mode of a board back, set it through the BMC. A hwmon chip usually returns to its automatic mode at the next boot. An NVIDIA fan is different: every normal stop gives it back to the default policy.
-- **A blocked update delays the release.** A zone that is inside an update finishes it before it releases its fans. The update is bounded by the time limits of its sources and by the limits of the NVML calls. coolerd sets no time limit of its own on an IPMI query or on a read or write of a hwmon file. A service manager that kills a slow stop, as systemd does after its stop timeout, ends coolerd without the release.
-- **An error after a signal is not reported.** When SIGINT or SIGTERM arrives first, an error that a zone returns while it finishes its update does not change the exit status.
+- **A blocked update delays the release.** A zone that is inside an update finishes it before it releases its fans. The programs that a source runs and the NVML calls have time limits. coolerd sets no time limit of its own on an IPMI query, on a read of a `file` source, or on a read or write of a hwmon file, and none on the stop as a whole. A service manager that kills a slow stop, as systemd does after its stop timeout, ends coolerd without the release.
+- **An error after a signal is not reported.** When coolerd handles SIGINT or SIGTERM first, an error that a zone returns while it finishes its update is not logged and does not change the exit status. A fan that could not be released still gives status 1.
 - **A failed board restore does not change the exit status.** When the last write of 100% or the restore of the fan mode fails, coolerd logs the error. The exit status then reflects only the release of each fan.
 - **A hwmon fan keeps the device path that it found at the start.** If the driver of the chip is unbound and bound again while coolerd runs, another chip can take that path, and coolerd then drives that chip. Restart coolerd after you reload or rebind a hwmon driver.
-- **An NVML call that hangs stops all NVML work.** Each NVML call has a time limit of 5 seconds. A call made before the library has loaded gets 30 seconds more for the load, 35 seconds in all. The time that a call waits behind other NVML calls counts toward its limit. A call that does not return in time fails, and so does its zone. NVML calls cannot be stopped, so coolerd then makes no further NVML call: the release of each NVIDIA fan fails at once and is logged, and coolerd exits with status 1. Restart coolerd after the driver recovers.
+- **An NVML call that hangs stops all NVML work.** Each NVML call has a time limit of 5 seconds. A call made before the library has loaded gets 30 seconds more for the load, 35 seconds in all. The time that a call waits behind other NVML calls counts toward its limit. A call that does not return in time fails, and so does its zone. NVML calls cannot be stopped, so coolerd then makes no further NVML call: the release of each NVIDIA fan that it had taken over fails at once and is logged, and coolerd exits with status 1. Restart coolerd after the driver recovers.
 - **Two names for one device are not detected.** coolerd does not detect two session names that reach the same board. It refuses a hwmon chip name that two chips share.
 - **`ignore` hides a hot device.** See [`on_failure`](#on_failure).

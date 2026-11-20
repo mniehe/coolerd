@@ -125,7 +125,7 @@ services.coolerd.settings = {
 };
 ```
 
-The build of the host fails when a zone has a fan of type `nvidia` and [`enableNvidiaFans`](#servicescoolerdenablenvidiafans) is off.
+The build of the host fails when a zone has a fan of type `nvidia` and [`enableNvidiaFans`](#servicescoolerdenablenvidiafans) is off. The check reads zones that are written as attribute sets, as on this page.
 
 ### `services.coolerd.enableSmartMonTools`
 
@@ -167,7 +167,7 @@ Kernel modules that the host loads at boot, for the hwmon chips that coolerd rea
 
 Type: attribute set of lists of positive integers. Default: `{}`. Example: `{nct6798 = [2 3];}`.
 
-The PWM channels that the service may write, as a list of channel numbers for each chip name. List every channel that a `hwmon` fan in `settings` names; coolerd cannot take over a channel that is not listed. A chip name must match `[A-Za-z0-9_-]+`, or the build of the host fails. See [The hwmon access helper](#the-hwmon-access-helper).
+The PWM channels that the service may write, as a list of channel numbers for each chip name. List every channel that a `hwmon` fan in `settings` names; the service user cannot write a channel that is not listed. The list grants access and takes none away: it does not limit a service that runs as root. A chip name must match `[A-Za-z0-9_-]+`, or the build of the host fails. See [The hwmon access helper](#the-hwmon-access-helper).
 
 ## The hwmon access helper
 
@@ -185,13 +185,13 @@ Every check runs before the first grant, so a failed check grants nothing. The m
 
 When `chgrp` or `chmod` fails while the helper grants access, the service does not start either. Some of the listed files can then already have the access.
 
-The helper gives write access to the service group and not to all users, so that only the service can drive the fans. It runs before every start, so the access is set whenever the service starts, in whatever order the devices appeared.
+The helper gives write access to the service group and not to all users, so that no other unprivileged user can drive the fans. It runs before every start, so the access is set whenever the service starts, in whatever order the devices appeared.
 
 The access has these limits:
 
 - `pwmN` and `pwmN_enable` must be files in the chip's own hwmon directory. Neither coolerd nor the helper looks under `device/`.
 - A grant lasts until the kernel removes the file. When you remove a channel from `hwmon.pwmChannels`, the service group keeps write access to it until a reboot or a reload of the driver.
-- A reload of the hwmon driver removes the access. coolerd usually exits at its next read or write of the channel, and systemd restarts the service after 10 seconds, which runs the helper again. Until the restart, the fan stays under whatever control the reloaded driver sets, and coolerd cannot set full speed when it exits. Restart the service after you reload a hwmon driver. Do not rely on this recovery.
+- A reload of the hwmon driver removes the old files and the access to them. The next read or write of the channel can then fail, which stops coolerd, and systemd starts the service again after 10 seconds, which runs the helper again. Until then the fan is under whatever control the reloaded driver sets. The path that coolerd keeps can also name another device after the reload, and coolerd then writes to that device, also when it stops. Stop the service before you reload or rebind a hwmon driver, and start it afterwards. Do not rely on the automatic restart.
 
 ## NVIDIA fans and root
 
@@ -217,7 +217,7 @@ Run this check on the host itself, after a deployment that adds or changes an `n
    nvidia-smi --query-gpu=fan.speed --format=csv
    ```
 
-   The speed is the duty cycle of the zone, or the fan's minimum when the duty cycle is lower. The unit logs the limits at the start in a line with `speed limits`. Read it with `journalctl -u coolerd.service`.
+   The speed is the duty cycle of the zone, or the fan's minimum when the duty cycle is lower, or its maximum when the duty cycle is higher. The unit logs the limits at the start in a line with `speed limits`. Read it with `journalctl -u coolerd.service`.
 2. Stop the unit with `sudo systemctl stop coolerd.service`, and read the speed again with the same command. The speed follows the GPU temperature again.
 
 If the journal shows a line that starts with `Failed to give fan`, the default policy was not restored. When that line ends with `under manual control`, the fan stays in manual control at its maximum. When it ends with `the fan's state is unknown`, the fan may keep the last speed that coolerd set, so start and stop the unit again or reload the driver.
