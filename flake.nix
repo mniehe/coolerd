@@ -72,9 +72,10 @@
           log_level = "info";
           sessions = {};
         };
-        # A value other than the default for every other public leaf except
-        # package, so an old path that sets nothing changes what the host builds
+        # A value other than the default for every other public leaf, so an old
+        # path that sets nothing changes what the host builds
         migrationLeaves = pkgs: {
+          package = inertPackage;
           enableIpmi = false;
           enableSmartMonTools = true;
           enableHdparm = true;
@@ -219,7 +220,8 @@
           config.system.checks;
         # Only the old-name host's package check is read: its system build must fail
         oldNameCheck = packageCheck (evalHost {services.coolerd.package = oldNamePackage;}).config;
-        inertCheck = packageCheck (evalHost {services.coolerd.package = inertPackage;}).config;
+        # Of inertPackage, which the migration host sets on the old path
+        migrationCheck = packageCheck hosts.migration.nixos.config;
         # Only evaluated: building it would build the Rust package
         defaultCheck = packageCheck hosts.default.nixos.config;
         checksPackage = check: expected: check.package != null && "${check.package}" == "${expected}";
@@ -264,10 +266,10 @@
         defaultOptions = hosts.default.nixos.options.services;
         unaliasedLeaves = lib.filter (leaf: !lib.hasAttrByPath leaf defaultOptions.ipmi-fan-control) (publicLeaves [] defaultOptions.coolerd);
         # Leaves the migration host leaves unset on the old path, so their
-        # forwarding goes unchecked; package is left out on purpose
+        # forwarding goes unchecked
         migrationOldOptions = hosts.migration.nixos.options.services.ipmi-fan-control;
         unsetOldLeaves =
-          lib.filter (leaf: leaf != ["package"] && !(lib.attrByPath leaf {isDefined = false;} migrationOldOptions).isDefined)
+          lib.filter (leaf: !(lib.attrByPath leaf {isDefined = false;} migrationOldOptions).isDefined)
           (publicLeaves [] defaultOptions.coolerd);
         # What the options produce on a host, for comparing the old-path and new-path hosts
         producedBy = host: let
@@ -387,8 +389,10 @@
           "packages: ipmi-fan-control is not the default package"
           ++ lib.optional (!lib.isDerivation defaultCheck || !checksPackage defaultCheck pkgs.coolerd)
           "default: system.checks has no coolerd-package-check of pkgs.coolerd"
-          ++ lib.optional (!lib.isDerivation inertCheck || !checksPackage inertCheck inertPackage)
-          "inert: system.checks has no coolerd-package-check of the package"
+          ++ lib.optional ((unit hosts.migration).serviceConfig.ExecStart != "${inertPackage}/bin/coolerd --config /etc/coolerd.toml")
+          "migration: ExecStart does not run bin/coolerd of the package set on the old path"
+          ++ lib.optional (!lib.isDerivation migrationCheck || !checksPackage migrationCheck inertPackage)
+          "migration: system.checks has no coolerd-package-check of the package set on the old path"
           ++ lib.optional (!checksPackage oldNameCheck oldNamePackage)
           "old name: system.checks has no coolerd-package-check of the package";
       in {
@@ -403,8 +407,9 @@
               exit 1
             fi
 
-            # The inert host's check passes once built
-            ${lib.optionalString (lib.isDerivation inertCheck) ": ${inertCheck}"}
+            # The migration host's check passes once built; a check of another
+            # package fails above and is not built, so the Rust package never is
+            ${lib.optionalString (lib.isDerivation migrationCheck && checksPackage migrationCheck inertPackage) ": ${migrationCheck}"}
 
             # Runs the package check's script as its builder would, against the
             # package directory $1; sets gate_status
