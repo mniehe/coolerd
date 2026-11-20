@@ -118,6 +118,19 @@ with lib; let
 
   validChipName = chip: builtins.match "[A-Za-z0-9_-]+" chip != null;
 
+  # Every fan that settings lists. settings is not checked by type, so a value
+  # of the wrong shape is skipped here; the daemon rejects it when it starts.
+  listOrEmpty = value:
+    if isList value
+    then value
+    else [];
+  settingsZones = listOrEmpty (cfg.settings.zones or null);
+  zoneFans = zone:
+    if isAttrs zone
+    then filter isAttrs (listOrEmpty (zone.fans or null))
+    else [];
+  listsNvidiaFan = any (fan: (fan.type or null) == "nvidia") (concatMap zoneFans settingsZones);
+
   # Fails the system build when the package lacks the program that ExecStart
   # runs, so a switch never stops the running unit for one that cannot start.
   # The package is an attribute rather than part of the script, so a test can
@@ -226,7 +239,7 @@ in {
     enableIpmi = mkOption {
       type = types.bool;
       default = true;
-      description = "Load the IPMI kernel modules and give the service access to the IPMI device. Turn it off on a host with no IPMI and only hwmon fans";
+      description = "Load the IPMI kernel modules and give the service access to the IPMI device. Turn it off on a host with no IPMI and only hwmon or NVIDIA fans";
     };
 
     enableNvidiaFans = mkOption {
@@ -270,7 +283,13 @@ in {
 
   config = mkIf cfg.enable {
     assertions =
-      map (chip: {
+      [
+        {
+          assertion = cfg.enableNvidiaFans || !listsNvidiaFan;
+          message = "services.coolerd.settings: a zone has a fan of type \"nvidia\", which needs services.coolerd.enableNvidiaFans = true";
+        }
+      ]
+      ++ map (chip: {
         assertion = validChipName chip;
         message = "services.coolerd.hwmon.pwmChannels: chip name ${builtins.toJSON chip} must match [A-Za-z0-9_-]+";
       })

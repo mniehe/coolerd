@@ -87,6 +87,28 @@
 
         # The library directory a host's graphics driver packages provide
         nvidiaLibraryPath = "/run/opengl-driver/lib";
+        # A zone that drives an NVIDIA fan, which needs enableNvidiaFans
+        nvidiaZone = {
+          fans = [
+            {
+              type = "nvidia";
+              gpu = "00000000:01:00.0";
+              fan = 0;
+            }
+          ];
+          sources = [
+            {
+              type = "nvidia";
+              gpu = "00000000:01:00.0";
+            }
+          ];
+          steps = [
+            {
+              temp = 50;
+              dcycle = 30;
+            }
+          ];
+        };
 
         # Each host names the packages whose bin directory must be on the unit's
         # PATH. A host runs as the user and group coolerd and sets no
@@ -156,14 +178,17 @@
             expected = p: [p.freeipmi];
           };
           # NVML fan commands need root. The drive options would otherwise set
-          # AmbientCapabilities, and pwmChannels makes the unit run the helper.
+          # AmbientCapabilities, and pwmChannels makes the unit run the helper;
+          # the channels are the hwmon host's, so both hosts run the one helper
+          # that hwmon-access exercises.
           nvidia = {
             nixos = evalHost {
               services.coolerd = {
                 enableNvidiaFans = true;
                 enableSmartMonTools = true;
                 enableHdparm = true;
-                hwmon.pwmChannels.nct6798 = [2];
+                hwmon.pwmChannels.nct6798 = [2 12];
+                settings.zones = [nvidiaZone];
               };
             };
             expected = p: [p.freeipmi p.smartmontools p.hdparm];
@@ -202,6 +227,21 @@
         rejectsBadChip =
           lib.any (a: !a.assertion && lib.hasInfix "services.coolerd.hwmon.pwmChannels" a.message)
           badChipConfig.assertions;
+
+        # A host with an NVIDIA fan that leaves enableNvidiaFans off. Only its
+        # assertions are read.
+        nvidiaWithoutOptionConfig =
+          (evalHost {
+            services.coolerd.settings.zones = [nvidiaZone];
+          })
+          .config;
+        rejectsNvidiaWithoutOption =
+          lib.any (a: !a.assertion && lib.hasInfix "services.coolerd.enableNvidiaFans" a.message)
+          nvidiaWithoutOptionConfig.assertions;
+        # The message of each failed assertion of the module on a host
+        failedAssertions = host:
+          map (a: a.message)
+          (lib.filter (a: !a.assertion && lib.hasInfix "services.coolerd" a.message) host.nixos.config.assertions);
 
         # A host with two chips. Only its access script is read, so that the
         # helper can be run against a tree where the second chip fails.
@@ -344,7 +384,11 @@
           && lib.hasSuffix "-coolerd-hwmon-access" (lib.elemAt words 0)
           && lib.elemAt words 1 == "/sys/class/hwmon"
           && lib.elemAt words 2 == lib.escapeShellArg (unit host).serviceConfig.Group;
-        accessHelper = pkgs.writeShellScript "hwmon-access-helper" accessScript;
+        # The module builds the helper the same way, so on the hwmon host it is
+        # this very derivation
+        accessHelper = pkgs.writeShellScript "coolerd-hwmon-access" accessScript;
+        # The derivations that a host's ExecStartPre commands run
+        execStartPreDrvs = host: lib.concatMap (command: lib.attrNames (builtins.getContext command)) (execStartPre host);
         twoChipHelper = pkgs.writeShellScript "hwmon-access-helper-two-chips" twoChipScript;
 
         configFileAccess = host: {inherit (host.nixos.config.environment.etc."coolerd.toml") user group mode;};
@@ -383,7 +427,8 @@
           "${name}: /etc/coolerd.toml is not owned by ${hostUser host}:${hostUser host} with mode 0600"
           # The unit text omits wantedBy, so the twin comparison cannot see it
           ++ lib.optional (!lib.elem "multi-user.target" (unit host).wantedBy)
-          "${name}: multi-user.target does not want the unit";
+          "${name}: multi-user.target does not want the unit"
+          ++ map (message: "${name}: an assertion fails: ${message}") (failedAssertions host);
 
         moduleFailures =
           lib.concatLists (lib.mapAttrsToList hostFailures hosts)
@@ -422,6 +467,13 @@
           "nvidia: ExecStartPre does not run the access helper with the + prefix on /sys/class/hwmon and the unit's group"
           ++ lib.optional (!lib.isDerivation nvidiaCheck || !checksPackage nvidiaCheck pkgs.coolerd)
           "nvidia: system.checks has no coolerd-package-check of pkgs.coolerd"
+          # hwmon-access runs accessHelper; both hosts must run that derivation
+          ++ lib.optional (execStartPreDrvs hosts.hwmon != [accessHelper.drvPath])
+          "hwmon: ExecStartPre does not run the helper derivation that hwmon-access exercises"
+          ++ lib.optional (execStartPreDrvs hosts.nvidia != [accessHelper.drvPath])
+          "nvidia: ExecStartPre does not run the helper derivation that hwmon-access exercises"
+          ++ lib.optional (!rejectsNvidiaWithoutOption)
+          "nvidia without enableNvidiaFans: no failed assertion names services.coolerd.enableNvidiaFans"
           ++ lib.optional (lib.hasInfix "KERNEL==\"ipmi" hwmonConfig.services.udev.extraRules || lib.elem "ipmi" hwmonConfig.users.users.coolerd.extraGroups || hwmonConfig.users.groups ? ipmi || hasIpmiModule hwmonConfig.boot.kernelModules)
           "hwmon: an IPMI udev rule, ipmi group or IPMI kernel module is present with enableIpmi = false"
           ++ lib.optional (!rejectsBadChip)
@@ -471,12 +523,17 @@
             # package fails above and is not built, so the Rust package never is
             ${lib.optionalString (lib.isDerivation migrationCheck && checksPackage migrationCheck inertPackage) ": ${migrationCheck}"}
 
-            # Runs the package check's script as its builder would, against the
-            # package directory $1; sets gate_status
+            # The package check scripts of the old-name host and of the nvidia
+            # host, which runs as root; they differ only in their package
+            old_name_gate=${lib.escapeShellArg oldNameCheck.buildCommand}
+            nvidia_gate=${lib.escapeShellArg nvidiaCheck.buildCommand}
+
+            # Runs the package check script $gate as its builder would, against
+            # the package directory $1; sets gate_status
             run_gate() {
               rm -f "$TMPDIR/gate-out"
               if package="$1" out="$TMPDIR/gate-out" \
-                bash -c ${lib.escapeShellArg oldNameCheck.buildCommand} 2> "$TMPDIR/gate-stderr"; then
+                bash -c "$gate" 2> "$TMPDIR/gate-stderr"; then
                 gate_status=0
               else
                 gate_status=$?
@@ -485,12 +542,12 @@
             expect_gate_fails() {
               run_gate "$2"
               if [ "$gate_status" -eq 0 ]; then
-                echo "$1: the package check passed a package without an executable bin/coolerd file" >&2
+                echo "$gate_host: $1: the package check passed a package without an executable bin/coolerd file" >&2
                 exit 1
               fi
               for expected in services.coolerd.package "$2/bin/coolerd"; do
                 if ! grep -q -F -- "$expected" "$TMPDIR/gate-stderr"; then
-                  echo "$1: the package check message does not name $expected: $(cat "$TMPDIR/gate-stderr")" >&2
+                  echo "$gate_host: $1: the package check message does not name $expected: $(cat "$TMPDIR/gate-stderr")" >&2
                   exit 1
                 fi
               done
@@ -498,7 +555,7 @@
             expect_gate_passes() {
               run_gate "$2"
               if [ "$gate_status" -ne 0 ] || [ ! -e "$TMPDIR/gate-out" ]; then
-                echo "$1: the package check failed a package with an executable bin/coolerd file: $(cat "$TMPDIR/gate-stderr")" >&2
+                echo "$gate_host: $1: the package check failed a package with an executable bin/coolerd file: $(cat "$TMPDIR/gate-stderr")" >&2
                 exit 1
               fi
             }
@@ -515,11 +572,18 @@
             chmod 755 "$fixtures/executable/bin/coolerd"
             ln -s "$fixtures/executable/bin/coolerd" "$fixtures/symlink/bin/coolerd"
 
-            expect_gate_fails "old name" ${oldNamePackage}
-            expect_gate_fails "directory" "$fixtures/directory"
-            expect_gate_fails "non-executable" "$fixtures/non-executable"
-            expect_gate_passes "executable" "$fixtures/executable"
-            expect_gate_passes "symlink" "$fixtures/symlink"
+            # Every case against the package check script of host $1 in $2
+            check_gate() {
+              gate_host="$1"
+              gate="$2"
+              expect_gate_fails "old name" ${oldNamePackage}
+              expect_gate_fails "directory" "$fixtures/directory"
+              expect_gate_fails "non-executable" "$fixtures/non-executable"
+              expect_gate_passes "executable" "$fixtures/executable"
+              expect_gate_passes "symlink" "$fixtures/symlink"
+            }
+            check_gate "old name host" "$old_name_gate"
+            check_gate "nvidia host" "$nvidia_gate"
             touch $out
           '';
 
