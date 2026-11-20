@@ -6,6 +6,7 @@ mod error;
 mod fan;
 mod freeipmi;
 mod hwmon;
+mod nvml;
 mod source;
 mod ipmi;
 mod session;

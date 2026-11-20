@@ -6,6 +6,7 @@ use {
         process::ExitStatus,
         result,
     },
+    nvml_wrapper::error::NvmlError,
     thiserror::Error,
     tokio::task::JoinError,
     crate::{
@@ -134,6 +135,29 @@ pub enum Error {
     FanNotTaken(String),
     #[error("IPMI sensors need an IPMI session, and the zone has none")]
     SensorsWithoutSession,
+    #[error("GPU {gpu}: failed to load the NVML library {library:?}: {source}")]
+    NvmlLoad {
+        gpu: String,
+        library: String,
+        source: NvmlError,
+    },
+    #[error("GPU {gpu}: NVML: {source}")]
+    Nvml {
+        gpu: String,
+        source: NvmlError,
+    },
+    #[error("GPU {gpu}: has {count} fan(s), so fan {fan} does not exist")]
+    NvidiaFanMissing {
+        gpu: String,
+        fan: u32,
+        count: u32,
+    },
+    #[error("GPU {gpu}: fan speed limits are not a range within 0 to 100 percent: min {min}, max {max}")]
+    NvidiaFanLimits {
+        gpu: String,
+        min: u32,
+        max: u32,
+    },
 }
 
 pub type Result<T, E = Error> = result::Result<T, E>;
