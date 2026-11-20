@@ -14,6 +14,7 @@
 // one worker thread makes every call, and a caller waits for the reply only
 // up to a limit. After one call times out, the worker may stay blocked
 // forever, and every later call fails at once instead of queueing behind it.
+// A call that was queued before the timeout is never made.
 
 use {
     std::{
@@ -90,8 +91,8 @@ pub struct RealNvml {
     /// Whether a call has returned anything other than a failed load, which
     /// means the library is loaded
     loaded: AtomicBool,
-    /// The call that timed out, once one has
-    stalled: OnceLock<String>,
+    /// The call that timed out, once one has. The worker reads it too.
+    stalled: Arc<OnceLock<String>>,
 }
 
 impl RealNvml {
@@ -108,7 +109,7 @@ impl RealNvml {
 
     /// A worker over the backend that `open` builds, with the waits `limits`
     fn with_backend(open: OpenBackend, limits: Limits) -> Self {
-        Self { open, limits, jobs: OnceLock::new(), loaded: AtomicBool::new(false), stalled: OnceLock::new() }
+        Self { open, limits, jobs: OnceLock::new(), loaded: AtomicBool::new(false), stalled: Arc::new(OnceLock::new()) }
     }
 
     /// The worker's queue. Starts the worker on the first call.
@@ -119,6 +120,7 @@ impl RealNvml {
 
         let (jobs, queue) = mpsc::channel::<Job>();
         let open = self.open.clone();
+        let stalled = self.stalled.clone();
 
         thread::Builder::new()
             .name(WORKER_NAME.to_owned())
@@ -126,6 +128,14 @@ impl RealNvml {
                 let backend = open();
 
                 for job in queue {
+                    // After a timeout no queued call runs, because its caller
+                    // may have given up on it. Returning drops the job, so a
+                    // caller still waiting gets no reply. A call that was
+                    // already running when the timeout came cannot be revoked.
+                    if stalled.get().is_some() {
+                        return;
+                    }
+
                     job(&*backend);
                 }
             })
@@ -381,27 +391,28 @@ pub mod fake {
         }
     }
 
-    /// A [`FakeNvml`] whose `stalls` operation never returns, as a call into
-    /// a hung driver: it waits on a channel whose sender it keeps and never
-    /// uses
-    struct StallingNvml {
-        inner: FakeNvml,
-        stalls: Op,
-        never: Mutex<Receiver<()>>,
-        _sender: Sender<()>,
+    /// A [`FakeNvml`] whose `gated` operation waits for a token on `gate`
+    /// before it runs, as a call into a hung driver. A gate whose senders are
+    /// all gone lets every call through.
+    struct GatedNvml {
+        inner: Arc<FakeNvml>,
+        gated: Op,
+        gate: Mutex<Receiver<()>>,
+        /// A sender that is never used, which keeps the gate shut for good
+        _shut: Option<Sender<()>>,
     }
 
-    impl StallingNvml {
+    impl GatedNvml {
         fn pass<T>(&self, op: Op, call: impl FnOnce(&FakeNvml) -> Result<T>) -> Result<T> {
-            if op == self.stalls {
-                let _ = self.never.lock().unwrap().recv();
+            if op == self.gated {
+                let _ = self.gate.lock().unwrap().recv();
             }
 
             call(&self.inner)
         }
     }
 
-    impl Nvml for StallingNvml {
+    impl Nvml for GatedNvml {
         fn fan_count(&self, gpu: &str) -> Result<u32> {
             self.pass(Op::FanCount, |nvml| nvml.fan_count(gpu))
         }
@@ -427,13 +438,41 @@ pub mod fake {
     /// that holds `gpu` and never returns from `stalls`. A stalled worker
     /// thread stays blocked until the test process exits.
     pub fn stalling_worker(gpu: &str, reports: FakeGpu, stalls: Op, limits: Limits) -> RealNvml {
-        let gpu = gpu.to_owned();
+        let (shut, gate) = mpsc::channel();
+
+        worker_over(Arc::new(FakeNvml::with_gpu(gpu, reports)), stalls, gate, Some(shut), limits)
+    }
+
+    /// The worker NVML of production over a fake whose gated operation a
+    /// test lets through one call at a time
+    pub struct GatedWorker {
+        pub nvml: RealNvml,
+        /// The fake behind the worker, which records each call that ran
+        pub fake: Arc<FakeNvml>,
+        /// Each token sent lets one gated call run
+        pub gate: Sender<()>,
+    }
+
+    /// The worker NVML of production, with the waits `limits`, over a fake
+    /// that holds `gpu` and whose `gated` operation waits for a token from
+    /// [`GatedWorker::gate`]
+    pub fn gated_worker(gpu: &str, reports: FakeGpu, gated: Op, limits: Limits) -> GatedWorker {
+        let fake = Arc::new(FakeNvml::with_gpu(gpu, reports));
+        let (tokens, gate) = mpsc::channel();
+        let nvml = worker_over(fake.clone(), gated, gate, None, limits);
+
+        GatedWorker { nvml, fake, gate: tokens }
+    }
+
+    fn worker_over(fake: Arc<FakeNvml>, gated: Op, gate: Receiver<()>, shut: Option<Sender<()>>, limits: Limits) -> RealNvml {
+        let parts = Mutex::new(Some((gate, shut)));
 
         RealNvml::with_backend(Arc::new(move || {
-            let (sender, never) = mpsc::channel();
-            let inner = FakeNvml::with_gpu(&gpu, reports);
+            // A second worker, which a race of first calls can start, gets an
+            // open gate
+            let (gate, shut) = parts.lock().unwrap().take().unwrap_or_else(|| (mpsc::channel().1, None));
 
-            Box::new(StallingNvml { inner, stalls, never: Mutex::new(never), _sender: sender })
+            Box::new(GatedNvml { inner: fake.clone(), gated, gate: Mutex::new(gate), _shut: shut })
         }), limits)
     }
 }
@@ -441,9 +480,13 @@ pub mod fake {
 #[cfg(test)]
 mod tests {
     use {
-        std::time::{Duration, Instant},
+        std::{
+            sync::Arc,
+            thread,
+            time::{Duration, Instant},
+        },
         super::{
-            fake::{stalling_worker, FakeGpu, Op},
+            fake::{gated_worker, stalling_worker, Call, FakeGpu, GatedWorker, Op},
             Limits,
             Nvml,
             RealNvml,
@@ -466,6 +509,22 @@ mod tests {
 
     /// Slack for a busy test machine on top of a limit
     const SLACK: Duration = Duration::from_secs(2);
+
+    /// How long a test waits before it queues a call behind a blocked one,
+    /// well inside [`SHORT`]'s call limit
+    const QUEUE_DELAY: Duration = Duration::from_millis(50);
+
+    /// How long a test gives the worker to make a call it should not make
+    const SETTLE: Duration = Duration::from_millis(100);
+
+    /// Wait until `done` holds, or for at most [`SLACK`]
+    fn wait_until(done: impl Fn() -> bool) {
+        let start = Instant::now();
+
+        while !done() && start.elapsed() < SLACK {
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
 
     /// A worker over a fake whose fan_speed never returns, with the library
     /// loaded by a first call
@@ -555,6 +614,29 @@ mod tests {
         assert!(matches!(&count, Err(Error::NvmlStalled { gpu, operation: "fan_count", .. }) if gpu == GPU), "{:?}", count);
         assert!(matches!(&set, Err(Error::NvmlStalled { operation: "set_default_fan_speed", .. })), "{:?}", set);
         assert!(elapsed < AT_ONCE, "{:?}", elapsed);
+    }
+
+    #[test]
+    fn call_queued_behind_a_timed_out_call_never_runs() {
+        let GatedWorker { nvml, fake, gate } = gated_worker(GPU, ONE_FAN, Op::FanSpeed, SHORT);
+        let nvml = Arc::new(nvml);
+        assert_eq!(nvml.fan_count(GPU).unwrap(), 1);
+        let blocked = {
+            let nvml = nvml.clone();
+            thread::spawn(move || nvml.fan_speed(GPU, 0))
+        };
+
+        thread::sleep(QUEUE_DELAY);
+        let queued = nvml.set_fan_speed(GPU, 0, 40);
+        let blocked = blocked.join().unwrap();
+        gate.send(()).unwrap();
+        wait_until(|| fake.calls().contains(&Call::FanSpeed(GPU.into(), 0)));
+        thread::sleep(SETTLE);
+
+        assert!(matches!(&blocked, Err(Error::NvmlTimeout { operation: "fan_speed", .. })), "{:?}", blocked);
+        assert!(matches!(&queued, Err(Error::NvmlTimeout { operation: "set_fan_speed", .. })), "{:?}", queued);
+        assert!(fake.calls().contains(&Call::FanSpeed(GPU.into(), 0)), "{:?}", fake.calls());
+        assert!(!fake.calls().contains(&Call::SetFanSpeed(GPU.into(), 0, 40)), "{:?}", fake.calls());
     }
 
     #[test]
