@@ -96,7 +96,7 @@ When the release of one fan fails, coolerd logs an error that names the fan, and
 
 ### Supermicro fan
 
-coolerd sets the IPMI zone of the fan to 100%. After every zone has stopped, coolerd sets each IPMI zone that the config names on the board to 100% once more, and then restores the fan mode that it saved at the start.
+coolerd sets the IPMI zone of the fan to 100%. After every zone has stopped, coolerd sets each IPMI zone that the config names on the board to 100%, for most zones a second time, and then restores the fan mode that it saved at the start.
 
 When the saved mode was the full mode, coolerd restores nothing: the board stays in the full mode at 100%.
 

@@ -242,5 +242,6 @@ the fans slow, or breaks the deployed unit:
 - the zone loop and the shutdown path in `src/main.rs`
 - `nix/**`
 - `docs/examples/*.nix`, because users copy these recipes onto deployed hosts,
-  and they set the unit's user, `PATH` and hwmon grants
+  and they set the unit's user, `PATH` and hwmon grants. A change to their
+  comments alone is the first row of the table and needs no review
 - `.claude/review/review.yaml`
