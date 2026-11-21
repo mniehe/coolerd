@@ -15,13 +15,15 @@ use {
     std::{
         collections::HashMap,
         env,
+        future::Future,
         io,
         path::PathBuf,
         process,
         sync::{
             Arc,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
+        time::Duration,
     },
     clap::Parser,
     log::{debug, error, info, trace},
@@ -30,13 +32,13 @@ use {
         time::sleep,
     },
 
-    config::{Config, FanConfig, load_config, Zone},
+    config::{Config, FanConfig, load_config, Recovery, RECOVERY_FIRST_DELAY_S, Zone},
     curve::{Transition, ZoneState},
     error::{Error, Result},
     fan::{build_fan, FanGuard, ReleaseFailures, ReleaseOutcome},
     freeipmi::SensorReading,
     hwmon::HwmonRoot,
-    nvml::{Nvml, RealNvml},
+    nvml::{worker_failed, Nvml, RealNvml},
     session::{IpmiSession, RestoreFailures, RestoreOutcome},
     source::{read_zone_sources, ZoneReaders},
 };
@@ -117,6 +119,8 @@ struct MainApp {
     release_failures: ReleaseFailures,
     /// The failed writes of 100% and fan-mode restores of every session
     restore_failures: RestoreFailures,
+    /// The zones in recovery
+    recoveries: Recoveries,
 }
 
 impl MainApp {
@@ -137,6 +141,7 @@ impl MainApp {
             nvml: Arc::new(RealNvml::new()),
             release_failures: ReleaseFailures::default(),
             restore_failures,
+            recoveries: Recoveries::default(),
         })
     }
 
@@ -145,14 +150,16 @@ impl MainApp {
     async fn run(&mut self, signals: &mut Signals) -> Result<()> {
         let mut loops = JoinSet::new();
 
-        for zone_config in &self.config.zones {
+        for (zone_config, recovery) in self.config.zones.iter().zip(&self.config.zone_recovery) {
             loops.spawn(Self::zone_loop(
                 // Only a zone with a Supermicro fan has an open session
                 self.sessions.get(&zone_config.session.0).cloned(),
                 self.nvml.clone(),
                 self.release_failures.clone(),
+                ZoneHealth::new(self.recoveries.clone()),
                 // Cloned since there's no structured concurrency support yet
                 Arc::new(zone_config.clone()),
+                *recovery,
             ));
         }
 
@@ -201,42 +208,28 @@ impl MainApp {
         results.into_result()
     }
 
-    /// Main loop for a zone. The loop runs forever while the future is being
-    /// polled.
+    /// Main loop for a zone. The loop runs while the future is being polled,
+    /// and returns only an error that `recovery` does not retry.
     async fn zone_loop(
         session: Option<Arc<IpmiSession>>,
         nvml: Arc<dyn Nvml>,
         release_failures: ReleaseFailures,
+        mut health: ZoneHealth,
         zone_config: Arc<Zone>,
+        recovery: Recovery,
     ) -> Result<()> {
-        // Each Supermicro fan holds an Arc of the session, so this guard
-        // releases the zone's fans before the session's own drop restores the
-        // fan mode. A returned error, a panic and an abort of this task all
-        // drop the guard; an abort takes effect once the poll in progress
-        // returns.
-        let mut fans = FanGuard::new(release_failures);
         let hwmon = HwmonRoot::default();
+        let interval = zone_config.interval.to_duration();
+        let mut zone = LiveZone {
+            state: ZoneState::new(&zone_config),
+            readers: ZoneReaders::new(hwmon.clone()),
+            hwmon,
+            session,
+            nvml,
+            zone_config,
+        };
 
-        for fan_config in &zone_config.fan_list {
-            fans.add(build_fan(fan_config, session.as_ref(), &hwmon, &nvml)?)?;
-        }
-
-        info!("[{}] Starting loop for fans {:?}", zone_label(session.as_deref()), fans.descriptions());
-
-        let mut state = ZoneState::new(&zone_config);
-        let mut readers = ZoneReaders::new(hwmon);
-
-        loop {
-            let st = &mut state;
-            let r = &mut readers;
-            let f = &mut fans;
-
-            task::block_in_place(|| {
-                Self::update_duty_cycle(session.as_deref(), &zone_config, st, r, f)
-            })?;
-
-            sleep(zone_config.interval.to_duration()).await;
-        }
+        Err(recover(&mut zone, recovery, interval, &release_failures, &mut health, sleep).await)
     }
 
     /// Update fan PWM duty cycle from the zone's source readings and curves
@@ -246,19 +239,21 @@ impl MainApp {
         state: &mut ZoneState,
         readers: &mut ZoneReaders,
         fans: &mut FanGuard,
-    ) -> Result<()> {
+    ) -> Result<(), ZoneFailure> {
         trace!("Querying sources for fans {:?}", fans.descriptions());
 
         let label = zone_label(session);
         let mut query_ipmi = || query_sensors(session);
         let failed_last = state.failed_sources();
         let readings = read_zone_sources(zone_config, &failed_last, &mut query_ipmi,
-            &mut |index, source| readers.read(index, source))?;
+            &mut |index, source| readers.read(index, source))
+            .map_err(|error| ZoneFailure { step: FailedStep::Sources, error })?;
         let update = state.next_duty(zone_config, &readings);
 
         Self::log_transitions(label, &fans.descriptions(), zone_config, &update.transitions);
 
-        let applied = fans.set_duty(update.duty)?;
+        let applied = fans.set_duty(update.duty)
+            .map_err(|error| ZoneFailure { step: FailedStep::Fans, error })?;
 
         for (fan, applied) in fans.descriptions().iter().zip(&applied) {
             debug!("[{}] {}: smoothed_temps={:?}C, curve_temps={:?}C, dcycle_cur={}, dcycle_new={}%, dcycle_sent={}",
@@ -290,6 +285,273 @@ impl MainApp {
                 }
             }
         }
+    }
+}
+
+/// The step of a zone's work that failed
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FailedStep {
+    /// Reading the sources. A source with `on_failure = { type = "exit" }`
+    /// fails here, with its own error.
+    Sources,
+    /// Building, taking over or driving a fan
+    Fans,
+}
+
+/// An error of a zone, with the step that returned it
+#[derive(Debug)]
+struct ZoneFailure {
+    step: FailedStep,
+    error: Error,
+}
+
+/// What a zone does after a failure, once its fans are released
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AfterFailure {
+    /// Wait, then take the fans over again
+    Retry,
+    /// Return the error, which stops every zone
+    Stop,
+}
+
+/// Whether `error`, or the error a fan error wraps, means that the NVML
+/// worker can make no more calls
+fn nvml_worker_failed(error: &Error) -> bool {
+    match error {
+        Error::Fan { source, .. } => nvml_worker_failed(source),
+        other => worker_failed(other),
+    }
+}
+
+/// Decide whether a zone retries `failure` after its fans were released with
+/// `release`. Only a fan error is retried, and only under `retry`: a source
+/// error is the source's `on_failure = exit`, a failed NVML worker never
+/// recovers in the process, and a failed release can leave a fan slow.
+fn after_failure(recovery: Recovery, failure: &ZoneFailure, release: ReleaseOutcome) -> AfterFailure {
+    let retried = matches!(recovery, Recovery::Retry { .. })
+        && failure.step == FailedStep::Fans
+        && release == ReleaseOutcome::AllReleased
+        && !nvml_worker_failed(&failure.error);
+
+    if retried {
+        AfterFailure::Retry
+    } else {
+        AfterFailure::Stop
+    }
+}
+
+/// The waits of a zone's recovery, in seconds: the first is
+/// [`RECOVERY_FIRST_DELAY_S`], and each consecutive failure doubles it up to
+/// the cap
+#[derive(Debug)]
+struct Backoff {
+    next_s: u64,
+    cap_s: u64,
+}
+
+impl Backoff {
+    fn new(cap_s: u64) -> Self {
+        Self { next_s: RECOVERY_FIRST_DELAY_S.min(cap_s), cap_s }
+    }
+
+    /// The wait after one more consecutive failure
+    fn failed(&mut self) -> u64 {
+        let delay_s = self.next_s;
+
+        self.next_s = delay_s.saturating_mul(2).min(self.cap_s);
+
+        delay_s
+    }
+
+    /// Start again from the first wait, after a successful update
+    fn reset(&mut self) {
+        self.next_s = RECOVERY_FIRST_DELAY_S.min(self.cap_s);
+    }
+}
+
+/// The cap of the waits of `recovery`. A zone under `exit` never waits.
+fn recovery_cap(recovery: Recovery) -> u64 {
+    match recovery {
+        Recovery::Retry { max_delay_s } => max_delay_s,
+        Recovery::Exit {} => RECOVERY_FIRST_DELAY_S,
+    }
+}
+
+/// The log line of a failure that a zone retries after `delay_s` seconds
+fn retry_line(error: &Error, delay_s: u64) -> String {
+    format!("Zone error: {}; released the zone's fans, taking them over again in {} seconds", error, delay_s)
+}
+
+/// Whether any zone is in recovery
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryOutcome {
+    AllRunning,
+    SomeRecovering,
+}
+
+/// The number of zones in recovery: each failed and has not completed an
+/// update since. Every zone shares it, so that the exit status can tell
+/// whether a stop found a zone in recovery.
+#[derive(Clone, Debug, Default)]
+struct Recoveries(Arc<AtomicUsize>);
+
+impl Recoveries {
+    fn outcome(&self) -> RecoveryOutcome {
+        if self.0.load(Ordering::SeqCst) == 0 {
+            RecoveryOutcome::AllRunning
+        } else {
+            RecoveryOutcome::SomeRecovering
+        }
+    }
+}
+
+/// One zone's count in [`Recoveries`]. An abort leaves a zone in recovery
+/// counted, so that the stop reports it.
+#[derive(Debug)]
+struct ZoneHealth {
+    zones: Recoveries,
+    recovering: bool,
+}
+
+impl ZoneHealth {
+    fn new(zones: Recoveries) -> Self {
+        Self { zones, recovering: false }
+    }
+
+    /// Count the zone as in recovery, once however often it fails
+    fn failed(&mut self) {
+        if self.recovering {
+            return;
+        }
+
+        self.recovering = true;
+        self.zones.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Record a successful update. Returns whether it ended a recovery.
+    fn updated(&mut self) -> bool {
+        if !self.recovering {
+            return false;
+        }
+
+        self.recovering = false;
+        self.zones.0.fetch_sub(1, Ordering::SeqCst);
+
+        true
+    }
+}
+
+/// The work of one zone that [`recover`] drives
+trait ZoneSteps {
+    /// Build the zone's fans and take each over, holding it in `fans`
+    fn take_over(&mut self, fans: &mut FanGuard) -> Result<()>;
+    /// Read the sources and drive the fans once
+    fn update(&mut self, fans: &mut FanGuard) -> Result<(), ZoneFailure>;
+}
+
+/// A zone of the config, on its session and NVML. The source state lasts
+/// across take-overs, so that a source's runner still knows of a killed
+/// program that has not exited.
+struct LiveZone {
+    session: Option<Arc<IpmiSession>>,
+    nvml: Arc<dyn Nvml>,
+    zone_config: Arc<Zone>,
+    hwmon: HwmonRoot,
+    state: ZoneState,
+    readers: ZoneReaders,
+}
+
+impl ZoneSteps for LiveZone {
+    fn take_over(&mut self, fans: &mut FanGuard) -> Result<()> {
+        for fan_config in &self.zone_config.fan_list {
+            fans.add(build_fan(fan_config, self.session.as_ref(), &self.hwmon, &self.nvml)?)?;
+        }
+
+        info!("[{}] Starting loop for fans {:?}", zone_label(self.session.as_deref()), fans.descriptions());
+
+        Ok(())
+    }
+
+    fn update(&mut self, fans: &mut FanGuard) -> Result<(), ZoneFailure> {
+        task::block_in_place(|| {
+            MainApp::update_duty_cycle(self.session.as_deref(), &self.zone_config, &mut self.state, &mut self.readers, fans)
+        })
+    }
+}
+
+/// Run `zone` until a failure that `recovery` does not retry, and return its
+/// error. Each attempt takes the fans over with a fresh guard and updates
+/// them every `interval`; after a failure the guard releases them, and a
+/// retried zone waits through `sleep` before the next attempt.
+///
+/// Each Supermicro fan holds an Arc of the session, so the guard releases the
+/// zone's fans before the session's own drop restores the fan mode. A panic
+/// and an abort of the task drop the guard, which releases the fans; an abort
+/// takes effect once the poll in progress returns.
+async fn recover<Z, S, F>(
+    zone: &mut Z,
+    recovery: Recovery,
+    interval: Duration,
+    release_failures: &ReleaseFailures,
+    health: &mut ZoneHealth,
+    mut sleep: S,
+) -> Error
+where
+    Z: ZoneSteps,
+    S: FnMut(Duration) -> F,
+    F: Future<Output = ()>,
+{
+    let mut backoff = Backoff::new(recovery_cap(recovery));
+
+    loop {
+        let mut fans = FanGuard::new(release_failures.clone());
+        let failure = attempt(zone, &mut fans, interval, &mut backoff, health, &mut sleep).await;
+        let release = fans.release();
+
+        if after_failure(recovery, &failure, release) == AfterFailure::Stop {
+            return failure.error;
+        }
+
+        health.failed();
+
+        let delay_s = backoff.failed();
+
+        error!("{}", retry_line(&failure.error, delay_s));
+        sleep(Duration::from_secs(delay_s)).await;
+    }
+}
+
+/// Take the fans of `zone` over into `fans` and update them every `interval`
+/// until a step fails
+async fn attempt<Z, S, F>(
+    zone: &mut Z,
+    fans: &mut FanGuard,
+    interval: Duration,
+    backoff: &mut Backoff,
+    health: &mut ZoneHealth,
+    sleep: &mut S,
+) -> ZoneFailure
+where
+    Z: ZoneSteps,
+    S: FnMut(Duration) -> F,
+    F: Future<Output = ()>,
+{
+    if let Err(error) = zone.take_over(fans) {
+        return ZoneFailure { step: FailedStep::Fans, error };
+    }
+
+    loop {
+        if let Err(failure) = zone.update(fans) {
+            return failure;
+        }
+
+        backoff.reset();
+
+        if health.updated() {
+            info!("Fans {:?} run again after recovery", fans.descriptions());
+        }
+
+        sleep(interval).await;
     }
 }
 
@@ -326,14 +588,16 @@ impl RunResults {
 }
 
 /// The result of the process: an error from the zone loops is kept, and a
-/// clean run becomes an error when a fan failed to release or a session
-/// failed to set a zone to 100% or to restore its fan mode
-fn exit_result(run: Result<()>, releases: ReleaseOutcome, restores: RestoreOutcome) -> Result<()> {
-    match (run, releases, restores) {
-        (Err(e), _, _) => Err(e),
-        (Ok(()), ReleaseOutcome::SomeFailed, _) => Err(Error::FansNotReleased),
-        (Ok(()), ReleaseOutcome::AllReleased, RestoreOutcome::SomeFailed) => Err(Error::SessionsNotRestored),
-        (Ok(()), ReleaseOutcome::AllReleased, RestoreOutcome::AllRestored) => Ok(()),
+/// clean run becomes an error when a fan failed to release, a session failed
+/// to set a zone to 100% or to restore its fan mode, or a zone was in
+/// recovery, in that order
+fn exit_result(run: Result<()>, releases: ReleaseOutcome, restores: RestoreOutcome, recoveries: RecoveryOutcome) -> Result<()> {
+    match (run, releases, restores, recoveries) {
+        (Err(e), _, _, _) => Err(e),
+        (Ok(()), ReleaseOutcome::SomeFailed, _, _) => Err(Error::FansNotReleased),
+        (Ok(()), ReleaseOutcome::AllReleased, RestoreOutcome::SomeFailed, _) => Err(Error::SessionsNotRestored),
+        (Ok(()), ReleaseOutcome::AllReleased, RestoreOutcome::AllRestored, RecoveryOutcome::SomeRecovering) => Err(Error::ZonesInRecovery),
+        (Ok(()), ReleaseOutcome::AllReleased, RestoreOutcome::AllRestored, RecoveryOutcome::AllRunning) => Ok(()),
     }
 }
 
@@ -436,6 +700,7 @@ async fn main_wrapper() -> Result<()> {
 fn finish(run: Result<()>, app: MainApp) -> Result<()> {
     let releases = app.release_failures.clone();
     let restores = app.restore_failures.clone();
+    let recoveries = app.recoveries.clone();
 
     // Every zone task has ended, so every guard has released its fans. The app
     // holds the last handle of each session, so this drop sets each session's
@@ -443,7 +708,7 @@ fn finish(run: Result<()>, app: MainApp) -> Result<()> {
     // decided.
     drop(app);
 
-    exit_result(run, releases.outcome(), restores.outcome())
+    exit_result(run, releases.outcome(), restores.outcome(), recoveries.outcome())
 }
 
 #[tokio::main]
@@ -470,17 +735,47 @@ mod tests {
             fs,
             io,
             path::{Path, PathBuf},
+            collections::VecDeque,
+            future::Future,
+            pin::{pin, Pin},
             process,
             sync::Arc,
+            task::{Context, Poll, Waker},
             time::Duration,
         },
         clap::CommandFactory,
         tokio::time::timeout,
-        super::{exit_result, finish, MainApp, Opt, query_sensors, RunResults, sessions_to_open, Signals, start_up},
+        super::{
+            after_failure,
+            AfterFailure,
+            Backoff,
+            exit_result,
+            FailedStep,
+            finish,
+            MainApp,
+            Opt,
+            query_sensors,
+            Recoveries,
+            RecoveryOutcome,
+            recover,
+            retry_line,
+            RunResults,
+            sessions_to_open,
+            Signals,
+            start_up,
+            ZoneFailure,
+            ZoneHealth,
+            ZoneSteps,
+        },
         crate::{
-            config::{Config, FanConfig, load_config, parse_config},
+            config::{Config, FanConfig, load_config, parse_config, Recovery},
             error::Error,
-            fan::{ReleaseFailures, ReleaseOutcome},
+            fan::{
+                fake::{CallLog, FakeFan, Op},
+                FanGuard,
+                ReleaseFailures,
+                ReleaseOutcome,
+            },
             ipmi::FanMode,
             nvml::fake::FakeNvml,
             session::{
@@ -800,14 +1095,14 @@ mod tests {
 
     #[test]
     fn clean_run_with_a_failed_release_is_an_error() {
-        let result = exit_result(Ok(()), ReleaseOutcome::SomeFailed, RestoreOutcome::AllRestored);
+        let result = exit_result(Ok(()), ReleaseOutcome::SomeFailed, RestoreOutcome::AllRestored, RecoveryOutcome::AllRunning);
 
         assert!(matches!(result, Err(Error::FansNotReleased)), "{:?}", result);
     }
 
     #[test]
     fn clean_run_with_every_fan_released_succeeds() {
-        let result = exit_result(Ok(()), ReleaseOutcome::AllReleased, RestoreOutcome::AllRestored);
+        let result = exit_result(Ok(()), ReleaseOutcome::AllReleased, RestoreOutcome::AllRestored, RecoveryOutcome::AllRunning);
 
         assert!(result.is_ok(), "{:?}", result);
     }
@@ -816,7 +1111,7 @@ mod tests {
     fn run_error_is_kept_whatever_the_releases_and_restores_did() {
         for releases in [ReleaseOutcome::SomeFailed, ReleaseOutcome::AllReleased] {
             for restores in [RestoreOutcome::SomeFailed, RestoreOutcome::AllRestored] {
-                let result = exit_result(Err(Error::SensorsWithoutSession), releases, restores);
+                let result = exit_result(Err(Error::SensorsWithoutSession), releases, restores, RecoveryOutcome::AllRunning);
 
                 assert!(matches!(result, Err(Error::SensorsWithoutSession)), "{:?}", result);
             }
@@ -825,7 +1120,7 @@ mod tests {
 
     #[test]
     fn clean_run_with_a_failed_restore_is_an_error() {
-        let result = exit_result(Ok(()), ReleaseOutcome::AllReleased, RestoreOutcome::SomeFailed);
+        let result = exit_result(Ok(()), ReleaseOutcome::AllReleased, RestoreOutcome::SomeFailed, RecoveryOutcome::AllRunning);
 
         assert!(matches!(result, Err(Error::SessionsNotRestored)), "{:?}", result);
     }
@@ -846,7 +1141,7 @@ mod tests {
 
         assert_eq!(failures.outcome(), RestoreOutcome::SomeFailed);
 
-        let result = exit_result(Ok(()), ReleaseOutcome::AllReleased, failures.outcome());
+        let result = exit_result(Ok(()), ReleaseOutcome::AllReleased, failures.outcome(), RecoveryOutcome::AllRunning);
 
         assert!(matches!(result, Err(Error::SessionsNotRestored)), "{:?}", result);
     }
@@ -868,6 +1163,7 @@ mod tests {
             nvml: Arc::new(FakeNvml::default()),
             release_failures: ReleaseFailures::default(),
             restore_failures,
+            recoveries: Recoveries::default(),
         }
     }
 
@@ -909,7 +1205,7 @@ mod tests {
 
     #[test]
     fn failed_release_is_reported_over_a_failed_restore() {
-        let result = exit_result(Ok(()), ReleaseOutcome::SomeFailed, RestoreOutcome::SomeFailed);
+        let result = exit_result(Ok(()), ReleaseOutcome::SomeFailed, RestoreOutcome::SomeFailed, RecoveryOutcome::AllRunning);
 
         assert!(matches!(result, Err(Error::FansNotReleased)), "{:?}", result);
     }
@@ -925,7 +1221,7 @@ mod tests {
             assert_eq!(run.add(result).is_some(), failed, "only an error is handed back to be logged");
         }
 
-        exit_result(run.into_result(), ReleaseOutcome::AllReleased, RestoreOutcome::AllRestored)
+        exit_result(run.into_result(), ReleaseOutcome::AllReleased, RestoreOutcome::AllRestored, RecoveryOutcome::AllRunning)
     }
 
     #[test]
@@ -971,5 +1267,261 @@ mod tests {
         let result = query_sensors(None);
 
         assert!(matches!(result, Err(Error::SensorsWithoutSession)), "{:?}", result);
+    }
+
+    const RETRY_300: Recovery = Recovery::Retry { max_delay_s: 300 };
+
+    #[test]
+    fn recovery_delay_doubles_to_the_cap_and_resets() {
+        let mut backoff = Backoff::new(300);
+        let delays: Vec<u64> = (0..7).map(|_| backoff.failed()).collect();
+
+        assert_eq!(delays, [10, 20, 40, 80, 160, 300, 300]);
+
+        backoff.reset();
+
+        assert_eq!(backoff.failed(), 10);
+
+        let mut shortest = Backoff::new(10);
+        let delays: Vec<u64> = (0..4).map(|_| shortest.failed()).collect();
+
+        assert_eq!(delays, [10, 10, 10, 10]);
+
+        // Doubling saturates, so no cap can overflow it
+        let mut unbounded = Backoff::new(u64::MAX);
+
+        for _ in 0..70 {
+            unbounded.failed();
+        }
+
+        assert_eq!(unbounded.failed(), u64::MAX);
+    }
+
+    fn failure(step: FailedStep, error: Error) -> ZoneFailure {
+        ZoneFailure { step, error }
+    }
+
+    /// An error with the same variant whichever step returns it
+    fn plain_error() -> Error {
+        Error::SensorNotFound("CPU Temp".to_owned())
+    }
+
+    /// `source` as a fan guard returns it
+    fn fan_error(source: Error) -> Error {
+        Error::Fan { fan: "nvidia gpu 00000000:01:00.0 fan 0".to_owned(), source: Box::new(source) }
+    }
+
+    fn stopped_worker() -> Error {
+        Error::NvmlNoReply { gpu: "00000000:01:00.0".to_owned(), operation: "set_fan_speed" }
+    }
+
+    #[test]
+    fn only_a_fan_error_with_a_clean_release_is_retried() {
+        let exit = Recovery::Exit {};
+
+        assert_eq!(after_failure(RETRY_300, &failure(FailedStep::Fans, plain_error()), ReleaseOutcome::AllReleased), AfterFailure::Retry);
+        assert_eq!(after_failure(RETRY_300, &failure(FailedStep::Fans, fan_error(plain_error())), ReleaseOutcome::AllReleased), AfterFailure::Retry);
+        assert_eq!(after_failure(exit, &failure(FailedStep::Fans, plain_error()), ReleaseOutcome::AllReleased), AfterFailure::Stop);
+
+        for recovery in [RETRY_300, exit] {
+            let stops = [
+                (failure(FailedStep::Sources, plain_error()), ReleaseOutcome::AllReleased),
+                (failure(FailedStep::Fans, fan_error(stopped_worker())), ReleaseOutcome::AllReleased),
+                (failure(FailedStep::Fans, stopped_worker()), ReleaseOutcome::AllReleased),
+                (failure(FailedStep::Fans, plain_error()), ReleaseOutcome::SomeFailed),
+            ];
+
+            for (failure, release) in stops {
+                assert_eq!(after_failure(recovery, &failure, release), AfterFailure::Stop, "{:?} {:?} {:?}", recovery, failure, release);
+            }
+        }
+    }
+
+    #[test]
+    fn retry_line_names_the_error_and_the_delay() {
+        let error = fan_error(plain_error());
+        let line = retry_line(&error, 40);
+
+        assert!(line.starts_with("Zone error: "), "{}", line);
+        assert!(line.contains(&error.to_string()), "{}", line);
+        assert!(line.contains("40 seconds"), "{}", line);
+    }
+
+    #[test]
+    fn stop_with_a_zone_in_recovery_is_an_error() {
+        let recoveries = Recoveries::default();
+        let mut running = ZoneHealth::new(recoveries.clone());
+        let mut failing = ZoneHealth::new(recoveries.clone());
+
+        running.failed();
+        running.updated();
+        failing.failed();
+
+        let result = exit_result(Ok(()), ReleaseOutcome::AllReleased, RestoreOutcome::AllRestored, recoveries.outcome());
+
+        assert!(matches!(result, Err(Error::ZonesInRecovery)), "{:?}", result);
+
+        let run_error = exit_result(Err(Error::SensorsWithoutSession), ReleaseOutcome::AllReleased, RestoreOutcome::AllRestored, RecoveryOutcome::SomeRecovering);
+        let release = exit_result(Ok(()), ReleaseOutcome::SomeFailed, RestoreOutcome::AllRestored, RecoveryOutcome::SomeRecovering);
+        let restore = exit_result(Ok(()), ReleaseOutcome::AllReleased, RestoreOutcome::SomeFailed, RecoveryOutcome::SomeRecovering);
+
+        assert!(matches!(run_error, Err(Error::SensorsWithoutSession)), "{:?}", run_error);
+        assert!(matches!(release, Err(Error::FansNotReleased)), "{:?}", release);
+        assert!(matches!(restore, Err(Error::SessionsNotRestored)), "{:?}", restore);
+    }
+
+    #[test]
+    fn stop_after_a_zone_recovered_succeeds() {
+        let recoveries = Recoveries::default();
+        let mut health = ZoneHealth::new(recoveries.clone());
+
+        health.failed();
+        health.failed();
+
+        assert!(health.updated(), "the first update after a failure ends the recovery");
+        assert!(!health.updated(), "a later update ends none");
+
+        let result = exit_result(Ok(()), ReleaseOutcome::AllReleased, RestoreOutcome::AllRestored, recoveries.outcome());
+
+        assert!(result.is_ok(), "{:?}", result);
+    }
+
+    /// The duty that a fake zone drives its fans at
+    const FAKE_DUTY: u8 = 50;
+
+    /// The update interval of a fake zone
+    const FAKE_INTERVAL: Duration = Duration::from_secs(5);
+
+    /// A zone whose take-overs hand out fake fans, one list per take-over in
+    /// order, and whose updates drive them at [`FAKE_DUTY`]
+    struct FakeZone {
+        takeovers: VecDeque<Vec<FakeFan>>,
+    }
+
+    impl FakeZone {
+        fn new(takeovers: Vec<Vec<FakeFan>>) -> Self {
+            Self { takeovers: takeovers.into() }
+        }
+    }
+
+    impl ZoneSteps for FakeZone {
+        fn take_over(&mut self, fans: &mut FanGuard) -> super::Result<()> {
+            for fan in self.takeovers.pop_front().expect("a take-over is left") {
+                fans.add(Box::new(fan))?;
+            }
+
+            Ok(())
+        }
+
+        fn update(&mut self, fans: &mut FanGuard) -> super::Result<(), ZoneFailure> {
+            fans.set_duty(FAKE_DUTY)
+                .map(|_| ())
+                .map_err(|error| ZoneFailure { step: FailedStep::Fans, error })
+        }
+    }
+
+    type FakeSleep = Pin<Box<dyn Future<Output = ()>>>;
+
+    /// A sleep that records each wait into `waits`, returns at once for the
+    /// first `ready` waits and never returns from the next one
+    fn sleeper(waits: &RefCell<Vec<Duration>>, ready: usize) -> impl FnMut(Duration) -> FakeSleep + '_ {
+        move |duration| {
+            let mut waits = waits.borrow_mut();
+
+            waits.push(duration);
+
+            if waits.len() <= ready {
+                Box::pin(std::future::ready(()))
+            } else {
+                Box::pin(std::future::pending())
+            }
+        }
+    }
+
+    /// Poll `future` once, then drop it as an abort of its task would
+    fn poll_once<F: Future>(future: F) -> Poll<F::Output> {
+        let mut future = pin!(future);
+
+        future.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    /// What a recovery loop did in one poll
+    struct Polled {
+        result: Poll<Error>,
+        waits: Vec<Duration>,
+        recoveries: RecoveryOutcome,
+        releases: ReleaseOutcome,
+    }
+
+    /// Poll the recovery loop of `zone` under retry once, with sleeps that
+    /// return at once for the first `ready` waits
+    fn poll_recovery(zone: &mut FakeZone, ready: usize) -> Polled {
+        let waits = RefCell::new(Vec::new());
+        let recoveries = Recoveries::default();
+        let failures = ReleaseFailures::default();
+        let mut health = ZoneHealth::new(recoveries.clone());
+        let result = poll_once(recover(zone, RETRY_300, FAKE_INTERVAL, &failures, &mut health, sleeper(&waits, ready)));
+
+        Polled { result, waits: waits.into_inner(), recoveries: recoveries.outcome(), releases: failures.outcome() }
+    }
+
+    fn log_of(calls: &CallLog) -> Vec<(&'static str, Op)> {
+        calls.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn failed_zone_releases_its_fans_and_takes_over_again() {
+        let calls = CallLog::default();
+        let mut zone = FakeZone::new(vec![
+            vec![FakeFan { failing: Some(Op::SetDuty), ..FakeFan::new("first", &calls) }],
+            vec![FakeFan::new("second", &calls)],
+        ]);
+
+        let polled = poll_recovery(&mut zone, 2);
+
+        assert!(polled.result.is_pending(), "the loop returned {:?}", polled.result);
+        assert_eq!(polled.waits, [Duration::from_secs(10), FAKE_INTERVAL, FAKE_INTERVAL]);
+        assert_eq!(log_of(&calls), [
+            ("first", Op::TakeControl), ("first", Op::SetDuty), ("first", Op::Release),
+            ("second", Op::TakeControl), ("second", Op::SetDuty), ("second", Op::SetDuty),
+            // Dropping the waiting loop, as an abort does, releases the fans
+            ("second", Op::Release),
+        ]);
+        assert_eq!(polled.recoveries, RecoveryOutcome::AllRunning);
+        assert_eq!(polled.releases, ReleaseOutcome::AllReleased);
+    }
+
+    #[test]
+    fn failed_takeover_is_retried_and_failed_release_is_fatal() {
+        let calls = CallLog::default();
+        let mut zone = FakeZone::new(vec![
+            vec![FakeFan { failing: Some(Op::TakeControl), ..FakeFan::new("first", &calls) }],
+            vec![FakeFan::new("second", &calls)],
+        ]);
+
+        let polled = poll_recovery(&mut zone, 1);
+
+        assert!(polled.result.is_pending(), "the loop returned {:?}", polled.result);
+        assert_eq!(polled.waits, [Duration::from_secs(10), FAKE_INTERVAL]);
+        assert_eq!(log_of(&calls), [
+            ("first", Op::TakeControl), ("first", Op::Release),
+            ("second", Op::TakeControl), ("second", Op::SetDuty), ("second", Op::Release),
+        ]);
+
+        let calls = CallLog::default();
+        let mut zone = FakeZone::new(vec![vec![
+            FakeFan { failing: Some(Op::SetDuty), ..FakeFan::new("a", &calls) },
+            FakeFan { failing: Some(Op::Release), ..FakeFan::new("b", &calls) },
+        ]]);
+
+        let polled = poll_recovery(&mut zone, usize::MAX);
+
+        assert!(matches!(&polled.result, Poll::Ready(Error::Fan { fan, .. }) if fan == "a"), "{:?}", polled.result);
+        assert_eq!(polled.waits, []);
+        assert_eq!(polled.releases, ReleaseOutcome::SomeFailed);
+        assert_eq!(log_of(&calls), [
+            ("a", Op::TakeControl), ("b", Op::TakeControl), ("a", Op::SetDuty),
+            ("b", Op::Release), ("a", Op::Release),
+        ]);
     }
 }
