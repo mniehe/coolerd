@@ -12,7 +12,7 @@ use {
     log::{error, info},
     crate::{
         config::SessionType,
-        error::Result,
+        error::{Error, Result},
         freeipmi::SensorReading,
         ipmi::{FanMode, Ipmi},
     },
@@ -31,6 +31,11 @@ pub trait IpmiPort: Send {
 /// zone task must not stop the shutdown path from setting the fans to 100%.
 fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The error of a step of the take-over of a board, named by its session
+fn start_failed(session: &str, action: String, source: Error) -> Error {
+    Error::SessionStart { session: session.to_owned(), action, source: Box::new(source) }
 }
 
 /// Whether every session set its zones to 100% and restored the fan mode it
@@ -93,7 +98,8 @@ impl IpmiSession {
         N: AsRef<str>,
         R: IntoIterator<Item = u8>,
     {
-        let orig_fan_mode = port.get_fan_mode()?;
+        let orig_fan_mode = port.get_fan_mode()
+            .map_err(|e| start_failed(name.as_ref(), "read the fan mode".to_owned(), e))?;
 
         info!("[{}] Original fan mode: {:?}", name.as_ref(), orig_fan_mode);
 
@@ -109,14 +115,14 @@ impl IpmiSession {
             info!("[{}] Setting fan mode to: {:?}", session.name, FanMode::Full);
             // Bound first, so the lock is released before `Drop` takes it
             let switched = session.lock().set_fan_mode(FanMode::Full);
-            switched?;
+            switched.map_err(|e| start_failed(&session.name, format!("set fan mode to {:?}", FanMode::Full), e))?;
         }
 
         for z in &session.restore_zones {
             info!("[{}] Setting zone {} duty cycle to 100%", session.name, z);
             // Bound first, so the lock is released before `Drop` takes it
             let written = session.lock().set_duty_cycle(*z, 100);
-            written?;
+            written.map_err(|e| start_failed(&session.name, format!("set zone {} duty cycle to 100%", z), e))?;
         }
 
         Ok(session)
@@ -300,13 +306,59 @@ mod tests {
 
         let result = IpmiSession::with_port("test", Box::new(board), [0], RestoreFailures::default());
 
-        assert!(matches!(result, Err(Error::Ipmi(_))), "expected the switch error");
+        assert!(matches!(result, Err(Error::SessionStart { .. })), "expected the switch error");
         assert_eq!(log_of(&calls), [
             PortCall::GetFanMode,
             PortCall::SetFanMode(FanMode::Full),
             PortCall::SetDutyCycle(0, 100),
             PortCall::SetFanMode(FanMode::Optimal),
         ]);
+    }
+
+    #[test]
+    fn failed_switch_to_full_mode_names_the_session() {
+        let calls = BoardLog::default();
+        let board = FakeBoard {
+            failing: Some(PortCall::SetFanMode(FanMode::Full)),
+            ..FakeBoard::new(FanMode::Optimal, &calls)
+        };
+
+        let result = IpmiSession::with_port("bmc0", Box::new(board), [0], RestoreFailures::default());
+
+        let message = result.err().expect("expected the switch error").to_string();
+        assert!(message.contains("[bmc0]"), "{}", message);
+        assert!(message.contains("fan mode to Full"), "{}", message);
+    }
+
+    #[test]
+    fn failed_fan_mode_read_names_the_session() {
+        let calls = BoardLog::default();
+        let board = FakeBoard {
+            failing: Some(PortCall::GetFanMode),
+            ..FakeBoard::new(FanMode::Optimal, &calls)
+        };
+
+        let result = IpmiSession::with_port("bmc0", Box::new(board), [0], RestoreFailures::default());
+
+        let message = result.err().expect("expected the read error").to_string();
+        assert!(message.contains("[bmc0]"), "{}", message);
+        assert!(message.contains("fan mode"), "{}", message);
+        assert_eq!(log_of(&calls), [PortCall::GetFanMode]);
+    }
+
+    #[test]
+    fn failed_start_write_names_the_session_and_the_zone() {
+        let calls = BoardLog::default();
+        let board = FakeBoard {
+            failing: Some(PortCall::SetDutyCycle(1, 100)),
+            ..FakeBoard::new(FanMode::Standard, &calls)
+        };
+
+        let result = IpmiSession::with_port("bmc0", Box::new(board), [0, 1], RestoreFailures::default());
+
+        let message = result.err().expect("expected the duty write error").to_string();
+        assert!(message.contains("[bmc0]"), "{}", message);
+        assert!(message.contains("zone 1"), "{}", message);
     }
 
     #[test]
@@ -452,9 +504,11 @@ mod tests {
             ..FakeBoard::new(FanMode::Standard, &calls)
         };
 
-        let result = IpmiSession::with_port("test", Box::new(board), [0, 1], RestoreFailures::default());
+        let failures = RestoreFailures::default();
 
-        assert!(matches!(result, Err(Error::Ipmi(_))), "expected the duty write error");
+        let result = IpmiSession::with_port("test", Box::new(board), [0, 1], failures.clone());
+
+        assert!(matches!(result, Err(Error::SessionStart { .. })), "expected the duty write error");
         assert_eq!(log_of(&calls), [
             PortCall::GetFanMode,
             PortCall::SetFanMode(FanMode::Full),
@@ -464,5 +518,7 @@ mod tests {
             PortCall::SetDutyCycle(1, 100),
             PortCall::SetFanMode(FanMode::Standard),
         ]);
+        // The drop's write to zone 0 fails as well
+        assert_eq!(failures.outcome(), RestoreOutcome::SomeFailed);
     }
 }

@@ -1311,7 +1311,15 @@ mod tests {
 
         let result = finish(Ok(()), app_over(board));
 
-        assert!(calls.lock().unwrap().ends_with(&[PortCall::SetDutyCycle(0, 100), PortCall::SetFanMode(FanMode::Standard)]));
+        assert_eq!(*calls.lock().unwrap(), [
+            PortCall::GetFanMode,
+            PortCall::SetFanMode(FanMode::Full),
+            // The write at open
+            PortCall::SetDutyCycle(0, 100),
+            // The session's drop
+            PortCall::SetDutyCycle(0, 100),
+            PortCall::SetFanMode(FanMode::Standard),
+        ]);
         assert!(matches!(result, Err(Error::SessionsNotRestored)), "{:?}", result);
     }
 
@@ -1327,7 +1335,13 @@ mod tests {
 
         let result = finish(Ok(()), app_over(board));
 
-        assert!(calls.lock().unwrap().ends_with(&[PortCall::SetDutyCycle(0, 100)]));
+        assert_eq!(*calls.lock().unwrap(), [
+            PortCall::GetFanMode,
+            // The write at open
+            PortCall::SetDutyCycle(0, 100),
+            // The session's drop
+            PortCall::SetDutyCycle(0, 100),
+        ]);
         assert!(matches!(result, Err(Error::SessionsNotRestored)), "{:?}", result);
     }
 
