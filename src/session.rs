@@ -38,6 +38,14 @@ fn start_failed(session: &str, action: String, source: Error) -> Error {
     Error::SessionStart { session: session.to_owned(), action, source: Box::new(source) }
 }
 
+/// Open the connection of `session` to its board through `open`
+fn open_port<P, F>(session: &str, open: F) -> Result<P>
+where
+    F: FnOnce() -> Result<P>,
+{
+    open().map_err(|e| start_failed(session, "open the IPMI connection".to_owned(), e))
+}
+
 /// Whether every session set its zones to 100% and restored the fan mode it
 /// saved
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,7 +95,9 @@ impl IpmiSession {
         N: AsRef<str>,
         R: IntoIterator<Item = u8>,
     {
-        Self::with_port(name, Box::new(Ipmi::new(st)?), restore_zones, restore_failures)
+        let port = open_port(name.as_ref(), || Ok(Ipmi::new(st)?))?;
+
+        Self::with_port(name, Box::new(port), restore_zones, restore_failures)
     }
 
     /// Take over the board behind `port`: switch it to full fan mode, then
@@ -269,6 +279,7 @@ mod tests {
         super::{
             fake::{port_error, BoardLog, FakeBoard, PortCall},
             lock_or_recover,
+            open_port,
             IpmiSession,
             RestoreFailures,
             RestoreOutcome,
@@ -350,6 +361,13 @@ mod tests {
         let result = IpmiSession::with_port("bmc0", Box::new(board), [0], RestoreFailures::default());
 
         assert_start_failure(result, "set fan mode to Full");
+    }
+
+    #[test]
+    fn failed_connection_names_the_session() {
+        let result = open_port("bmc0", || Err::<FakeBoard, _>(port_error()));
+
+        assert_start_failure(result, "open the IPMI connection");
     }
 
     #[test]
