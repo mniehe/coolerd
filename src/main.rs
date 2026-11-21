@@ -99,6 +99,81 @@ impl Signals {
     }
 }
 
+/// A request to stop the program, which [`supervise`] waits for again after
+/// each result it receives
+trait StopRequest {
+    /// Wait for the next request
+    async fn requested(&mut self);
+}
+
+impl StopRequest for Signals {
+    async fn requested(&mut self) {
+        self.recv().await
+    }
+}
+
+/// Wait until `stop` is requested or a zone task of `loops` ends, then abort
+/// every task and join them all. Returns the result of the run and whether a
+/// zone counted in `recoveries` was in recovery when the first stop came.
+async fn supervise<S: StopRequest>(
+    stop: &mut S,
+    loops: &mut JoinSet<Result<()>>,
+    recoveries: &Recoveries,
+) -> (Result<()>, RecoveryOutcome) {
+    let mut results = RunResults::default();
+
+    loop {
+        // A zone inside an update finishes it after the stop, and that
+        // update can end its recovery; the stop still found it in recovery.
+        // The boundary is the moment this loop accepts the stop, so each branch
+        // reads the recovery outcome before it does anything else.
+        let (ret, recovery): (Result<()>, RecoveryOutcome) = tokio::select! {
+            // Explicitly interrupted by ^C or signal handler
+            _ = stop.requested() => {
+                let recovery = recoveries.outcome();
+                info!("Interrupted");
+                (Ok(()), recovery)
+            }
+            // Oh boy, this is an Option<Result<Result<()>, JoinError>>
+            r = loops.join_next() => {
+                let recovery = recoveries.outcome();
+                let ret = match r {
+                    // No tasks left
+                    None => break,
+                    // The task panicked or was aborted
+                    Some(Err(e)) => {
+                        if e.is_cancelled() {
+                            Ok(())
+                        } else {
+                            Err(Error::LoopPanicked(e))
+                        }
+                    },
+                    // zone_loop's actual error return value
+                    Some(Ok(r)) => r,
+                };
+                (ret, recovery)
+            }
+        };
+
+        if let Some(line) = results.receive(ret, recovery) {
+            error!("{}", line);
+        }
+
+        // If tokio::select returned, then a loop exited or the program was
+        // explicitly interrupted. Interrupt all remaining tasks and the
+        // loop will exit once the FuturesUnordered is empty. This mechanism
+        // is necessary because Tokio's JoinHandles do not cancel tasks when
+        // they are dropped. Without the explicit aborts and joins, the
+        // IpmiSession destructors might not run since the tasks would keep
+        // the Arcs alive.
+        loops.abort_all();
+    }
+
+    let stop_recoveries = results.stop_recovery();
+
+    (results.into_result(), stop_recoveries)
+}
+
 /// Listen for signals, then open the app. A signal that arrives while the
 /// app opens sessions waits until the zone loops run, so it stops the program
 /// through the exit path that releases the fans and restores the fan mode.
@@ -166,58 +241,11 @@ impl MainApp {
             ));
         }
 
-        let mut results = RunResults::default();
+        let (ret, stop_recoveries) = supervise(signals, &mut loops, &self.recoveries).await;
 
-        loop {
-            // A zone inside an update finishes it after the stop, and that
-            // update can end its recovery; the stop still found it in recovery.
-            // The boundary is the moment `run` accepts the stop, so each branch
-            // reads the recovery outcome before it does anything else.
-            let (ret, recovery): (Result<()>, RecoveryOutcome) = tokio::select! {
-                // Explicitly interrupted by ^C or signal handler
-                _ = signals.recv() => {
-                    let recovery = self.recoveries.outcome();
-                    info!("Interrupted");
-                    (Ok(()), recovery)
-                }
-                // Oh boy, this is an Option<Result<Result<()>, JoinError>>
-                r = loops.join_next() => {
-                    let recovery = self.recoveries.outcome();
-                    let ret = match r {
-                        // No tasks left
-                        None => break,
-                        // The task panicked or was aborted
-                        Some(Err(e)) => {
-                            if e.is_cancelled() {
-                                Ok(())
-                            } else {
-                                Err(Error::LoopPanicked(e))
-                            }
-                        },
-                        // zone_loop's actual error return value
-                        Some(Ok(r)) => r,
-                    };
-                    (ret, recovery)
-                }
-            };
+        self.stop_recoveries = stop_recoveries;
 
-            if let Some(line) = results.receive(ret, recovery) {
-                error!("{}", line);
-            }
-
-            // If tokio::select returned, then a loop exited or the program was
-            // explicitly interrupted. Interrupt all remaining tasks and the
-            // loop will exit once the FuturesUnordered is empty. This mechanism
-            // is necessary because Tokio's JoinHandles do not cancel tasks when
-            // they are dropped. Without the explicit aborts and joins, the
-            // IpmiSession destructors might not run since the tasks would keep
-            // the Arcs alive.
-            loops.abort_all();
-        }
-
-        self.stop_recoveries = results.stop_recovery();
-
-        results.into_result()
+        ret
     }
 
     /// Main loop for a zone. The loop runs while the future is being polled,
@@ -821,12 +849,20 @@ mod tests {
             future::Future,
             pin::{pin, Pin},
             process,
-            sync::{Arc, Mutex},
+            sync::{
+                Arc,
+                Mutex,
+                atomic::{AtomicBool, Ordering},
+            },
             task::{Context, Poll, Waker},
             time::Duration,
         },
         clap::CommandFactory,
-        tokio::time::timeout,
+        tokio::{
+            sync::oneshot,
+            task::JoinSet,
+            time::timeout,
+        },
         super::{
             after_failure,
             AfterFailure,
@@ -847,6 +883,8 @@ mod tests {
             sessions_to_open,
             Signals,
             start_up,
+            StopRequest,
+            supervise,
             ZoneFailure,
             ZoneHealth,
             ZoneProgress,
@@ -1494,6 +1532,101 @@ mod tests {
 
         assert!(matches!(result, Err(Error::SensorsWithoutSession)), "{:?}", result);
         assert_eq!(RunResults::default().stop_recovery(), AllRunning, "a run with no result found no zone in recovery");
+    }
+
+    /// A stop that is requested once, when `requested` receives a value, and
+    /// never again
+    struct OneStop {
+        requested: oneshot::Receiver<()>,
+        accepted: bool,
+    }
+
+    impl StopRequest for OneStop {
+        async fn requested(&mut self) {
+            if self.accepted {
+                return std::future::pending().await;
+            }
+
+            (&mut self.requested).await.unwrap();
+            self.accepted = true;
+        }
+    }
+
+    /// A zone in recovery that completes its update only as its task is
+    /// aborted, so after the supervisor has accepted the stop
+    struct UpdatesOnAbort(ZoneHealth);
+
+    impl Drop for UpdatesOnAbort {
+        fn drop(&mut self) {
+            self.0.updated();
+        }
+    }
+
+    /// Sets its flag when its task is aborted
+    struct FlagsAbort(Arc<AtomicBool>);
+
+    impl Drop for FlagsAbort {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The longest a supervisor test waits before it counts as hung
+    const SUPERVISE_LIMIT: Duration = Duration::from_secs(10);
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_keeps_the_recovery_seen_when_it_was_accepted() {
+        let recoveries = Recoveries::default();
+        let (failed, requested) = oneshot::channel();
+        let mut stop = OneStop { requested, accepted: false };
+        let mut loops = JoinSet::new();
+        let mut health = ZoneHealth::new(recoveries.clone());
+
+        loops.spawn(async move {
+            health.failed();
+
+            let _recovering = UpdatesOnAbort(health);
+
+            failed.send(()).unwrap();
+            std::future::pending::<super::Result<()>>().await
+        });
+
+        let (result, at_stop) = timeout(SUPERVISE_LIMIT, supervise(&mut stop, &mut loops, &recoveries)).await.unwrap();
+
+        assert!(result.is_ok(), "{:?}", result);
+        assert_eq!(at_stop, RecoveryOutcome::SomeRecovering);
+        assert!(loops.is_empty(), "every zone task was joined");
+        // The zone finished its update after the stop, so only the stop saw it
+        // in recovery
+        assert_eq!(recoveries.outcome(), RecoveryOutcome::AllRunning);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn supervisor_stops_every_zone_when_one_returns() {
+        let recoveries = Recoveries::default();
+        let (_never, requested) = oneshot::channel();
+        let mut stop = OneStop { requested, accepted: false };
+        let mut loops = JoinSet::new();
+        let aborted = [Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false))];
+
+        for flag in &aborted {
+            let guard = FlagsAbort(flag.clone());
+
+            loops.spawn(async move {
+                let _guard = guard;
+
+                std::future::pending::<super::Result<()>>().await
+            });
+        }
+
+        loops.spawn(async { Err(Error::SensorsWithoutSession) });
+
+        let (result, at_stop) = timeout(SUPERVISE_LIMIT, supervise(&mut stop, &mut loops, &recoveries)).await.unwrap();
+
+        assert!(matches!(result, Err(Error::SensorsWithoutSession)), "{:?}", result);
+        assert_eq!(at_stop, RecoveryOutcome::AllRunning);
+        assert!(loops.is_empty(), "every zone task was joined");
+        assert!(aborted.iter().all(|flag| flag.load(Ordering::SeqCst)), "every other zone was aborted");
     }
 
     /// A fan that records each duty it is driven at
