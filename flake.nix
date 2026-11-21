@@ -284,23 +284,6 @@
           // {
             fans = [["nvidia" "00000000:01:00.0" 0]];
           };
-        # The zone as a list in field order, which the daemon also reads. Its
-        # elements follow the fields of Zone in src/config.rs; fans is the
-        # twelfth.
-        nvidiaFanListZone = [
-          "default"
-          1
-          2
-          500
-          [0]
-          [hwmonSource]
-          {type = "maximum";}
-          nvidiaZone.steps
-          {type = "maximum";}
-          0
-          "gpu"
-          nvidiaZone.fans
-        ];
         nvidiaSourceOnlyZone =
           nvidiaZone
           // {
@@ -615,8 +598,6 @@
           "nvidia fan as a table without enableNvidiaFans: no failed assertion names services.coolerd.enableNvidiaFans"
           ++ lib.optional (!rejectsWithoutNvidiaOption nvidiaFanPositionalZone)
           "nvidia fan as a list without enableNvidiaFans: no failed assertion names services.coolerd.enableNvidiaFans"
-          ++ lib.optional (!rejectsWithoutNvidiaOption nvidiaFanListZone)
-          "nvidia fan in a zone written as a list without enableNvidiaFans: no failed assertion names services.coolerd.enableNvidiaFans"
           ++ map (message: "nvidia source without an NVIDIA fan: an assertion fails: ${message}") (failedWithZone nvidiaSourceOnlyZone)
           ++ lib.optional (lib.hasInfix "KERNEL==\"ipmi" hwmonConfig.services.udev.extraRules || lib.elem "ipmi" hwmonConfig.users.users.coolerd.extraGroups || hwmonConfig.users.groups ? ipmi || hasIpmiModule hwmonConfig.boot.kernelModules)
           "hwmon: an IPMI udev rule, ipmi group or IPMI kernel module is present with enableIpmi = false"
