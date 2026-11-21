@@ -134,6 +134,8 @@ pub enum Error {
     },
     #[error("Failed to release every fan; the errors logged before this one name each fan")]
     FansNotReleased,
+    #[error("Failed to restore the saved fan mode of every IPMI session; the errors logged before this one name each session")]
+    FanModeNotRestored,
     #[error("{0}: not taken over")]
     FanNotTaken(String),
     #[error("IPMI sensors need an IPMI session, and the zone has none")]

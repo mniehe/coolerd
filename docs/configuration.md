@@ -439,7 +439,7 @@ The format of the config file is the format of ipmi-fan-control. A config writte
 - **Unknown keys.** An `aggregation` or `duty_aggregation` of type `maximum` and a session of type `local` now reject a key that they do not know, as every other table does. Earlier versions ignored such a key, so a config with one, such as `aggregation = { type = "maximum", top = 3 }`, now fails to load with an error that names the key. Remove the key, or change the type when the key was meant for it.
 - **Retries.** Only a source that fails is read again. Earlier versions read every source of the zone again when one source failed.
 - **Time limits.** `smartctl` and `hdparm` are stopped after 30 seconds. Earlier versions waited for them without a limit.
-- **Exit status.** When coolerd fails to release a fan as it stops, it exits with status 1, also when a signal stopped it. Earlier versions exited with status 0.
+- **Exit status.** When coolerd fails to release a fan or to restore the fan mode of a board as it stops, it exits with status 1, also when a signal stopped it. So does an error that a zone returns while it stops after a signal, and coolerd now logs that error. Earlier versions exited with status 0 in these cases, and they did not log a zone error that came after a signal.
 - **Signals.** coolerd listens for SIGINT and SIGTERM before it opens an IPMI session. Earlier versions started to listen only after the zones had started.
 
 [Migrating from ipmi-fan-control](nixos.md#migrating-from-ipmi-fan-control) lists the names that the rename changed.

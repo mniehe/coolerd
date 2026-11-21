@@ -571,6 +571,7 @@ mod tests {
             session::{
                 fake::{BoardLog, FakeBoard, PortCall},
                 IpmiSession,
+                RestoreFailures,
             },
         },
     };
@@ -728,7 +729,7 @@ mod tests {
     const SESSION_OPEN: [PortCall; 2] = [PortCall::GetFanMode, PortCall::SetFanMode(FanMode::Full)];
 
     fn session_on(board: FakeBoard) -> Arc<IpmiSession> {
-        Arc::new(IpmiSession::with_port("test", Box::new(board), [0]).unwrap())
+        Arc::new(IpmiSession::with_port("test", Box::new(board), [0], RestoreFailures::default()).unwrap())
     }
 
     #[test]

@@ -82,14 +82,14 @@ coolerd runs the release in each of these cases:
 - A zone panics, which is a bug in coolerd.
 - The start fails part way. The fans and the boards that coolerd has taken over by then are released.
 
-One zone that stops with an error stops every zone.
+One zone that stops with an error stops every zone. coolerd logs each error that a zone returns, also an error that a zone returns while it stops after a signal or after the error of another zone.
 
 ```mermaid
 flowchart TD
     A[signal, zone error or panic] --> B[every zone stops; a zone inside an update finishes it first]
     B --> C[each zone releases its fans, the last fan of its list first]
     C --> D[each board: every IPMI zone to 100%, then the saved fan mode]
-    D --> E[exit status 1 when a zone failed or a fan was not released, else 0]
+    D --> E[exit status 1 when a zone failed, a fan was not released or a fan mode was not restored, else 0]
 ```
 
 When the release of one fan fails, coolerd logs an error that names the fan, and the next fan still gets its attempt.
@@ -99,6 +99,8 @@ When the release of one fan fails, coolerd logs an error that names the fan, and
 coolerd sets the IPMI zone of the fan to 100%. After every zone has stopped, coolerd sets each IPMI zone that the config names on the board to 100% once more, and then restores the fan mode that it saved at the start.
 
 When the saved mode was the full mode, coolerd restores nothing: the board stays in the full mode at 100%.
+
+When the restore of the fan mode fails, coolerd logs an error that names the session and exits with status 1. The board may then stay in the full mode. A failed write of 100% in this last step is logged and does not change the exit status, because the release of the fan wrote 100% before it, and a failed release gives status 1.
 
 When the switch to the full mode fails at the start, coolerd runs the same steps before it exits.
 
@@ -142,9 +144,9 @@ A `supermicro` or `hwmon` fan that cannot be read, and any fan that refuses a wr
 
 | Status | Meaning |
 |---|---|
-| 0 | SIGINT or SIGTERM stopped coolerd, and every fan was released. Also after `--help`. |
+| 0 | SIGINT or SIGTERM stopped coolerd, no zone returned an error, every fan was released and every board got its saved fan mode back. Also after `--help`. |
 | 2 | The command line was wrong, such as a missing `--config`. |
-| 1 | Any other error: a config error, a failed start, a source failure with `on_failure = { type = "exit" }`, a fan that refused a duty cycle, a panic, or a fan that could not be released. |
+| 1 | Any other error: a config error, a failed start, a source failure with `on_failure = { type = "exit" }`, a fan that refused a duty cycle, a panic, a fan that could not be released, or a fan mode that could not be restored. A zone error counts also when a signal came first. |
 
 The [NixOS module](nixos.md) restarts the service 10 seconds after an exit with status 1.
 
@@ -155,8 +157,6 @@ coolerd cannot cover these cases. Plan for them.
 - **A killed process releases nothing.** SIGKILL, a power loss and a crash of the machine end coolerd without the release. So does any signal other than SIGINT and SIGTERM that ends the process, such as SIGHUP. The fans keep the last state that coolerd set, for as long as the device keeps it: a board stays in the full mode at its last duty cycle, a hwmon channel stays manual at its last value, and an NVIDIA fan stays manual at its last speed.
 - **After a kill, the saved state is lost.** The next start of coolerd finds the board in the full mode, or the hwmon channel in manual control, and saves that. When it stops, it leaves the board in the full mode at 100%, or the channel in manual control at 255. To get the earlier fan mode of a board back, set it through the BMC. A hwmon chip usually returns to its automatic mode at the next boot. An NVIDIA fan is different: every normal stop gives it back to the default policy.
 - **A blocked update delays the release.** A zone that is inside an update finishes it before it releases its fans. The programs that a source runs and the NVML calls have time limits. coolerd sets no time limit of its own on an IPMI query, on a read of a `file` source, or on a read or write of a hwmon file, and none on the stop as a whole. A service manager that kills a slow stop, as systemd does after its stop timeout, ends coolerd without the release.
-- **An error after a signal is not reported.** When coolerd handles SIGINT or SIGTERM first, an error that a zone returns while it finishes its update is not logged and does not change the exit status. A fan that could not be released still gives status 1.
-- **A failed board restore does not change the exit status.** When the last write of 100% or the restore of the fan mode fails, coolerd logs the error. The exit status then reflects only the release of each fan.
 - **A hwmon fan keeps the device path that it found at the start.** If the driver of the chip is unbound and bound again while coolerd runs, another chip can take that path, and coolerd then drives that chip. Restart coolerd after you reload or rebind a hwmon driver.
 - **An NVML call that hangs stops all NVML work.** Each NVML call has a time limit of 5 seconds. A call made before the library has loaded gets 30 seconds more for the load, 35 seconds in all. The time that a call waits behind other NVML calls counts toward its limit. A call that does not return in time fails, and so does its zone. NVML calls cannot be stopped, so coolerd then makes no further NVML call: the release of each NVIDIA fan that it had taken over fails at once and is logged, and coolerd exits with status 1. Restart coolerd after the driver recovers.
 - **Two names for one device are not detected.** coolerd does not detect two session names that reach the same board. It refuses a hwmon chip name that two chips share.

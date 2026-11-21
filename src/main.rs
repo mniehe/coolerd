@@ -37,7 +37,7 @@ use {
     freeipmi::SensorReading,
     hwmon::HwmonRoot,
     nvml::{Nvml, RealNvml},
-    session::IpmiSession,
+    session::{IpmiSession, RestoreFailures, RestoreOutcome},
     source::{read_zone_sources, ZoneReaders},
 };
 
@@ -115,15 +115,18 @@ struct MainApp {
     nvml: Arc<dyn Nvml>,
     /// The failed releases of every zone's fans
     release_failures: ReleaseFailures,
+    /// The failed fan-mode restores of every session
+    restore_failures: RestoreFailures,
 }
 
 impl MainApp {
     fn new(config: Config) -> Result<Self> {
         let mut sessions = HashMap::new();
+        let restore_failures = RestoreFailures::default();
 
         for (name, restore_zones) in sessions_to_open(&config) {
             let st = &config.sessions.0[&name].0;
-            let session = IpmiSession::new(&name, st, restore_zones)?;
+            let session = IpmiSession::new(&name, st, restore_zones, restore_failures.clone())?;
 
             sessions.insert(name, Arc::new(session));
         }
@@ -133,6 +136,7 @@ impl MainApp {
             sessions,
             nvml: Arc::new(RealNvml::new()),
             release_failures: ReleaseFailures::default(),
+            restore_failures,
         })
     }
 
@@ -152,7 +156,7 @@ impl MainApp {
             ));
         }
 
-        let mut first_result = None;
+        let mut results = RunResults::default();
 
         loop {
             let ret: Result<()> = tokio::select! {
@@ -180,8 +184,8 @@ impl MainApp {
                 }
             };
 
-            if first_result.is_none() {
-                first_result = Some(ret);
+            if let Some(e) = results.add(ret) {
+                error!("{}", e);
             }
 
             // If tokio::select returned, then a loop exited or the program was
@@ -194,7 +198,7 @@ impl MainApp {
             loops.abort_all();
         }
 
-        first_result.unwrap_or(Ok(()))
+        results.into_result()
     }
 
     /// Main loop for a zone. The loop runs forever while the future is being
@@ -289,12 +293,46 @@ impl MainApp {
     }
 }
 
+/// The results of the zone loops and of the signals, as `run` receives them.
+/// The first error is the result of the run; a signal or a cancelled loop
+/// adds none, so an error that a zone returns after a signal still counts.
+#[derive(Debug, Default)]
+struct RunResults {
+    first_error: Option<Error>,
+}
+
+impl RunResults {
+    /// Add one result. Returns an error that is not kept, for the caller to
+    /// log.
+    fn add(&mut self, result: Result<()>) -> Option<Error> {
+        let Err(e) = result else {
+            return None;
+        };
+
+        if self.first_error.is_some() {
+            return Some(e);
+        }
+
+        self.first_error = Some(e);
+
+        None
+    }
+
+    /// The result of the run
+    fn into_result(self) -> Result<()> {
+        self.first_error.map_or(Ok(()), Err)
+    }
+}
+
 /// The result of the process: an error from the zone loops is kept, and a
-/// clean run becomes an error when a fan failed to release
-fn exit_result(run: Result<()>, releases: ReleaseOutcome) -> Result<()> {
-    match (run, releases) {
-        (Ok(()), ReleaseOutcome::SomeFailed) => Err(Error::FansNotReleased),
-        (run, _) => run,
+/// clean run becomes an error when a fan failed to release or a session
+/// failed to restore its fan mode
+fn exit_result(run: Result<()>, releases: ReleaseOutcome, restores: RestoreOutcome) -> Result<()> {
+    match (run, releases, restores) {
+        (Err(e), _, _) => Err(e),
+        (Ok(()), ReleaseOutcome::SomeFailed, _) => Err(Error::FansNotReleased),
+        (Ok(()), ReleaseOutcome::AllReleased, RestoreOutcome::SomeFailed) => Err(Error::FanModeNotRestored),
+        (Ok(()), ReleaseOutcome::AllReleased, RestoreOutcome::AllRestored) => Ok(()),
     }
 }
 
@@ -389,9 +427,15 @@ async fn main_wrapper() -> Result<()> {
 
     let (mut signals, mut app) = start_up(Signals::listen, || MainApp::new(config))?;
     let run = app.run(&mut signals).await;
+    let releases = app.release_failures.clone();
+    let restores = app.restore_failures.clone();
 
-    // Every zone task has ended, so every guard has released its fans
-    exit_result(run, app.release_failures.outcome())
+    // Every zone task has ended, so every guard has released its fans. The app
+    // holds the last handle of each session, so this drop restores each
+    // board's fan mode before the exit status is decided.
+    drop(app);
+
+    exit_result(run, releases.outcome(), restores.outcome())
 }
 
 #[tokio::main]
@@ -422,11 +466,12 @@ mod tests {
         },
         clap::CommandFactory,
         tokio::time::timeout,
-        super::{exit_result, Opt, query_sensors, sessions_to_open, Signals, start_up},
+        super::{exit_result, Opt, query_sensors, RunResults, sessions_to_open, Signals, start_up},
         crate::{
             config::{Config, FanConfig, load_config, parse_config},
             error::Error,
             fan::ReleaseOutcome,
+            session::RestoreOutcome,
         },
     };
 
@@ -738,25 +783,91 @@ mod tests {
 
     #[test]
     fn clean_run_with_a_failed_release_is_an_error() {
-        let result = exit_result(Ok(()), ReleaseOutcome::SomeFailed);
+        let result = exit_result(Ok(()), ReleaseOutcome::SomeFailed, RestoreOutcome::AllRestored);
 
         assert!(matches!(result, Err(Error::FansNotReleased)), "{:?}", result);
     }
 
     #[test]
     fn clean_run_with_every_fan_released_succeeds() {
-        let result = exit_result(Ok(()), ReleaseOutcome::AllReleased);
+        let result = exit_result(Ok(()), ReleaseOutcome::AllReleased, RestoreOutcome::AllRestored);
 
         assert!(result.is_ok(), "{:?}", result);
     }
 
     #[test]
-    fn run_error_is_kept_whatever_the_releases_did() {
+    fn run_error_is_kept_whatever_the_releases_and_restores_did() {
         for releases in [ReleaseOutcome::SomeFailed, ReleaseOutcome::AllReleased] {
-            let result = exit_result(Err(Error::SensorsWithoutSession), releases);
+            for restores in [RestoreOutcome::SomeFailed, RestoreOutcome::AllRestored] {
+                let result = exit_result(Err(Error::SensorsWithoutSession), releases, restores);
 
-            assert!(matches!(result, Err(Error::SensorsWithoutSession)), "{:?}", result);
+                assert!(matches!(result, Err(Error::SensorsWithoutSession)), "{:?}", result);
+            }
         }
+    }
+
+    #[test]
+    fn clean_run_with_a_failed_restore_is_an_error() {
+        let result = exit_result(Ok(()), ReleaseOutcome::AllReleased, RestoreOutcome::SomeFailed);
+
+        assert!(matches!(result, Err(Error::FanModeNotRestored)), "{:?}", result);
+    }
+
+    #[test]
+    fn failed_release_is_reported_over_a_failed_restore() {
+        let result = exit_result(Ok(()), ReleaseOutcome::SomeFailed, RestoreOutcome::SomeFailed);
+
+        assert!(matches!(result, Err(Error::FansNotReleased)), "{:?}", result);
+    }
+
+    /// The exit result of a run that received `results` in order, with every
+    /// fan released and every fan mode restored
+    fn exit_after(results: Vec<super::Result<()>>) -> super::Result<()> {
+        let mut run = RunResults::default();
+
+        for result in results {
+            assert!(run.add(result).is_none(), "an error was handed back to be logged");
+        }
+
+        exit_result(run.into_result(), ReleaseOutcome::AllReleased, RestoreOutcome::AllRestored)
+    }
+
+    #[test]
+    fn zone_error_after_a_signal_fails_the_exit() {
+        // The signal, then a zone that fails as it finishes its update
+        let result = exit_after(vec![Ok(()), Err(Error::SensorsWithoutSession)]);
+
+        assert!(matches!(result, Err(Error::SensorsWithoutSession)), "{:?}", result);
+    }
+
+    #[test]
+    fn signal_stop_without_an_error_succeeds() {
+        // The signal, then two cancelled zone loops
+        let result = exit_after(vec![Ok(()), Ok(()), Ok(())]);
+
+        assert!(result.is_ok(), "{:?}", result);
+    }
+
+    #[test]
+    fn zone_error_before_a_signal_fails_the_exit() {
+        let result = exit_after(vec![Err(Error::SensorsWithoutSession), Ok(())]);
+
+        assert!(matches!(result, Err(Error::SensorsWithoutSession)), "{:?}", result);
+    }
+
+    #[test]
+    fn error_after_the_first_error_is_handed_back_to_be_logged() {
+        let mut run = RunResults::default();
+
+        assert!(run.add(Err(Error::SensorsWithoutSession)).is_none());
+
+        let later = run.add(Err(Error::FansNotReleased));
+
+        assert!(matches!(later, Some(Error::FansNotReleased)), "{:?}", later);
+
+        let result = run.into_result();
+
+        assert!(matches!(result, Err(Error::SensorsWithoutSession)), "{:?}", result);
     }
 
     #[test]
