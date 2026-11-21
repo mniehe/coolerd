@@ -427,12 +427,19 @@ async fn main_wrapper() -> Result<()> {
 
     let (mut signals, mut app) = start_up(Signals::listen, || MainApp::new(config))?;
     let run = app.run(&mut signals).await;
+
+    finish(run, app)
+}
+
+/// Drop `app` once its run has ended, then decide the result of the process
+fn finish(run: Result<()>, app: MainApp) -> Result<()> {
     let releases = app.release_failures.clone();
     let restores = app.restore_failures.clone();
 
     // Every zone task has ended, so every guard has released its fans. The app
-    // holds the last handle of each session, so this drop restores each
-    // board's fan mode before the exit status is decided.
+    // holds the last handle of each session, so this drop sets each session's
+    // zones to 100% and restores its fan mode before the exit status is
+    // decided.
     drop(app);
 
     exit_result(run, releases.outcome(), restores.outcome())
@@ -458,20 +465,23 @@ mod tests {
     use {
         std::{
             cell::{Cell, RefCell},
+            collections::HashMap,
             fs,
             io,
             path::{Path, PathBuf},
             process,
+            sync::Arc,
             time::Duration,
         },
         clap::CommandFactory,
         tokio::time::timeout,
-        super::{exit_result, Opt, query_sensors, RunResults, sessions_to_open, Signals, start_up},
+        super::{exit_result, finish, MainApp, Opt, query_sensors, RunResults, sessions_to_open, Signals, start_up},
         crate::{
             config::{Config, FanConfig, load_config, parse_config},
             error::Error,
-            fan::ReleaseOutcome,
+            fan::{ReleaseFailures, ReleaseOutcome},
             ipmi::FanMode,
+            nvml::fake::FakeNvml,
             session::{
                 fake::{BoardLog, FakeBoard, PortCall},
                 IpmiSession,
@@ -838,6 +848,62 @@ mod tests {
         let result = exit_result(Ok(()), ReleaseOutcome::AllReleased, failures.outcome());
 
         assert!(matches!(result, Err(Error::SessionsNotRestored)), "{:?}", result);
+    }
+
+    /// An app whose one session runs over `board`, after a run that ended
+    /// with no error
+    fn app_over(board: FakeBoard) -> MainApp {
+        let restore_failures = RestoreFailures::default();
+        let session = IpmiSession::with_port("default", Box::new(board), [0], restore_failures.clone()).unwrap();
+
+        MainApp {
+            config: parse(concat!(
+                "[[zones]]\n",
+                "fans = [{ type = \"supermicro\", zone = 0 }]\n",
+                "sources = [{ type = \"ipmi\", sensor = \"CPU Temp\" }]\n",
+                "steps = [{ temp = 40, dcycle = 40 }]\n",
+            )),
+            sessions: HashMap::from([("default".to_owned(), Arc::new(session))]),
+            nvml: Arc::new(FakeNvml::default()),
+            release_failures: ReleaseFailures::default(),
+            restore_failures,
+        }
+    }
+
+    #[test]
+    fn finish_fails_on_a_mode_restore_that_fails_as_the_app_drops() {
+        let calls = BoardLog::default();
+        let board = FakeBoard {
+            failing: Some(PortCall::SetFanMode(FanMode::Standard)),
+            ..FakeBoard::new(FanMode::Standard, &calls)
+        };
+
+        let result = finish(Ok(()), app_over(board));
+
+        assert!(calls.lock().unwrap().ends_with(&[PortCall::SetDutyCycle(0, 100), PortCall::SetFanMode(FanMode::Standard)]));
+        assert!(matches!(result, Err(Error::SessionsNotRestored)), "{:?}", result);
+    }
+
+    #[test]
+    fn finish_fails_on_a_full_duty_write_that_fails_as_the_app_drops() {
+        let calls = BoardLog::default();
+        let board = FakeBoard {
+            failing: Some(PortCall::SetDutyCycle(0, 100)),
+            ..FakeBoard::new(FanMode::Full, &calls)
+        };
+
+        let result = finish(Ok(()), app_over(board));
+
+        assert!(calls.lock().unwrap().ends_with(&[PortCall::SetDutyCycle(0, 100)]));
+        assert!(matches!(result, Err(Error::SessionsNotRestored)), "{:?}", result);
+    }
+
+    #[test]
+    fn finish_succeeds_when_the_app_drops_cleanly() {
+        let calls = BoardLog::default();
+        let result = finish(Ok(()), app_over(FakeBoard::new(FanMode::Standard, &calls)));
+
+        assert!(result.is_ok(), "{:?}", result);
     }
 
     #[test]

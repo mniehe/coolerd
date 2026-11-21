@@ -39,8 +39,8 @@ termination owner.
   not absorb, `run` aborts the other loops through a `JoinSet`, and
   `RunResults` keeps the first error of any loop as the result, also one
   that comes after a signal, and hands each later error back to be logged.
-  `main_wrapper` drops `MainApp` before `exit_result`, and `main` exits 1 on
-  an error. `FanGuard::drop` in `src/fan.rs` and
+  `finish`, which `main_wrapper` calls, drops `MainApp` before
+  `exit_result`, and `main` exits 1 on an error. `FanGuard::drop` in `src/fan.rs` and
   `IpmiSession::drop` in `src/session.rs` are the cleanup. The first
   releases each of its fans (a hwmon fan writes 255, then restores a saved
   automatic mode; an NVIDIA fan asks for the default policy, then falls
