@@ -280,13 +280,33 @@ impl<'de> Deserialize<'de> for SourceConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "lowercase", tag = "type")]
+#[serde(from = "AggregationKeys")]
 pub enum Aggregation {
     #[default]
     Maximum,
     Average {
         top: Option<usize>,
     },
+}
+
+/// The config form of [`Aggregation`]. Serde ignores extra keys on a unit
+/// variant of a tagged enum; an empty struct variant rejects them.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename = "Aggregation", rename_all = "lowercase", tag = "type")]
+enum AggregationKeys {
+    Maximum {},
+    Average {
+        top: Option<usize>,
+    },
+}
+
+impl From<AggregationKeys> for Aggregation {
+    fn from(keys: AggregationKeys) -> Self {
+        match keys {
+            AggregationKeys::Maximum {} => Self::Maximum,
+            AggregationKeys::Average { top } => Self::Average { top },
+        }
+    }
 }
 
 /// One fan that a zone drives
@@ -373,7 +393,7 @@ impl fmt::Debug for Password {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "lowercase", tag = "type")]
+#[serde(from = "SessionTypeKeys")]
 pub enum SessionType {
     #[default]
     Local,
@@ -382,6 +402,28 @@ pub enum SessionType {
         username: String,
         password: Password,
     },
+}
+
+/// The config form of [`SessionType`]. Serde ignores extra keys on a unit
+/// variant of a tagged enum; an empty struct variant rejects them.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename = "SessionType", rename_all = "lowercase", tag = "type")]
+enum SessionTypeKeys {
+    Local {},
+    Remote {
+        hostname: String,
+        username: String,
+        password: Password,
+    },
+}
+
+impl From<SessionTypeKeys> for SessionType {
+    fn from(keys: SessionTypeKeys) -> Self {
+        match keys {
+            SessionTypeKeys::Local {} => Self::Local,
+            SessionTypeKeys::Remote { hostname, username, password } => Self::Remote { hostname, username, password },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Parser, ValueEnum)]
@@ -956,8 +998,8 @@ fn check_steps(steps: &[Step], key: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use {
-        std::path::Path,
-        super::{Aggregation, Config, FanConfig, LogLevel, OnFailure, parse_config, SessionType, Source},
+        std::{fs, path::{Path, PathBuf}},
+        super::{Aggregation, Config, FanConfig, load_config, LogLevel, OnFailure, parse_config, SessionType, Source, Zone},
         crate::{
             curve::{SourceReading, ZoneState},
             error::{Error, Result},
@@ -1005,9 +1047,65 @@ mod tests {
         }
     }
 
+    /// A file of the repository, named by its path from the repository root
+    fn repo_file(relative: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
+    }
+
+    /// The source types of a zone, in the order of its `sources`
+    fn source_types(zone: &Zone) -> Vec<&'static str> {
+        zone.sources.iter()
+            .map(|source| match source.kind {
+                Source::Ipmi { .. } => "ipmi",
+                Source::File { .. } => "file",
+                Source::Smart { .. } => "smart",
+                Source::Hdparm { .. } => "hdparm",
+                Source::Nvidia { .. } => "nvidia",
+                Source::Hwmon { .. } => "hwmon",
+            })
+            .collect()
+    }
+
+    /// The `gpu` of each NVIDIA source of a zone
+    fn nvidia_source_gpus(zone: &Zone) -> Vec<&str> {
+        zone.sources.iter()
+            .filter_map(|source| match &source.kind {
+                Source::Nvidia { gpu } => Some(gpu.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every `.toml` file of `docs/examples`, read from the directory so
+    /// that a new example is loaded without a change to a test
+    fn example_config_paths() -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = fs::read_dir(repo_file("docs/examples"))
+            .expect("the repository has a docs/examples directory")
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+            .collect();
+
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn every_example_config_loads() {
+        let paths = example_config_paths();
+
+        // An empty directory would pass the loop below
+        assert!(!paths.is_empty(), "docs/examples holds no config");
+
+        for path in paths {
+            if let Err(e) = load_config(&path) {
+                panic!("{}", e);
+            }
+        }
+    }
+
     #[test]
     fn sample_config_loads() {
-        let config = parse(include_str!("../config.sample.toml")).unwrap();
+        let config = load_config(&repo_file("config.sample.toml")).unwrap();
 
         assert_eq!(config.zones.len(), 1);
         assert_eq!(config.zones[0].fan_list, [FanConfig::Supermicro { zone: 0 }, FanConfig::Supermicro { zone: 1 }]);
@@ -1136,12 +1234,8 @@ mod tests {
     }
 
     #[test]
-    fn readme_nvidia_fan_example_loads() {
-        let blocks = readme_toml_blocks();
-        let block = blocks.iter()
-            .find(|b| b.contains(r#"fans = [{ type = "nvidia""#))
-            .expect("the README has a TOML example of an nvidia fan");
-        let config = parse(block).unwrap();
+    fn nvidia_example_fan_loads() {
+        let config = example("nvidia");
 
         assert_eq!(config.zones[0].fan_list, [FanConfig::Nvidia { gpu: "00000000:01:00.0".into(), fan: 0 }]);
     }
@@ -1160,23 +1254,32 @@ mod tests {
         assert!(sources[..sources.len() - 1].iter().all(|s| s.smoothing_samples == 1));
     }
 
-    /// Every TOML block of the README
-    fn readme_toml_blocks() -> Vec<&'static str> {
+    /// The config of `docs/examples/<name>.toml`
+    fn example(name: &str) -> Config {
+        let path = repo_file(&format!("docs/examples/{}.toml", name));
+
+        load_config(&path).unwrap_or_else(|e| panic!("{}", e))
+    }
+
+    /// Every TOML block of a page, named by its path from the repository root
+    fn page_toml_blocks(page: &str) -> Vec<String> {
         const FENCE: &str = "```toml\n";
 
-        include_str!("../README.md")
-            .split(FENCE)
+        let path = repo_file(page);
+        let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {}", path.display(), e));
+
+        text.split(FENCE)
             .skip(1)
-            .filter_map(|rest| rest.split_once("```").map(|(block, _)| block))
+            .filter_map(|rest| rest.split_once("```").map(|(block, _)| block.to_owned()))
             .collect()
     }
 
     #[test]
-    fn readme_on_failure_example_loads() {
-        let blocks = readme_toml_blocks();
+    fn failure_page_on_failure_example_loads() {
+        let blocks = page_toml_blocks("docs/failure.md");
         let block = blocks.iter()
             .find(|b| b.contains("on_failure"))
-            .expect("the README has a TOML example with on_failure");
+            .expect("the failure page has a TOML example with on_failure");
         let config = parse(block).unwrap();
         let sources = &config.zones[0].sources;
 
@@ -1185,11 +1288,12 @@ mod tests {
     }
 
     #[test]
-    fn readme_curve_example_loads() {
-        let readme = include_str!("../README.md");
-        let start = readme.find("```toml\n").expect("the README has a TOML example") + "```toml\n".len();
-        let end = start + readme[start..].find("```").unwrap();
-        let config = parse(&readme[start..end]).unwrap();
+    fn configuration_page_curve_example_loads() {
+        let blocks = page_toml_blocks("docs/configuration.md");
+        let block = blocks.iter()
+            .find(|b| b.contains("duty_aggregation"))
+            .expect("the configuration page has a TOML example with duty_aggregation");
+        let config = parse(block).unwrap();
         let zone = &config.zones[0];
 
         assert!(zone.sources[0].steps.is_none());
@@ -1199,27 +1303,86 @@ mod tests {
     }
 
     #[test]
-    fn readme_fans_example_loads() {
-        let blocks = readme_toml_blocks();
-        let block = blocks.iter()
-            .find(|b| b.contains("fans = "))
-            .expect("the README has a TOML example with fans");
-        let config = parse(block).unwrap();
+    fn supermicro_example_fans_load() {
+        let config = example("supermicro");
+        // The example gives each IPMI zone a zone of its own
+        let fans: Vec<&FanConfig> = config.zones.iter().flat_map(|zone| &zone.fan_list).collect();
 
-        assert_eq!(config.zones[0].fan_list, [FanConfig::Supermicro { zone: 0 }, FanConfig::Supermicro { zone: 1 }]);
+        assert_eq!(fans, [&FanConfig::Supermicro { zone: 0 }, &FanConfig::Supermicro { zone: 1 }]);
     }
 
     #[test]
-    fn readme_named_curve_example_loads() {
-        let blocks = readme_toml_blocks();
+    fn configuration_page_named_curve_example_loads() {
+        let blocks = page_toml_blocks("docs/configuration.md");
         let block = blocks.iter()
             .find(|b| b.contains("[curves."))
-            .expect("the README has a TOML example with a curves table");
+            .expect("the configuration page has a TOML example with a curves table");
         let config = parse(block).unwrap();
         let named: Vec<_> = config.zones[0].sources.iter().filter(|s| s.curve.is_some()).collect();
 
         assert!(named.len() >= 2, "{:?}", named);
         assert!(named.iter().all(|s| s.steps.is_some() && s.curve_hysteresis.is_some()));
+        assert!(named.iter().all(|s| s.curve.as_deref() == Some("gpu")), "{:?}", named);
+    }
+
+    #[test]
+    fn every_page_toml_block_loads() {
+        for page in ["docs/configuration.md", "docs/failure.md"] {
+            for block in page_toml_blocks(page) {
+                if let Err(e) = parse(&block) {
+                    panic!("{}: {}\n{}", page, e, block);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn supermicro_example_has_ipmi_and_smart_sources() {
+        let config = example("supermicro");
+
+        assert_eq!(config.zones.len(), 2);
+        assert_eq!(source_types(&config.zones[0]), ["ipmi"]);
+        assert_eq!(source_types(&config.zones[1]), ["smart", "smart"]);
+    }
+
+    #[test]
+    fn hwmon_desktop_example_has_hwmon_source_and_fan() {
+        let config = example("hwmon-desktop");
+
+        assert_eq!(config.zones.len(), 1);
+        assert_eq!(source_types(&config.zones[0]), ["hwmon"]);
+        assert_eq!(config.zones[0].fan_list, [FanConfig::Hwmon { chip: "nct6798".into(), pwm: 2 }]);
+    }
+
+    #[test]
+    fn nvidia_example_has_nvidia_source_and_fan() {
+        let config = example("nvidia");
+
+        assert_eq!(config.zones.len(), 1);
+        assert_eq!(source_types(&config.zones[0]), ["nvidia"]);
+        // The zone reads the GPU whose fan it drives
+        assert_eq!(nvidia_source_gpus(&config.zones[0]), ["00000000:01:00.0"]);
+        assert_eq!(config.zones[0].fan_list, [FanConfig::Nvidia { gpu: "00000000:01:00.0".into(), fan: 0 }]);
+    }
+
+    #[test]
+    fn mixed_example_zones_share_one_curve() {
+        let config = example("mixed");
+        let nvidia_fan = FanConfig::Nvidia { gpu: "00000000:01:00.0".into(), fan: 0 };
+
+        assert_eq!(config.zones.len(), 2);
+        assert_eq!(source_types(&config.zones[0]), ["ipmi", "nvidia"]);
+        assert_eq!(config.zones[0].fan_list, [FanConfig::Supermicro { zone: 0 }, FanConfig::Supermicro { zone: 1 }]);
+        assert_eq!(source_types(&config.zones[1]), ["nvidia"]);
+        assert_eq!(config.zones[1].fan_list, [nvidia_fan]);
+        assert_eq!(config.zones[0].curve.as_deref(), Some("gpu"));
+        assert_eq!(config.zones[0].curve, config.zones[1].curve);
+        // Both zones read the GPU whose fan the second zone drives, and
+        // neither stops the daemon when that read fails
+        assert_eq!(nvidia_source_gpus(&config.zones[0]), ["00000000:01:00.0"]);
+        assert_eq!(nvidia_source_gpus(&config.zones[1]), ["00000000:01:00.0"]);
+        assert_eq!(config.zones[0].sources[1].on_failure, OnFailure::Dcycle { dcycle: 80 });
+        assert_eq!(config.zones[1].sources[0].on_failure, OnFailure::Dcycle { dcycle: 100 });
     }
 
     #[test]
@@ -1729,6 +1892,110 @@ mod tests {
         let config = parse(&zone_toml(&[])).unwrap();
 
         assert!(matches!(config.zones[0].duty_aggregation, Aggregation::Maximum));
+    }
+
+    const AGGREGATION_KEYS: [&str; 2] = ["aggregation", "duty_aggregation"];
+
+    /// The parse error of a zone whose `key` is a `maximum` aggregation with
+    /// an unknown key `extra`
+    fn maximum_with_extra_key_error(key: &str) -> String {
+        parse_error(&zone_toml(&[(key, r#"{ type = "maximum", extra = 1 }"#)]))
+    }
+
+    #[test]
+    fn rejects_unknown_key_in_maximum_aggregation() {
+        let message = maximum_with_extra_key_error("aggregation");
+
+        assert!(message.contains("unknown field `extra`"), "{}", message);
+    }
+
+    #[test]
+    fn rejects_unknown_key_in_maximum_duty_aggregation() {
+        let message = maximum_with_extra_key_error("duty_aggregation");
+
+        assert!(message.contains("unknown field `extra`"), "{}", message);
+    }
+
+    #[test]
+    fn rejects_unknown_key_in_average_aggregation() {
+        for key in AGGREGATION_KEYS {
+            let message = parse_error(&zone_toml(&[(key, r#"{ type = "average", extra = 1 }"#)]));
+
+            assert!(message.contains("unknown field `extra`"), "{}: {}", key, message);
+        }
+    }
+
+    #[test]
+    fn maximum_aggregation_loads_as_a_table_and_as_an_array() {
+        for key in AGGREGATION_KEYS {
+            for value in [r#"{ type = "maximum" }"#, r#"["maximum"]"#] {
+                let config = parse(&zone_toml(&[(key, value)])).unwrap();
+                let zone = &config.zones[0];
+
+                assert!(matches!(zone.aggregation, Aggregation::Maximum), "{} = {}", key, value);
+                assert!(matches!(zone.duty_aggregation, Aggregation::Maximum), "{} = {}", key, value);
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_maximum_aggregation_array_with_a_value() {
+        for key in AGGREGATION_KEYS {
+            let message = parse_error(&zone_toml(&[(key, r#"["maximum", 3]"#)]));
+
+            assert!(message.contains("invalid length 1, expected 0 elements in sequence"), "{}: {}", key, message);
+        }
+    }
+
+    #[test]
+    fn average_aggregation_loads_as_an_array() {
+        let config = parse(&zone_toml(&[("aggregation", r#"["average", 3]"#)])).unwrap();
+
+        assert!(matches!(config.zones[0].aggregation, Aggregation::Average { top: Some(3) }));
+    }
+
+    #[test]
+    fn rejects_aggregation_as_a_string() {
+        let message = parse_error(&zone_toml(&[("aggregation", r#""maximum""#)]));
+
+        assert!(message.contains("invalid type: string \"maximum\", expected internally tagged enum Aggregation"),
+            "{}", message);
+    }
+
+    /// A config whose zone uses the default session, written as `session`
+    fn default_session_toml(session: &str) -> String {
+        format!("{}\n[sessions]\ndefault = {}\n", zone_toml(&[]), session)
+    }
+
+    #[test]
+    fn rejects_unknown_key_in_local_session() {
+        let message = parse_error(&default_session_toml(r#"{ type = "local", extra = 1 }"#));
+
+        assert!(message.contains("unknown field `extra`"), "{}", message);
+    }
+
+    #[test]
+    fn rejects_unknown_key_in_remote_session() {
+        let session = r#"{ type = "remote", hostname = "bmc.lan", username = "admin", password = "secret", extra = 1 }"#;
+        let message = parse_error(&default_session_toml(session));
+
+        assert!(message.contains("unknown field `extra`"), "{}", message);
+    }
+
+    #[test]
+    fn local_session_loads_as_a_table_and_as_an_empty_array() {
+        for session in [r#"{ type = "local" }"#, "[]"] {
+            let config = parse(&default_session_toml(session)).unwrap();
+
+            assert!(matches!(config.sessions.0["default"].0, SessionType::Local), "{}", session);
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_session_type() {
+        let message = parse_error(&default_session_toml(r#"{ type = "serial" }"#));
+
+        assert!(message.contains("unknown variant `serial`, expected `local` or `remote`"), "{}", message);
     }
 
     #[test]
@@ -2289,6 +2556,16 @@ mod tests {
         assert!(matches!(zone.duty_aggregation, Aggregation::Maximum));
         assert_eq!(zone.hysteresis, 0);
         assert!(zone.curve.is_none());
+    }
+
+    /// nix/module.nix reads the fans of a zone written as a list at index 11.
+    /// load_config rejects such a zone, so this reads it without validation.
+    #[test]
+    fn fans_is_element_eleven_of_a_positional_zone() {
+        let contents = r#"zones = [["default", 1, 2, 500, [0], [{ type = "file", path = "/dev/null" }], { type = "maximum" }, [{ temp = 40, dcycle = 70 }], { type = "maximum" }, 0, "gpu", [{ type = "nvidia", gpu = "00000000:01:00.0", fan = 0 }]]]"#;
+        let config: Config = toml::from_str(contents).unwrap();
+
+        assert_eq!(config.zones[0].fans, Some(vec![FanConfig::Nvidia { gpu: "00000000:01:00.0".to_owned(), fan: 0 }]));
     }
 
     #[test]

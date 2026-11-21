@@ -37,14 +37,20 @@ termination owner.
   reports each change as a `Transition`, which the zone loop logs.
 - `src/main.rs`: `zone_loop` returns the first error that `on_failure` does
   not absorb, `run` aborts the other loops through a `JoinSet`, and
-  `main` exits 1 after `MainApp` drops. `FanGuard::drop` in `src/fan.rs` and
+  `RunResults` keeps the first error of any loop as the result, also one
+  that comes after a signal, and hands every error, the first included,
+  back to `run` to be logged as it arrives.
+  `finish`, which `main_wrapper` calls, drops `MainApp` before
+  `exit_result`, and `main` exits 1 on an error. `FanGuard::drop` in `src/fan.rs` and
   `IpmiSession::drop` in `src/session.rs` are the cleanup. The first
   releases each of its fans (a hwmon fan writes 255, then restores a saved
   automatic mode; an NVIDIA fan asks for the default policy, then falls
   back to its maximum). It logs each failed or panicking release and records
   it in `ReleaseFailures`, and `exit_result` then turns a clean run into
   `FansNotReleased`. The second sets every Supermicro zone to 100% and
-  restores the fan mode. It logs its own errors and does not record them.
+  restores the fan mode. It logs its own errors and records a failed write
+  of 100% and a failed restore of the fan mode in `RestoreFailures`, which
+  `exit_result` turns into `SessionsNotRestored`.
 - A failure that ends in a lower or unchanged fan duty with no log line is
   the disguised success that matters most here.
 

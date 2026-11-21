@@ -1,0 +1,73 @@
+# coolerd example: a Supermicro server with an NVIDIA GPU.
+#
+# One zone drives the chassis fans through the board, and one zone drives the
+# GPU's own fan through NVML. Both zones name the curve `gpu`, so one list of
+# steps maps the GPU temperature for the chassis fans and for the GPU fan.
+# Each zone reads the GPU on its own. coolerd must
+# run as root to set a GPU fan speed. Copy this file, change each value under
+# a REPLACE comment, and start coolerd with `coolerd --config <file>`.
+#
+# Every key is described in docs/configuration.md. What coolerd does when a
+# source fails, and what the fans get when it stops, is in docs/failure.md.
+
+log_level = "info"
+
+# REPLACE: the curve for your GPU. Below 50 °C the fans run at 30%, above
+# 85 °C at 100%, and in between on a straight line. Each zone that names the
+# curve slows its fans only after its temperature has fallen by 3 °C.
+[curves.gpu]
+steps = [
+  { temp = 50, dcycle = 30 },
+  { temp = 85, dcycle = 100 },
+]
+hysteresis = 3
+
+# The chassis fans. On most Supermicro boards, IPMI zone 0 holds the fan
+# headers FAN1, FAN2 and so on, and zone 1 the headers FANA, FANB and so on.
+# Check the manual of your board.
+[[zones]]
+fans = [
+  { type = "supermicro", zone = 0 },
+  { type = "supermicro", zone = 1 },
+]
+
+# Seconds that the zone waits after each update. Each update runs
+# nvidia-smi.
+interval = 2
+
+sources = [
+  # REPLACE: the name of a temperature sensor of your board, as
+  # `ipmi-sensors --sensor-types=Temperature` prints it, and the curve for
+  # your CPU. This source has its own steps, so it does not use the curve
+  # `gpu`.
+  { type = "ipmi", sensor = "CPU Temp", steps = [{ temp = 40, dcycle = 30 }, { temp = 75, dcycle = 100 }] },
+
+  # REPLACE: the PCI bus id of your GPU. To list the bus ids, run
+  # `nvidia-smi --query-gpu=pci.bus_id --format=csv`. This source has no steps
+  # of its own, so the zone's curve, `gpu`, maps it.
+  #
+  # When this zone cannot read the GPU temperature, the chassis fans run at
+  # 80% or more until it reads again.
+  { type = "nvidia", gpu = "00000000:01:00.0", on_failure = { type = "dcycle", dcycle = 80 } },
+]
+
+# The zone runs at the higher of the two duty cycles, the CPU's and the GPU's.
+curve = "gpu"
+
+# The GPU's own fan.
+[[zones]]
+fans = [
+  # REPLACE: the same PCI bus id. `fan` starts at 0. A GPU with two fan
+  # controllers needs a second line with `fan = 1`.
+  { type = "nvidia", gpu = "00000000:01:00.0", fan = 0 },
+]
+interval = 2
+
+sources = [
+  # REPLACE: the same PCI bus id. When this zone cannot read the GPU
+  # temperature, the GPU fan runs at its maximum until it reads again, and
+  # coolerd keeps running. Without `on_failure`, coolerd would stop here, and
+  # the 80% of the chassis fans above would never apply for long.
+  { type = "nvidia", gpu = "00000000:01:00.0", on_failure = { type = "dcycle", dcycle = 100 } },
+]
+curve = "gpu"

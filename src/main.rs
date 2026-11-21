@@ -37,7 +37,7 @@ use {
     freeipmi::SensorReading,
     hwmon::HwmonRoot,
     nvml::{Nvml, RealNvml},
-    session::IpmiSession,
+    session::{IpmiSession, RestoreFailures, RestoreOutcome},
     source::{read_zone_sources, ZoneReaders},
 };
 
@@ -115,15 +115,18 @@ struct MainApp {
     nvml: Arc<dyn Nvml>,
     /// The failed releases of every zone's fans
     release_failures: ReleaseFailures,
+    /// The failed writes of 100% and fan-mode restores of every session
+    restore_failures: RestoreFailures,
 }
 
 impl MainApp {
     fn new(config: Config) -> Result<Self> {
         let mut sessions = HashMap::new();
+        let restore_failures = RestoreFailures::default();
 
         for (name, restore_zones) in sessions_to_open(&config) {
             let st = &config.sessions.0[&name].0;
-            let session = IpmiSession::new(&name, st, restore_zones)?;
+            let session = IpmiSession::new(&name, st, restore_zones, restore_failures.clone())?;
 
             sessions.insert(name, Arc::new(session));
         }
@@ -133,6 +136,7 @@ impl MainApp {
             sessions,
             nvml: Arc::new(RealNvml::new()),
             release_failures: ReleaseFailures::default(),
+            restore_failures,
         })
     }
 
@@ -152,7 +156,7 @@ impl MainApp {
             ));
         }
 
-        let mut first_result = None;
+        let mut results = RunResults::default();
 
         loop {
             let ret: Result<()> = tokio::select! {
@@ -180,8 +184,8 @@ impl MainApp {
                 }
             };
 
-            if first_result.is_none() {
-                first_result = Some(ret);
+            if let Some(line) = results.add(ret) {
+                error!("{}", line);
             }
 
             // If tokio::select returned, then a loop exited or the program was
@@ -194,7 +198,7 @@ impl MainApp {
             loops.abort_all();
         }
 
-        first_result.unwrap_or(Ok(()))
+        results.into_result()
     }
 
     /// Main loop for a zone. The loop runs forever while the future is being
@@ -289,12 +293,47 @@ impl MainApp {
     }
 }
 
+/// The results of the zone loops and of the signals, as `run` receives them.
+/// The first error is the result of the run; a signal or a cancelled loop
+/// adds none, so an error that a zone returns after a signal still counts.
+#[derive(Debug, Default)]
+struct RunResults {
+    first_error: Option<Error>,
+}
+
+impl RunResults {
+    /// Add one result. Returns the log line of every error, the kept one
+    /// included, so that an error reaches the log as soon as `run` receives
+    /// it and not only when the process exits.
+    fn add(&mut self, result: Result<()>) -> Option<String> {
+        let Err(e) = result else {
+            return None;
+        };
+
+        let line = format!("Zone error: {}", e);
+
+        if self.first_error.is_none() {
+            self.first_error = Some(e);
+        }
+
+        Some(line)
+    }
+
+    /// The result of the run
+    fn into_result(self) -> Result<()> {
+        self.first_error.map_or(Ok(()), Err)
+    }
+}
+
 /// The result of the process: an error from the zone loops is kept, and a
-/// clean run becomes an error when a fan failed to release
-fn exit_result(run: Result<()>, releases: ReleaseOutcome) -> Result<()> {
-    match (run, releases) {
-        (Ok(()), ReleaseOutcome::SomeFailed) => Err(Error::FansNotReleased),
-        (run, _) => run,
+/// clean run becomes an error when a fan failed to release or a session
+/// failed to set a zone to 100% or to restore its fan mode
+fn exit_result(run: Result<()>, releases: ReleaseOutcome, restores: RestoreOutcome) -> Result<()> {
+    match (run, releases, restores) {
+        (Err(e), _, _) => Err(e),
+        (Ok(()), ReleaseOutcome::SomeFailed, _) => Err(Error::FansNotReleased),
+        (Ok(()), ReleaseOutcome::AllReleased, RestoreOutcome::SomeFailed) => Err(Error::SessionsNotRestored),
+        (Ok(()), ReleaseOutcome::AllReleased, RestoreOutcome::AllRestored) => Ok(()),
     }
 }
 
@@ -390,8 +429,21 @@ async fn main_wrapper() -> Result<()> {
     let (mut signals, mut app) = start_up(Signals::listen, || MainApp::new(config))?;
     let run = app.run(&mut signals).await;
 
-    // Every zone task has ended, so every guard has released its fans
-    exit_result(run, app.release_failures.outcome())
+    finish(run, app)
+}
+
+/// Drop `app` once its run has ended, then decide the result of the process
+fn finish(run: Result<()>, app: MainApp) -> Result<()> {
+    let releases = app.release_failures.clone();
+    let restores = app.restore_failures.clone();
+
+    // Every zone task has ended, so every guard has released its fans. The app
+    // holds the last handle of each session, so this drop sets each session's
+    // zones to 100% and restores its fan mode before the exit status is
+    // decided.
+    drop(app);
+
+    exit_result(run, releases.outcome(), restores.outcome())
 }
 
 #[tokio::main]
@@ -414,23 +466,41 @@ mod tests {
     use {
         std::{
             cell::{Cell, RefCell},
+            collections::HashMap,
+            fs,
             io,
-            path::Path,
+            path::{Path, PathBuf},
             process,
+            sync::Arc,
             time::Duration,
         },
         clap::CommandFactory,
         tokio::time::timeout,
-        super::{exit_result, Opt, query_sensors, sessions_to_open, Signals, start_up},
+        super::{exit_result, finish, MainApp, Opt, query_sensors, RunResults, sessions_to_open, Signals, start_up},
         crate::{
-            config::{Config, FanConfig, parse_config},
+            config::{Config, FanConfig, load_config, parse_config},
             error::Error,
-            fan::ReleaseOutcome,
+            fan::{ReleaseFailures, ReleaseOutcome},
+            ipmi::FanMode,
+            nvml::fake::FakeNvml,
+            session::{
+                fake::{BoardLog, FakeBoard, PortCall},
+                IpmiSession,
+                RestoreFailures,
+                RestoreOutcome,
+            },
         },
     };
 
     fn parse(contents: &str) -> Config {
         parse_config(contents, Path::new("/etc/coolerd.toml")).unwrap()
+    }
+
+    /// The config of `docs/examples/<name>.toml`
+    fn example(name: &str) -> Config {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("docs/examples/{}.toml", name));
+
+        load_config(&path).unwrap_or_else(|e| panic!("{}", e))
     }
 
     /// `sessions_to_open` sorted by session name, because sessions are a map
@@ -491,17 +561,166 @@ mod tests {
     }
 
     #[test]
-    fn readme_hwmon_zone_opens_no_session() {
-        let readme = include_str!("../README.md");
-        let block = readme.split("```toml\n")
-            .skip(1)
-            .filter_map(|rest| rest.split_once("```").map(|(block, _)| block))
-            .find(|b| b.contains("type = \"hwmon\"") && !b.contains("supermicro"))
-            .expect("the README has a TOML example of a hwmon zone");
-        let config = parse(block);
+    fn hwmon_desktop_example_opens_no_session() {
+        let config = example("hwmon-desktop");
 
         assert_eq!(config.zones[0].fan_list, [FanConfig::Hwmon { chip: "nct6798".into(), pwm: 2 }]);
         assert_eq!(sessions_to_open(&config), []);
+    }
+
+    #[test]
+    fn nvidia_example_opens_no_session() {
+        assert_eq!(sessions_to_open(&example("nvidia")), []);
+    }
+
+    #[test]
+    fn supermicro_example_opens_the_default_session() {
+        assert_eq!(sessions_to_open(&example("supermicro")), [("default".to_owned(), vec![0, 1])]);
+    }
+
+    #[test]
+    fn mixed_example_opens_the_default_session() {
+        assert_eq!(sessions_to_open(&example("mixed")), [("default".to_owned(), vec![0, 1])]);
+    }
+
+    const UPSTREAM_URL: &str = "https://github.com/chenxiaolong/ipmi-fan-control";
+    const README_MAX_LINES: usize = 150;
+
+    /// The targets of the inline markdown links of `text` that name a file:
+    /// links inside fenced code and links to a URL or to a fragment of the
+    /// same page are left out, and a fragment after a file is cut off
+    fn file_link_targets(text: &str) -> Vec<String> {
+        let mut targets = Vec::new();
+        let mut in_fence = false;
+
+        for line in text.lines() {
+            if line.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+                continue;
+            }
+            if in_fence {
+                continue;
+            }
+
+            for rest in line.split("](").skip(1) {
+                let Some((target, _)) = rest.split_once(')') else {
+                    continue;
+                };
+                let file = target.split('#').next().unwrap_or_default();
+
+                if file.is_empty() || file.contains("://") || file.starts_with("mailto:") {
+                    continue;
+                }
+
+                targets.push(file.to_owned());
+            }
+        }
+
+        targets
+    }
+
+    /// `README.md` and every `docs/*.md` page, each with its path from the
+    /// repository root
+    fn documentation_pages() -> Vec<PathBuf> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut pages: Vec<PathBuf> = fs::read_dir(root.join("docs"))
+            .expect("the repository has a docs directory")
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+            .map(|path| path.strip_prefix(root).unwrap().to_owned())
+            .collect();
+
+        pages.sort();
+        pages.insert(0, PathBuf::from("README.md"));
+        pages
+    }
+
+    /// Every file of `docs/examples`, each with its path from the repository
+    /// root
+    fn example_files() -> Vec<PathBuf> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files: Vec<PathBuf> = fs::read_dir(root.join("docs/examples"))
+            .expect("the repository has a docs/examples directory")
+            .map(|entry| entry.unwrap().path())
+            .map(|path| path.strip_prefix(root).unwrap().to_owned())
+            .collect();
+
+        files.sort();
+        files
+    }
+
+    fn read_repo_file(relative: &Path) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {}", path.display(), e))
+    }
+
+    #[test]
+    fn file_link_targets_skips_code_urls_and_fragments() {
+        let text = concat!(
+            "See [the keys](docs/configuration.md#zones) and [upstream](https://example.com/a).\n",
+            "```sh\n",
+            "echo [not a link](missing.md)\n",
+            "```\n",
+            "Back to [the top](#top), then [one](a.md) and [two](../b.toml).\n",
+        );
+
+        assert_eq!(file_link_targets(text), ["docs/configuration.md", "a.md", "../b.toml"]);
+    }
+
+    #[test]
+    fn documentation_links_name_existing_files() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut missing = Vec::new();
+
+        for page in documentation_pages() {
+            let directory = root.join(&page).parent().unwrap().to_owned();
+
+            for target in file_link_targets(&read_repo_file(&page)) {
+                if !directory.join(&target).exists() {
+                    missing.push(format!("{}: {}", page.display(), target));
+                }
+            }
+        }
+
+        assert_eq!(missing, Vec::<String>::new(), "links to files that do not exist");
+    }
+
+    #[test]
+    fn readme_links_every_page_and_example() {
+        let pages = documentation_pages();
+        let targets = file_link_targets(&read_repo_file(Path::new("README.md")));
+        let mut wanted: Vec<String> = pages[1..].iter().map(|page| page.display().to_string()).collect();
+
+        let examples = example_files();
+
+        wanted.extend(examples.iter().map(|file| file.display().to_string()));
+
+        // A README with no page to link would pass on an empty docs directory
+        assert!(pages.len() > 1, "docs holds no page");
+        assert!(!examples.is_empty(), "docs/examples holds no file");
+
+        let unlinked: Vec<&String> = wanted.iter().filter(|page| !targets.contains(page)).collect();
+
+        assert_eq!(unlinked, Vec::<&String>::new(), "README.md does not link these files");
+    }
+
+    #[test]
+    fn every_example_config_has_a_recipe() {
+        let files = example_files();
+        let lone: Vec<&PathBuf> = files.iter()
+            .filter(|file| !files.contains(&file.with_extension("toml")) || !files.contains(&file.with_extension("nix")))
+            .collect();
+
+        assert_eq!(lone, Vec::<&PathBuf>::new(), "an example is a .toml file and a .nix file of one name");
+    }
+
+    #[test]
+    fn readme_is_a_short_entry_page_that_credits_upstream() {
+        let readme = read_repo_file(Path::new("README.md"));
+
+        assert!(readme.lines().count() <= README_MAX_LINES, "README.md has {} lines", readme.lines().count());
+        assert!(readme.contains(UPSTREAM_URL));
     }
 
     #[test]
@@ -581,25 +800,170 @@ mod tests {
 
     #[test]
     fn clean_run_with_a_failed_release_is_an_error() {
-        let result = exit_result(Ok(()), ReleaseOutcome::SomeFailed);
+        let result = exit_result(Ok(()), ReleaseOutcome::SomeFailed, RestoreOutcome::AllRestored);
 
         assert!(matches!(result, Err(Error::FansNotReleased)), "{:?}", result);
     }
 
     #[test]
     fn clean_run_with_every_fan_released_succeeds() {
-        let result = exit_result(Ok(()), ReleaseOutcome::AllReleased);
+        let result = exit_result(Ok(()), ReleaseOutcome::AllReleased, RestoreOutcome::AllRestored);
 
         assert!(result.is_ok(), "{:?}", result);
     }
 
     #[test]
-    fn run_error_is_kept_whatever_the_releases_did() {
+    fn run_error_is_kept_whatever_the_releases_and_restores_did() {
         for releases in [ReleaseOutcome::SomeFailed, ReleaseOutcome::AllReleased] {
-            let result = exit_result(Err(Error::SensorsWithoutSession), releases);
+            for restores in [RestoreOutcome::SomeFailed, RestoreOutcome::AllRestored] {
+                let result = exit_result(Err(Error::SensorsWithoutSession), releases, restores);
 
-            assert!(matches!(result, Err(Error::SensorsWithoutSession)), "{:?}", result);
+                assert!(matches!(result, Err(Error::SensorsWithoutSession)), "{:?}", result);
+            }
         }
+    }
+
+    #[test]
+    fn clean_run_with_a_failed_restore_is_an_error() {
+        let result = exit_result(Ok(()), ReleaseOutcome::AllReleased, RestoreOutcome::SomeFailed);
+
+        assert!(matches!(result, Err(Error::SessionsNotRestored)), "{:?}", result);
+    }
+
+    /// A signal can cancel a zone task before its fan guard exists, so the
+    /// session's drop then makes the only write of 100% to the zone
+    #[test]
+    fn failed_full_duty_write_without_a_fan_guard_fails_the_exit() {
+        let calls = BoardLog::default();
+        let board = FakeBoard {
+            failing: Some(PortCall::SetDutyCycle(0, 100)),
+            ..FakeBoard::new(FanMode::Full, &calls)
+        };
+        let failures = RestoreFailures::default();
+        let session = IpmiSession::with_port("test", Box::new(board), [0], failures.clone()).unwrap();
+
+        drop(session);
+
+        assert_eq!(failures.outcome(), RestoreOutcome::SomeFailed);
+
+        let result = exit_result(Ok(()), ReleaseOutcome::AllReleased, failures.outcome());
+
+        assert!(matches!(result, Err(Error::SessionsNotRestored)), "{:?}", result);
+    }
+
+    /// An app whose one session runs over `board`, after a run that ended
+    /// with no error
+    fn app_over(board: FakeBoard) -> MainApp {
+        let restore_failures = RestoreFailures::default();
+        let session = IpmiSession::with_port("default", Box::new(board), [0], restore_failures.clone()).unwrap();
+
+        MainApp {
+            config: parse(concat!(
+                "[[zones]]\n",
+                "fans = [{ type = \"supermicro\", zone = 0 }]\n",
+                "sources = [{ type = \"ipmi\", sensor = \"CPU Temp\" }]\n",
+                "steps = [{ temp = 40, dcycle = 40 }]\n",
+            )),
+            sessions: HashMap::from([("default".to_owned(), Arc::new(session))]),
+            nvml: Arc::new(FakeNvml::default()),
+            release_failures: ReleaseFailures::default(),
+            restore_failures,
+        }
+    }
+
+    #[test]
+    fn finish_fails_on_a_mode_restore_that_fails_as_the_app_drops() {
+        let calls = BoardLog::default();
+        let board = FakeBoard {
+            failing: Some(PortCall::SetFanMode(FanMode::Standard)),
+            ..FakeBoard::new(FanMode::Standard, &calls)
+        };
+
+        let result = finish(Ok(()), app_over(board));
+
+        assert!(calls.lock().unwrap().ends_with(&[PortCall::SetDutyCycle(0, 100), PortCall::SetFanMode(FanMode::Standard)]));
+        assert!(matches!(result, Err(Error::SessionsNotRestored)), "{:?}", result);
+    }
+
+    #[test]
+    fn finish_fails_on_a_full_duty_write_that_fails_as_the_app_drops() {
+        let calls = BoardLog::default();
+        let board = FakeBoard {
+            failing: Some(PortCall::SetDutyCycle(0, 100)),
+            ..FakeBoard::new(FanMode::Full, &calls)
+        };
+
+        let result = finish(Ok(()), app_over(board));
+
+        assert!(calls.lock().unwrap().ends_with(&[PortCall::SetDutyCycle(0, 100)]));
+        assert!(matches!(result, Err(Error::SessionsNotRestored)), "{:?}", result);
+    }
+
+    #[test]
+    fn finish_succeeds_when_the_app_drops_cleanly() {
+        let calls = BoardLog::default();
+        let result = finish(Ok(()), app_over(FakeBoard::new(FanMode::Standard, &calls)));
+
+        assert!(result.is_ok(), "{:?}", result);
+    }
+
+    #[test]
+    fn failed_release_is_reported_over_a_failed_restore() {
+        let result = exit_result(Ok(()), ReleaseOutcome::SomeFailed, RestoreOutcome::SomeFailed);
+
+        assert!(matches!(result, Err(Error::FansNotReleased)), "{:?}", result);
+    }
+
+    /// The exit result of a run that received `results` in order, with every
+    /// fan released and every fan mode restored
+    fn exit_after(results: Vec<super::Result<()>>) -> super::Result<()> {
+        let mut run = RunResults::default();
+
+        for result in results {
+            let failed = result.is_err();
+
+            assert_eq!(run.add(result).is_some(), failed, "only an error is handed back to be logged");
+        }
+
+        exit_result(run.into_result(), ReleaseOutcome::AllReleased, RestoreOutcome::AllRestored)
+    }
+
+    #[test]
+    fn zone_error_after_a_signal_fails_the_exit() {
+        // The signal, then a zone that fails as it finishes its update
+        let result = exit_after(vec![Ok(()), Err(Error::SensorsWithoutSession)]);
+
+        assert!(matches!(result, Err(Error::SensorsWithoutSession)), "{:?}", result);
+    }
+
+    #[test]
+    fn signal_stop_without_an_error_succeeds() {
+        // The signal, then two cancelled zone loops
+        let result = exit_after(vec![Ok(()), Ok(()), Ok(())]);
+
+        assert!(result.is_ok(), "{:?}", result);
+    }
+
+    #[test]
+    fn zone_error_before_a_signal_fails_the_exit() {
+        let result = exit_after(vec![Err(Error::SensorsWithoutSession), Ok(())]);
+
+        assert!(matches!(result, Err(Error::SensorsWithoutSession)), "{:?}", result);
+    }
+
+    #[test]
+    fn every_zone_error_is_handed_back_to_be_logged() {
+        let mut run = RunResults::default();
+
+        let first = run.add(Err(Error::SensorsWithoutSession));
+        let later = run.add(Err(Error::FansNotReleased));
+
+        assert_eq!(first, Some(format!("Zone error: {}", Error::SensorsWithoutSession)));
+        assert_eq!(later, Some(format!("Zone error: {}", Error::FansNotReleased)));
+
+        let result = run.into_result();
+
+        assert!(matches!(result, Err(Error::SensorsWithoutSession)), "{:?}", result);
     }
 
     #[test]

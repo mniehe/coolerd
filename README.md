@@ -1,317 +1,94 @@
 coolerd
 =======
 
-coolerd is a Linux fan control daemon. It reads temperatures from sources, maps them through curves that sources and zones can share, and drives fans through backends. The sources are IPMI sensors, files, hwmon chips, `smartctl`, `hdparm` and `nvidia-smi`. The fan backends are Supermicro boards over IPMI, hwmon PWM channels and NVIDIA GPU fans through NVML.
+coolerd is a fan control daemon for Linux. It reads temperatures from sources, maps them through curves to a duty cycle, and sets fans to that duty cycle. One config file describes the sources, the curves and the fans of a machine.
 
-_Note_: Only Linux is supported.
+```mermaid
+flowchart LR
+    S[temperature sources] --> C[curves] --> F[fans]
+```
+
+coolerd runs on Linux only.
 
 Origin
 ------
 
 coolerd is a fork of [chenxiaolong/ipmi-fan-control](https://github.com/chenxiaolong/ipmi-fan-control), which Andrew Gunnerson wrote and has since archived. The Supermicro IPMI backend, which sets the fan duty cycle with Supermicro OEM raw commands through libfreeipmi, is that project's work. coolerd keeps its licence, the GNU GPL version 3 or later, and the `authors` field of `Cargo.toml` still names Andrew Gunnerson.
 
-The upstream project was tested mainly on a 6028U-TR4T+, which uses the X10DRU-i+ motherboard. Its author reported that the fan control IPMI commands did not change across five generations of Supermicro motherboards.
+The upstream project was tested mainly on a 6028U-TR4T+, which uses the X10DRU-i+ motherboard. Its author reported that the fan control IPMI commands did not change across five generations of Supermicro motherboards. This is a record of what was tested. It does not promise that coolerd works on your board.
+
+If you come from ipmi-fan-control, read [Migrating from ipmi-fan-control](docs/nixos.md#migrating-from-ipmi-fan-control). The format of the config file is unchanged.
+
+What coolerd supports
+---------------------
+
+| Temperature source | Read through |
+|---|---|
+| `ipmi` | A temperature sensor of a board, over IPMI |
+| `hwmon` | A hwmon chip under `/sys/class/hwmon`, found by its name |
+| `file` | A file that holds millidegrees Celsius |
+| `smart` | A drive, with `smartctl` |
+| `hdparm` | A drive, with `hdparm -H` |
+| `nvidia` | An NVIDIA GPU, with `nvidia-smi` |
+
+| Fan | Driven through |
+|---|---|
+| `supermicro` | A fan zone of a Supermicro board, over IPMI |
+| `hwmon` | A PWM channel of a hwmon chip |
+| `nvidia` | A fan of an NVIDIA GPU, through the driver's NVML library |
+
+Any source can drive any fan, with one exception: an `ipmi` source needs a `supermicro` fan in the same zone. Sources and zones can share a curve.
 
 Installation
 ------------
 
-coolerd has no prebuilt packages. This repository is a Nix flake. Its `packages.default` output builds the program:
+coolerd has no prebuilt packages. This repository is a Nix flake, and its `packages.default` output builds the program:
 
 ```sh
-nix build .#default
+nix build github:mniehe/ipmi-fan-control
+sudo ./result/bin/coolerd --config config.toml
 ```
 
-The program is then `result/bin/coolerd`. To run it as a service on NixOS, add this repository as a flake input and use the module described under [NixOS](#nixos). On another system, build it from source as the next section describes.
+On NixOS, run coolerd as a service with the module of this flake. [NixOS](docs/nixos.md) shows how to add it to a host and describes every option.
 
-Building
---------
+On another system, build coolerd with `cargo build --release`. [Configuration](docs/configuration.md#building-from-source) lists what the build needs.
 
-This project depends on:
+Quick start
+-----------
 
-* the freeipmi suite of libraries (specifically, libfreeipmi and libipmimonitoring)
-* `pkg-config`
-* the Clang compiler (for generating Rust FFI bindings to the freeipmi libraries)
-* the Rust compiler
-* [optional] smartmontools (for querying HDD/SSD drive temperatures)
-* [optional] hdparm (for querying Hitachi/HGST/WD drive temperatures while spun down)
-* [optional] nvidia-smi from the NVIDIA driver (for querying NVIDIA GPU temperatures). The `nvidia` source selects the card by PCI bus id or UUID; see [`config.sample.toml`](config.sample.toml). On NixOS, supply it through `extraPackages` as shown under [NixOS](#nixos).
-* [optional] `libnvidia-ml.so.1` from the NVIDIA driver (for driving NVIDIA GPU fans). The program loads it at run time and does not need it to build; see [NVIDIA fans](#nvidia-fans).
+1. Pick the example for your machine and copy it.
 
-These packages can be installed from the system package manager:
+   | Machine | Config | NixOS recipe |
+   |---|---|---|
+   | Supermicro server | [`supermicro.toml`](docs/examples/supermicro.toml) | [`supermicro.nix`](docs/examples/supermicro.nix) |
+   | Desktop or server without IPMI | [`hwmon-desktop.toml`](docs/examples/hwmon-desktop.toml) | [`hwmon-desktop.nix`](docs/examples/hwmon-desktop.nix) |
+   | NVIDIA GPU fans | [`nvidia.toml`](docs/examples/nvidia.toml) | [`nvidia.nix`](docs/examples/nvidia.nix) |
+   | Supermicro server with an NVIDIA GPU | [`mixed.toml`](docs/examples/mixed.toml) | [`mixed.nix`](docs/examples/mixed.nix) |
 
-```sh
-# Fedora
-sudo dnf install freeipmi-devel pkgconf-pkg-config clang-devel cargo
-# OpenSUSE
-sudo zypper in freeipmi-devel pkgconf-pkg-config clang-devel cargo
-# Arch Linux
-sudo pacman -S freeipmi pkgconf clang cargo
-# Debian-based distros
-sudo apt install libfreeipmi-dev libipmimonitoring-dev pkg-config libclang-dev cargo
-```
-
-Then, to make a debug build, run:
-
-```sh
-cargo build
-```
-
-or to make a release build, run:
-
-```sh
-cargo build --release
-```
-
-Running
--------
-
-Make a copy of [`config.sample.toml`](config.sample.toml) and update the values to match your hardware. Then, run `coolerd` with:
-
-```sh
-# Debug
-sudo ./target/debug/coolerd --config config.toml
-# Release
-sudo ./target/release/coolerd --config config.toml
-```
-
-Fan curves
-----------
-
-Each zone sets one duty cycle from one or more curves. The sources without their own `steps` are combined by `aggregation` into the zone temperature, which the zone's `steps` map to a duty cycle. A source with its own `steps` skips the zone temperature and maps its reading through its own curve; its `steps` must be non-empty. When every source has its own `steps`, the zone has no temperature: the zone's `steps` and `aggregation` are not used to compute the duty cycle, and the zone's `steps` may be omitted. Both are still validated when given.
-
-The zone then combines the duty cycles of all its curves by `duty_aggregation`. `maximum`, the default, takes the highest duty cycle. `average` takes the mean, rounded up, and counts each curve once, however many sources feed it. The mean can be lower than the highest duty cycle, so the source behind the most demanding curve may run hotter than that curve intends.
-
-An `average` `aggregation` divides by the number of temperatures it used; `top` only caps that number. Earlier versions divided by `top` even when the zone had fewer sources, so a zone whose `top` exceeds its source count now runs its fans faster: readings of 80 °C and 80 °C with `top = 3` give 80 °C, where they gave 53 °C.
-
-`hysteresis` holds each curve's temperature through small falls. A curve follows a rise at once, but follows a fall only once it reaches `hysteresis` degrees. The default is 0, which follows every reading. The zone's `hysteresis` applies only to inline `steps`, the zone's and those of each source; a named curve, described below, has its own.
-
-`smoothing_samples` on a source replaces each reading by the mean of the source's last `smoothing_samples` readings, rounded down, so a short spike moves the fans less. The mean comes first: the zone temperature, the source's own curve and `hysteresis` all see the smoothed reading. The default is 1, which uses each reading as it is, and 0 is rejected. The count is in updates, so the mean covers about `smoothing_samples` times `interval` seconds. When a source fails, its stored readings are dropped, and it starts again from fresh readings. With `smoothing_samples = 3` and steps from 40 °C at 40% to 80 °C at 100%, readings of 40, 70, 40 and 40 °C give 40%, 62%, 55% and 55%, where the same readings without smoothing give 40%, 85%, 40% and 40%.
-
-Smoothing delays the response to real heat; `hysteresis` does not, because it follows every rise at once. The mean holds only the readings stored since the program started or since the source last failed, so the first reading after either acts at once. After that, the cooler readings still in the mean hold back a sustained rise until the `smoothing_samples`-th hot reading pushes out the last of them. The duty cycle can reach its target sooner, because the mean can cross the top step first: with `smoothing_samples = 3` and the steps above, three readings of 70 °C and then one of 100 °C give a mean of 80 °C and 100% at the first hot reading. Use smoothing for a sensor whose readings jump, as some AMD CPU and GPU sensors do, not for a device that heats quickly.
-
-In this example the CPU uses the zone curve and the GPU its own. At CPU 50 °C and GPU 70 °C, the curves give 54% and 60%, and the zone runs at 60% on the first poll. On later polls, `hysteresis` can hold a curve's temperature above its reading, so the duty cycle can be higher than the current readings alone give.
-
-```toml
-[[zones]]
-ipmi_zones = [0]
-sources = [
-  { type = "ipmi", sensor = "CPU Temp" },
-  { type = "nvidia", gpu = "00000000:81:00.0", steps = [{ temp = 60, dcycle = 40 }, { temp = 90, dcycle = 100 }] },
-]
-steps = [{ temp = 45, dcycle = 45 }, { temp = 75, dcycle = 100 }]
-duty_aggregation = { type = "maximum" }
-hysteresis = 3
-```
-
-### Named curves
-
-A curve can be defined once in the top-level `curves` table and named with `curve` by any number of sources and zones, in place of their own `steps`. A source or zone cannot have both `steps` and `curve`, and a name that `curves` does not hold is rejected. Each entry has `steps`, with the rules of a zone's `steps`, and an optional `hysteresis`, which defaults to 0. A named curve uses its own `hysteresis` and never the zone's.
-
-A source or zone that names a curve behaves as if it had the curve's `steps` inline: the rules for its own `steps` apply, so a source cannot name a curve with no steps, and a source that names a curve does not feed the zone temperature. Each source that names a curve maps its own temperature and holds it on its own, so two GPUs on one curve do not share a held temperature.
-
-In this example both GPUs use the curve `gpu`. With both at 60, 72, 70 and 68 °C in turn, the zone runs at 40%, 64%, 64% and 56%: the fall of 2 °C to 70 °C is held, and the fall of 4 °C to 68 °C is followed. The same `steps` inline on each GPU, with the zone's `hysteresis = 3`, give the same duty cycles.
-
-```toml
-[curves.gpu]
-steps = [{ temp = 60, dcycle = 40 }, { temp = 90, dcycle = 100 }]
-hysteresis = 3
-
-[[zones]]
-ipmi_zones = [0]
-sources = [
-  { type = "nvidia", gpu = "00000000:81:00.0", curve = "gpu" },
-  { type = "nvidia", gpu = "00000000:82:00.0", curve = "gpu" },
-]
-```
-
-See [`config.sample.toml`](config.sample.toml) for every key.
-
-When a source fails
--------------------
-
-A zone reads each source once per update. It reads the sources that are not `ipmi` first, in the order of `sources`, and then all `ipmi` sources in one IPMI query, so that the sensor readings are fresh when the zone sets its duty cycle. Each sensor in that query can fail on its own.
-
-A `file` source's path must be a regular file after symlinks are followed, as sysfs and hwmon files are; a FIFO, directory or device fails the source without being read.
-
-A `hwmon` source, `{ type = "hwmon", chip = "k10temp", input = 1 }`, reads `temp1_input` of the chip whose hwmon `name` file holds `k10temp` and rounds the reading up to whole degrees. A reading above 255 °C counts as 255 °C. A reading below 0 °C fails the source, because a chip reports a negative value for an open probe; a real temperature below 0 °C fails the source as well. When the chip has a `temp1_fault` file and it holds a value other than 0, or it cannot be read or parsed, the source fails. It finds the chip by name on every read, never by its `hwmonN` number, which can change between boots. A name that no chip or more than one chip has fails the source.
-
-A source that fails is read again after `retry_delay_ms`, up to `retries` times; a source that read well is not read again. Earlier versions read every source of the zone again when one source failed. All sources of a zone share these retries in each update, so a source that uses them up leaves none for the sources read after it. `retries` bounds the number of waits in an update, not its duration, because each attempt also takes as long as the source needs to answer.
-
-A source that failed in the previous update gets one attempt in each update and no retries, until it reads again. A source that keeps failing therefore leaves the retries to the other sources and adds one attempt to each update.
-
-A program that does not answer in time is stopped: smartctl and hdparm after 30 seconds, nvidia-smi after 5 seconds. Earlier versions waited for smartctl and hdparm without a limit. Only that program is stopped, not the processes it started, so a wrapper script used in place of one of these tools must not leave helper processes behind. A stopped program can fail to exit, as nvidia-smi can in a hung driver. Its source then does not start the program again until the old process is gone, and until then that source fails at once. Each source tracks only its own process, so other sources still run, including sources that run the same program.
-
-When a source still fails after the last retry, its `on_failure` decides what the zone does:
-
-* `{ type = "exit" }`, the default: the program stops. On the way out it sets the fans of every zone to 100% and restores the original fan mode. Earlier versions handled every failure this way.
-* `{ type = "ignore" }`: the zone leaves the source out. Its reading does not enter the zone temperature, and its own curve gives no duty cycle. The other sources keep driving the fans.
-* `{ type = "dcycle", dcycle = N }`: the zone leaves the source out as with `ignore`, and runs at N% or more until the source reads again. The other curves can still raise the fans above N%.
-
-A zone in which no source has a reading runs at 100%, whatever the modes. The program logs one error when a source starts to fail and one message when it reads again. A source that fails in every update is still tried once in every update. While it fails, its curve keeps its last temperature, so `hysteresis` applies from there when it reads again.
-
-`ignore` has a risk: a hot device that cannot be read no longer raises the fans. Use `ignore` only for a source whose heat another source also measures, such as a second sensor on the same CPU. For a device that produces much heat, such as a GPU, use `dcycle` with a duty cycle that keeps the device cool under full load.
-
-In this example the GPU falls back to 80%. With the CPU at 50 °C, a failed GPU runs the zone at 80%, where `ignore` would run it at 54%, the CPU curve's duty cycle. With the CPU at 75 °C, the zone runs at 100% either way.
-
-```toml
-[[zones]]
-ipmi_zones = [0]
-sources = [
-  { type = "ipmi", sensor = "CPU Temp" },
-  { type = "nvidia", gpu = "00000000:81:00.0", steps = [{ temp = 60, dcycle = 40 }, { temp = 90, dcycle = 100 }], on_failure = { type = "dcycle", dcycle = 80 } },
-]
-steps = [{ temp = 45, dcycle = 45 }, { temp = 75, dcycle = 100 }]
-```
-
-Fans
-----
-
-Each zone drives the fans in its `fans` list, all at the zone's duty cycle. A `supermicro` fan is one IPMI fan zone of the board that the zone's `session` reaches.
-
-```toml
-[[zones]]
-fans = [{ type = "supermicro", zone = 0 }, { type = "supermicro", zone = 1 }]
-sources = [{ type = "ipmi", sensor = "CPU Temp" }]
-steps = [{ temp = 40, dcycle = 40 }, { temp = 70, dcycle = 70 }]
-```
-
-`ipmi_zones = [0, 1]` is the older form of the same list and still loads. A zone sets either `fans` or `ipmi_zones`, not both. A number repeated in `ipmi_zones` is driven once, but a fan listed twice in `fans` is rejected.
-
-A fan belongs to one zone. Two zones on one session can no longer name the same IPMI zone: earlier versions loaded such a config, and the zones overwrote each other's duty cycle. The check compares session names, so two session names that reach the same board are not detected. Do not drive one board through two sessions.
-
-On startup the program switches each board it uses to full fan mode. On exit, also after an error, it sets each zone's fans to 100% and then restores the board's original fan mode. If the switch to full fan mode fails, the program does the same before it exits.
-
-A `hwmon` fan, `{ type = "hwmon", chip = "nct6798", pwm = 2 }`, is the PWM channel `pwm2` of the chip whose hwmon `name` file holds `nct6798`. `pwm` starts at 1. Two zones cannot drive the same chip and channel, whatever their sessions. On startup the program finds the chip, saves `pwm2_enable`, switches the channel to manual control and sets `pwm2` to 255, full speed. It scales each duty cycle to 0 to 255, rounding up, and writes `pwm2` only when the value changes. On exit, also after an error, it sets `pwm2` to 255 and then, when the saved `pwm2_enable` is 2 or more, writes it back. Values from 2 up are modes the driver defines; on most chips they are automatic modes, so the firmware or driver takes the fan over again. A saved value of 0 or 1 is not written back, and the channel stays under manual control at 255: 1 means the channel was already manual, and 0 means full speed on most chips but switches the fan off under the kernel's `pwm-fan` driver.
-
-A zone with only `hwmon` fans needs no IPMI device. The program opens an IPMI session only for a zone that has a `supermicro` fan, so an `ipmi` source needs a `supermicro` fan in the same zone, and a config that breaks this rule is rejected. This zone reads a CPU temperature from the `k10temp` chip and drives a case fan on the `nct6798` chip:
-
-```toml
-[[zones]]
-fans = [{ type = "hwmon", chip = "nct6798", pwm = 2 }]
-sources = [{ type = "hwmon", chip = "k10temp", input = 1 }]
-steps = [{ temp = 40, dcycle = 30 }, { temp = 80, dcycle = 100 }]
-```
-
-The program finds the chip by name once, at startup, and keeps the chip's device path. If the chip's driver is unbound and bound again while the program runs, another chip can take that path, and the program then drives that chip. Restart the program after you rebind a hwmon driver.
-
-If the program fails to release a fan on exit, it logs the error and exits with status 1, also when a signal stopped it. Earlier versions exited with status 0 in that case. The program listens for SIGINT and SIGTERM before it opens an IPMI session or takes over a fan, so a signal that arrives during startup stops it through the same exit path. Earlier versions started to listen only after the zones had started.
-
-### NVIDIA fans
-
-An `nvidia` fan, `{ type = "nvidia", gpu = "00000000:01:00.0", fan = 0 }`, is fan 0 of the NVIDIA GPU at PCI bus id `00000000:01:00.0`. `fan` starts at 0. A fan selects its GPU by PCI bus id only; a GPU UUID, which the `nvidia` source accepts, is rejected. The domain may have four or eight hex digits in either case, so `0000:01:00.0` and `00000000:01:00.0` name the same GPU, and two zones cannot drive the same fan of one GPU in either spelling. To list the bus ids, run `nvidia-smi --query-gpu=pci.bus_id --format=csv`.
-
-The program drives the fan through NVML, the management library of the NVIDIA driver. It loads `libnvidia-ml.so.1` at run time, when a zone with an `nvidia` fan starts, because the library must match the driver that the kernel has loaded. A config without an `nvidia` fan never loads it. Setting a GPU fan speed needs root, so the program must run as root.
-
-On startup the program reads the GPU's fan count and the fan's speed limits, and logs the limits. It fails when the fan does not exist or when the limits are not a range within 0 to 100%. It changes nothing at startup. Its first update sets the fan speed, which switches the fan to manual control; later updates set the speed only when it changes. NVML refuses a speed below the fan's minimum, so the program raises a lower duty cycle to the minimum: with a minimum of 30%, a duty cycle of 20% runs the fan at 30%. A duty cycle above the fan's maximum is capped at the maximum. The debug log shows the speed that NVML reports as the fan's speed before each update.
-
-On exit, also after an error, the program gives the fan back to the driver's default fan policy. That policy is the GPU's own fan curve: the driver sets the speed from the GPU temperature again, and it may run the fan slower than the zone did. If that call fails, the program sets the fan to its maximum under manual control instead, and logs a line that starts with `Failed to give fan` and ends with `set it to its maximum of <max>% under manual control`. The fan then stays in manual control at its maximum until the program next starts and exits normally, or until the driver is reloaded. If setting the maximum fails as well, the line ends with `the fan's state is unknown` instead: the fan may keep the last speed that the program set. In both cases the program exits with status 1.
-
-Each NVML call has a time limit of 5 seconds. A call made before the library has loaded gets 30 seconds more for the load, 35 seconds in all. The time a call waits behind other NVML calls counts toward its limit. A call that does not return in time fails, and so does the zone. NVML calls cannot be stopped, so the program makes no further NVML call after that: calls that were waiting are not made, and every later call, including the release of each NVIDIA fan on exit, fails at once and is logged. Restart the program after the driver recovers.
-
-This zone drives fan 0 of a GPU from the GPU's own temperature:
-
-```toml
-[[zones]]
-fans = [{ type = "nvidia", gpu = "00000000:01:00.0", fan = 0 }]
-sources = [{ type = "nvidia", gpu = "00000000:01:00.0" }]
-steps = [{ temp = 50, dcycle = 30 }, { temp = 85, dcycle = 100 }]
-```
-
-On NixOS, set `services.coolerd.enableNvidiaFans = true`. It runs the service as root and puts `/run/opengl-driver/lib` on the service's `LD_LIBRARY_PATH`, where NixOS links the driver's libraries. `/run/opengl-driver/lib` exists only when the host enables its graphics driver packages. The `nvidia` source also needs `nvidia-smi` on the service's `PATH`, through `extraPackages` as shown under [NixOS](#nixos).
-
-#### Checking the fans on a host
-
-`nvidia-smi` cannot show the fan policy, that is, whether the driver or a program sets the speed. So these steps show only the effect. They suit a host with one zone that drives an NVIDIA fan. To make the change easy to see, give the zone a fixed duty cycle for the check, such as `steps = [{ temp = 0, dcycle = 60 }]`.
-
-1. Start the unit with `sudo systemctl start coolerd.service`. Wait for a few updates, then read the speed:
+2. Change each value under a `REPLACE` comment: the sensor names, the chips, the drives and the curves of your machine. For a hwmon fan, first read [Finding hwmon chips and channels](docs/hwmon.md).
+3. Read [Failures and shutdown](docs/failure.md), so that you know what the fans do when a sensor fails and when coolerd stops.
+4. Start coolerd:
 
    ```sh
-   nvidia-smi --query-gpu=fan.speed --format=csv
+   sudo coolerd --config config.toml
    ```
 
-   The speed is the zone's duty cycle, or the fan's minimum when the duty cycle is lower. The unit logs the limits at startup in a line with `speed limits`; read it with `journalctl -u coolerd.service`.
-2. Stop the unit with `sudo systemctl stop coolerd.service`, and read the speed again with the same command. The speed follows the GPU temperature again. If the journal shows a line that starts with `Failed to give fan`, the default policy was not restored. When that line ends with `under manual control`, the fan stays in manual control at its maximum; when it ends with `the fan's state is unknown`, the fan may keep the last speed that the program set, so restart the unit or reload the driver.
+When coolerd starts, it takes over the fans that the config names. A Supermicro board is switched to its full fan mode, and a hwmon channel is switched to manual control at full speed. When coolerd stops, it attempts to set these fans to full speed and to give back the control that it took. A process that is killed gives nothing back.
 
-NixOS
------
+A wrong curve or a wrong fan can overheat hardware. Watch the temperatures after the first start. `log_level = "debug"` logs the temperatures and the duty cycle after each update.
 
-This flake provides a NixOS module, `nixosModules.default`, and an overlay, `overlays.default`, that adds the package. The module's options live under `services.coolerd`. The module uses the package from the overlay, so a host adds both:
+Documentation
+-------------
 
-```nix
-nixpkgs.overlays = [coolerd.overlays.default];
-imports = [coolerd.nixosModules.default];
-services.coolerd.enable = true;
-```
+| Page | What it answers |
+|---|---|
+| [Configuration](docs/configuration.md) | Every config key, its default and its rule. How a zone turns temperatures into a duty cycle. |
+| [Failures and shutdown](docs/failure.md) | What happens when a source cannot be read. What each fan gets when coolerd stops. What coolerd cannot cover. |
+| [Finding hwmon chips and channels](docs/hwmon.md) | How to find the chip name and the PWM channel of a fan. |
+| [NixOS](docs/nixos.md) | The NixOS module, its options, the recipes, and the move from `services.ipmi-fan-control`. |
+| [`config.sample.toml`](config.sample.toml) | Every key in one commented file. |
 
-Here `coolerd` is this repository's flake input. The module puts freeipmi on the service's `PATH`, plus smartmontools and hdparm when `enableSmartMonTools` and `enableHdparm` are set.
+Licence
+-------
 
-A source that runs another program needs that program on the service's `PATH`. Add its package to `extraPackages`. For example, to make `nvidia-smi` available:
-
-```nix
-services.coolerd.extraPackages = [(lib.getBin config.hardware.nvidia.package)];
-```
-
-_Note_: The attribute that holds `nvidia-smi` depends on the host's driver package. `config.hardware.nvidia.package` is the driver that `hardware.nvidia` installs; a host that installs the driver another way must name that package instead.
-
-### hwmon fans and hosts without IPMI
-
-Three options serve a host that drives `hwmon` fans:
-
-* `enableIpmi`, default `true`. When it is set, the module loads the `ipmi_devintf`, `ipmi_si` and `ipmi_msghandler` kernel modules, creates the `ipmi` group, adds the service user to it, and adds a udev rule that gives the group the IPMI device. Set it to `false` on a host with no IPMI device. The module still puts freeipmi on the service's `PATH`.
-* `hwmon.kernelModules`, default `[]`. Kernel modules that the host loads at boot, such as `nct6775` for a Nuvoton Super I/O chip.
-* `hwmon.pwmChannels`, default `{}`. The PWM channels the service may write, as a list of channel numbers for each chip name. A chip name must match `[A-Za-z0-9_-]+`.
-
-The kernel makes `pwmN` and `pwmN_enable` writable by root only, and the service runs as the user `coolerd`. So before each start of the service, a helper runs as root. For each chip in `hwmon.pwmChannels`, it finds the one `/sys/class/hwmon` entry whose `name` file holds the chip name, after it trims surrounding whitespace. An entry without a `name` file is skipped. The helper checks that `pwmN` and `pwmN_enable` of each listed channel are regular files and not symbolic links. Only when every file of every chip has passed does it give the service group write access to them. It changes no other file. The helper fails and the service does not start when no entry or more than one entry has the chip name, when a `name` file exists but cannot be read, or when a file is missing, is a symbolic link or is not a regular file. Every check runs before the first grant, so a failed check grants nothing. When `chgrp` or `chmod` fails while the helper grants access, the service does not start either, but some of the listed files can already have the access. List every channel that a `hwmon` fan in `settings` names; the program cannot take over a channel that is not listed.
-
-The helper gives write access to the service group and not to all users, so that only the service can drive the fans. It runs before every start, so the access is set whenever the service starts, whatever the order in which the device appeared. When it fails, the service stops with a message that names the chip or the path.
-
-The access has these limits:
-
-* `pwmN` and `pwmN_enable` must be direct children of the chip's hwmon directory. Neither the program nor the helper looks under `device/`.
-* A grant lasts until the kernel removes the file. When you remove a channel from `hwmon.pwmChannels`, the service group keeps write access to it until a reboot or a reload of the driver.
-* A reload of the hwmon driver removes the access. The program usually exits at its next read or write of the channel, and systemd restarts the service after 10 seconds, which runs the helper again. Until the restart, the fan stays under whatever control the reloaded driver sets, and the program cannot set full speed when it exits. Restart the service after you reload a hwmon driver; do not rely on this recovery.
-
-This desktop has no IPMI device. It reads the CPU temperature from the `k10temp` chip and drives the case fan on channel 2 of the `nct6798` chip:
-
-```nix
-services.coolerd = {
-  enable = true;
-  enableIpmi = false;
-  hwmon.kernelModules = ["nct6775"];
-  hwmon.pwmChannels.nct6798 = [2];
-  settings.zones = [
-    {
-      fans = [{ type = "hwmon"; chip = "nct6798"; pwm = 2; }];
-      sources = [{ type = "hwmon"; chip = "k10temp"; input = 1; }];
-      steps = [{ temp = 40; dcycle = 30; } { temp = 80; dcycle = 100; }];
-    }
-  ];
-};
-```
-
-Migrating from ipmi-fan-control
--------------------------------
-
-The rename from ipmi-fan-control to coolerd changes these names:
-
-| What | ipmi-fan-control | coolerd |
-|---|---|---|
-| Program | `ipmi-fan-control` | `coolerd` |
-| systemd unit | `ipmi-fan-control.service` | `coolerd.service` |
-| Service user and group | `ipmi-fan-control` | `coolerd` |
-| Config file that the NixOS module writes | `/etc/ipmi-fan-control.toml` | `/etc/coolerd.toml` |
-| NixOS options | `services.ipmi-fan-control` | `services.coolerd` |
-| Nix package | `ipmi-fan-control` | `coolerd` |
-| Log target in `RUST_LOG` | `ipmi_fan_control` | `coolerd` |
-| Variable that turns off log timestamps | `IPMI_FAN_CONTROL_LOG_TIMESTAMPS` | `COOLERD_LOG_TIMESTAMPS` |
-
-The config file format does not change, so an existing config loads with the same result.
-
-The old NixOS option path still works. Each option under `services.ipmi-fan-control` is an alias of the same option under `services.coolerd`, and a priority such as `lib.mkForce` carries over. NixOS prints a warning for each old option that a configuration sets. The Nix package `ipmi-fan-control` is the same package as `coolerd`. Move the configuration to `services.coolerd` to remove the warnings.
-
-Before switching a host to coolerd, note these points:
-
-* Host settings that name the old unit, user or group do not carry over. Rename overrides written as `systemd.services.ipmi-fan-control.*`, drop-ins for `ipmi-fan-control.service`, and local udev rules or ACLs that name the `ipmi-fan-control` user or group.
-* A normal system build fails when a `package` override has no executable file `bin/coolerd`. The check does not run the program, so it does not prove that coolerd starts.
-* Move all definitions of one option to the new path together. The old and new paths define the same option. `lib.mkBefore` and `lib.mkAfter` keep their order among definitions that are all on the old path, but not relative to definitions on the new path.
-* On the switch, NixOS stops `ipmi-fan-control.service`, which attempts to set the fans to full and restore the saved fan mode as it exits. NixOS then starts `coolerd.service`. A started unit does not prove that coolerd controls the fans, and each zone logs `Starting loop for fans` before its first fan update. After the switch, watch `journalctl -u coolerd.service` for errors and restarts. At the default `log_level` of `info`, coolerd logs no line per update; set `log_level = "debug"` to see each duty update.
+coolerd is free software under the GNU General Public License, version 3 or later. See [`LICENSE`](LICENSE).

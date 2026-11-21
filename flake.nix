@@ -215,6 +215,38 @@
             });
             expected = migrationExpectedPath;
           };
+          # The recipes of docs/examples. Each enables the service itself and
+          # reads the TOML file beside it as its settings.
+          recipeSupermicro = {
+            recipe = "supermicro";
+            nixos = evalModules [./docs/examples/supermicro.nix];
+            expected = p: [p.freeipmi p.smartmontools];
+          };
+          recipeHwmonDesktop = {
+            recipe = "hwmon-desktop";
+            nixos = evalModules [./docs/examples/hwmon-desktop.nix];
+            expected = p: [p.freeipmi];
+          };
+          recipeNvidia = {
+            recipe = "nvidia";
+            nixos = evalModules [./docs/examples/nvidia.nix driverStandIn];
+            expected = p: [p.freeipmi p.hello];
+            user = "root";
+            libraryPath = nvidiaLibraryPath;
+          };
+          recipeMixed = {
+            recipe = "mixed";
+            nixos = evalModules [./docs/examples/mixed.nix driverStandIn];
+            expected = p: [p.freeipmi p.hello];
+            user = "root";
+            libraryPath = nvidiaLibraryPath;
+          };
+        };
+
+        # The NVIDIA driver is unfree and is not evaluated here, so a free
+        # package stands in for the one a recipe puts on the unit's PATH
+        driverStandIn = {pkgs, ...}: {
+          hardware.nvidia.package = pkgs.hello;
         };
 
         # A host whose chip name the module must reject. Only its assertions are
@@ -252,6 +284,23 @@
           // {
             fans = [["nvidia" "00000000:01:00.0" 0]];
           };
+        # The zone as a list in field order, which the daemon also reads. Its
+        # elements follow the fields of Zone in src/config.rs; fans is the
+        # twelfth.
+        nvidiaFanListZone = [
+          "default"
+          1
+          2
+          500
+          [0]
+          [hwmonSource]
+          {type = "maximum";}
+          nvidiaZone.steps
+          {type = "maximum";}
+          0
+          "gpu"
+          nvidiaZone.fans
+        ];
         nvidiaSourceOnlyZone =
           nvidiaZone
           // {
@@ -342,11 +391,12 @@
 
         hwmonConfig = hosts.hwmon.nixos.config;
         migrationConfig = hosts.migration.nixos.config;
-        # The path of every option leaf under opts that is not internal
+        # The path of every option leaf under opts that is neither internal
+        # nor hidden
         publicLeaves = prefix: opts:
           lib.concatLists (lib.mapAttrsToList (name: value:
             if lib.isOption value
-            then lib.optional (!(value.internal or false)) (prefix ++ [name])
+            then lib.optional (!(value.internal or false) && (value.visible or true) != false) (prefix ++ [name])
             else publicLeaves (prefix ++ [name]) value)
           opts);
         defaultOptions = hosts.default.nixos.options.services;
@@ -410,6 +460,47 @@
         execStartPreDrvs = host: lib.concatMap (command: lib.attrNames (builtins.getContext command)) (execStartPre host);
         twoChipHelper = pkgs.writeShellScript "hwmon-access-helper-two-chips" twoChipScript;
 
+        # A public option is documented by a heading of docs/nixos.md that is
+        # this whole line; the option's name in prose does not count
+        optionHeading = leaf: "### `services.coolerd.${lib.concatStringsSep "." leaf}`";
+        nixosPageLines = lib.splitString "\n" (builtins.readFile ./docs/nixos.md);
+        undocumentedLeaves = lib.filter (leaf: !lib.elem (optionHeading leaf) nixosPageLines) (publicLeaves [] defaultOptions.coolerd);
+
+        recipeHosts = lib.filterAttrs (_: host: host ? recipe) hosts;
+        sortedChannels = lib.mapAttrs (_: lib.sort lib.lessThan);
+        # The PWM channels, by chip, of the hwmon fans that settings lists
+        settingsPwmChannels = settings:
+          sortedChannels (lib.zipAttrsWith (_: lib.unique)
+            (map (fan: {${fan.chip} = fan.pwm;})
+              (lib.filter (fan: fan.type == "hwmon")
+                (lib.concatMap (zone: zone.fans or []) (settings.zones or [])))));
+        # A recipe's settings are its TOML file, its pwmChannels are the hwmon
+        # fans of that file, and its unit runs the access helper for them
+        recipeFailures = name: host: let
+          cfg = host.nixos.config.services.coolerd;
+          helper = pkgs.writeShellScript "coolerd-hwmon-access" cfg.hwmon.accessScript;
+          expectedPre =
+            if cfg.hwmon.pwmChannels == {}
+            then []
+            else accessCommands helper (hostUser host);
+        in
+          lib.optional (cfg.settings != builtins.fromTOML (builtins.readFile (./docs/examples + "/${host.recipe}.toml")))
+          "${name}: settings is not docs/examples/${host.recipe}.toml"
+          ++ lib.optional (sortedChannels cfg.hwmon.pwmChannels != settingsPwmChannels cfg.settings)
+          "${name}: hwmon.pwmChannels is ${builtins.toJSON cfg.hwmon.pwmChannels}, but the hwmon fans of docs/examples/${host.recipe}.toml are ${builtins.toJSON (settingsPwmChannels cfg.settings)}"
+          ++ lib.optional (execStartPre host != expectedPre)
+          "${name}: ExecStartPre is ${shown (execStartPre host)}, expected ${shown expectedPre}";
+        # A file added to docs/examples without a recipe host above would
+        # otherwise pass this check unevaluated
+        exampleNames = suffix:
+          lib.sort lib.lessThan (map (lib.removeSuffix suffix)
+            (lib.filter (lib.hasSuffix suffix) (lib.attrNames (builtins.readDir ./docs/examples))));
+        hostedRecipes = lib.sort lib.lessThan (lib.mapAttrsToList (_: host: host.recipe) recipeHosts);
+        unhostedFailures =
+          lib.optional (exampleNames ".nix" != hostedRecipes)
+          "docs/examples holds the recipes ${builtins.toJSON (exampleNames ".nix")}, but the check hosts evaluate ${builtins.toJSON hostedRecipes}";
+        recipeConfig = host: host.nixos.config;
+
         configFileAccess = host: {inherit (host.nixos.config.environment.etc."coolerd.toml") user group mode;};
         hostUser = host: host.user or "coolerd";
         # Readable only by the user the unit runs as
@@ -464,6 +555,23 @@
 
         moduleFailures =
           lib.concatLists (lib.mapAttrsToList hostFailures hosts)
+          ++ map (leaf: "docs/nixos.md: no heading ${optionHeading leaf}") undocumentedLeaves
+          ++ lib.concatLists (lib.mapAttrsToList recipeFailures recipeHosts)
+          ++ unhostedFailures
+          ++ lib.optional (!((recipeConfig hosts.recipeSupermicro).users.groups ? ipmi) || !lib.elem "ipmi" (recipeConfig hosts.recipeSupermicro).users.users.coolerd.extraGroups)
+          "recipeSupermicro: the service user is not in an ipmi group"
+          ++ lib.optional (!lib.all (m: lib.elem m (recipeConfig hosts.recipeSupermicro).boot.kernelModules) ipmiModules)
+          "recipeSupermicro: boot.kernelModules does not contain the IPMI modules"
+          ++ lib.optional ((recipeConfig hosts.recipeHwmonDesktop).services.coolerd.hwmon.pwmChannels == {})
+          "recipeHwmonDesktop: hwmon.pwmChannels is empty"
+          ++ lib.optional (!lib.all (m: lib.elem m (recipeConfig hosts.recipeHwmonDesktop).boot.kernelModules) (recipeConfig hosts.recipeHwmonDesktop).services.coolerd.hwmon.kernelModules || (recipeConfig hosts.recipeHwmonDesktop).services.coolerd.hwmon.kernelModules == [])
+          "recipeHwmonDesktop: boot.kernelModules does not contain a hwmon module of the recipe"
+          ++ lib.optional (hasIpmiModule (recipeConfig hosts.recipeHwmonDesktop).boot.kernelModules || hasIpmiModule (recipeConfig hosts.recipeNvidia).boot.kernelModules)
+          "recipeHwmonDesktop, recipeNvidia: an IPMI kernel module is present with enableIpmi = false"
+          ++ lib.optional (!lib.all (m: lib.elem m (recipeConfig hosts.recipeMixed).boot.kernelModules) ipmiModules)
+          "recipeMixed: boot.kernelModules does not contain the IPMI modules"
+          ++ lib.optional (!(recipeConfig hosts.recipeNvidia).hardware.graphics.enable || !(recipeConfig hosts.recipeMixed).hardware.graphics.enable)
+          "recipeNvidia, recipeMixed: hardware.graphics.enable is off, so /run/opengl-driver/lib would not exist"
           ++ lib.optional (!hasPackage "hello" (unit hosts.extra).path)
           "extraPackages: hello is not in the unit path"
           ++ lib.optional (!hasPackage "freeipmi" (unit hosts.default).path)
@@ -507,6 +615,8 @@
           "nvidia fan as a table without enableNvidiaFans: no failed assertion names services.coolerd.enableNvidiaFans"
           ++ lib.optional (!rejectsWithoutNvidiaOption nvidiaFanPositionalZone)
           "nvidia fan as a list without enableNvidiaFans: no failed assertion names services.coolerd.enableNvidiaFans"
+          ++ lib.optional (!rejectsWithoutNvidiaOption nvidiaFanListZone)
+          "nvidia fan in a zone written as a list without enableNvidiaFans: no failed assertion names services.coolerd.enableNvidiaFans"
           ++ map (message: "nvidia source without an NVIDIA fan: an assertion fails: ${message}") (failedWithZone nvidiaSourceOnlyZone)
           ++ lib.optional (lib.hasInfix "KERNEL==\"ipmi" hwmonConfig.services.udev.extraRules || lib.elem "ipmi" hwmonConfig.users.users.coolerd.extraGroups || hwmonConfig.users.groups ? ipmi || hasIpmiModule hwmonConfig.boot.kernelModules)
           "hwmon: an IPMI udev rule, ipmi group or IPMI kernel module is present with enableIpmi = false"

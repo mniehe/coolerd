@@ -15,7 +15,13 @@ claim the mutation exists in production.
   numbers, parsers on captured output, config validation on TOML strings.
 - A source that spawns a program is tested with a fake executable script,
   never the real binary.
-- `config.sample.toml` must load in a test, because it is the documentation.
+- `config.sample.toml` and every config in `docs/examples/` must load in a
+  test through `load_config`, because they are the documentation. So must
+  every block fenced as `toml` in `docs/configuration.md` and
+  `docs/failure.md`.
+- A new module option or recipe is covered by the `module-eval` check in
+  `flake.nix`, which requires a heading in `docs/nixos.md` for each option
+  and evaluates each recipe in `docs/examples/`.
 
 ## Lenses, in priority order
 

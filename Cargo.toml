@@ -1,7 +1,7 @@
 [package]
 name = "coolerd"
 description = "Fan control daemon for Linux"
-repository = "https://github.com/chenxiaolong/ipmi-fan-control"
+repository = "https://github.com/mniehe/ipmi-fan-control"
 readme = "README.md"
 license = "GPL-3.0-or-later"
 version = "0.4.3"

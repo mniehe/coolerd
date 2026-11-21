@@ -89,7 +89,14 @@ worktree other than `flake.lock` and the dependency tables of `Cargo.toml`.
   error.rs      # The one Error enum (thiserror) and the Result alias
 build.rs        # Runs bindgen over wrapper.h at build time
 wrapper.h       # The freeipmi headers that bindgen reads
-config.sample.toml  # The documented config; the reference for every key
+config.sample.toml  # Every config key in one commented file
+README.md       # The entry page: origin, supported sources and fans, installation, quick start, links
+/docs
+  configuration.md  # Every config key with its type, default and rule; how a zone computes its duty
+  failure.md        # Source failures, retries, on_failure, what each fan gets on exit, exit status, limits
+  hwmon.md          # How to find a hwmon chip name and a PWM channel
+  nixos.md          # The NixOS module: one heading per option, the access helper, NVIDIA and root, migration
+  /examples         # A config and a NixOS recipe for each host type: supermicro, hwmon-desktop, nvidia, mixed
 /nix
   module.nix    # NixOS module: options, old-name aliases, service user, udev rule, hwmon access helper, systemd unit
   overlay.nix   # The Nix package, built from Cargo.lock
@@ -143,12 +150,26 @@ No test loads the real `libnvidia-ml`.
   the parsing without the binary. It runs the program through `CommandRunner`
   in `src/command.rs` with a named time limit and output limit, because a
   program that hangs would otherwise hold the zone at its last duty.
-- A change to the config format updates `config.sample.toml` and `README.md`
-  in the same change, because the sample is the only reference users have. It
-  also updates the `settings` example in `nix/module.nix` when it alters a key
-  or a value that the example shows.
+- A change to the config format updates `config.sample.toml` and
+  `docs/configuration.md` in the same change, because they are the reference
+  users have. It also updates each file in `docs/examples/` and the `settings`
+  example in `nix/module.nix` that shows the key or the value.
+- Every statement in `README.md` and `docs/` is true of the code. A change to
+  behaviour updates the page that states it in the same change:
+  `docs/failure.md` for source failures, fan releases, the exit status and the
+  known limits, and `docs/nixos.md` for the module.
+- Tests load every config in `docs/examples/` and every block fenced as
+  `toml` in `docs/configuration.md` and `docs/failure.md`, so such a block is
+  a complete config. Fence a fragment without a language. A test also checks
+  every relative link in `README.md` and `docs/*.md`.
+- A module option has a heading in `docs/nixos.md` that is the whole line
+  `` ### `services.coolerd.<path>` ``; the `module-eval` check fails without
+  it. `module-eval` also evaluates each recipe in `docs/examples/` with the
+  TOML file beside it, so a new host type adds both files and a check host in
+  `flake.nix`.
 - A program the daemon spawns must be on the unit's PATH. Add it to
-  `runtimeDeps` in `nix/module.nix` and to the dependency list in `README.md`.
+  `runtimeDeps` in `nix/module.nix` and to the table of run-time programs in
+  `docs/configuration.md`.
   A program that must match the host's driver, as `nvidia-smi` must, is not
   taken from `pkgs`: the host passes its package through the `extraPackages`
   option.
@@ -178,7 +199,7 @@ summary; "should pass" is not a result.
 nix develop -c cargo build
 nix develop -c cargo clippy -- -D warnings
 nix develop -c cargo test
-nix flake check          # when the change touches flake.nix or nix/
+nix flake check          # when the change touches flake.nix, nix/, docs/nixos.md or docs/examples/
 nix build .#default      # when the change touches Cargo.toml, Cargo.lock, build.rs, wrapper.h or nix/overlay.nix
 ```
 
@@ -188,7 +209,7 @@ names another depth:
 
 | Change | Review |
 |---|---|
-| Only `README.md`, `testing.md` or comments in `config.sample.toml` | None |
+| Only `README.md`, `docs/*.md`, `testing.md` or comments in `config.sample.toml` and in `docs/examples/` | None |
 | Only prompt files, none of them a critical path | `/pantheon:review --dimension prompt`: one reviewer |
 | Under 200 source lines, no critical path | `/pantheon:review --dimension correctness`: one reviewer, enough for a diff one agent can hold |
 | 200 to 1000 source lines, or a critical path at any size | `/pantheon:review`: the manifest selects the dimensions |
@@ -220,4 +241,7 @@ the fans slow, or breaks the deployed unit:
   block the shutdown path
 - the zone loop and the shutdown path in `src/main.rs`
 - `nix/**`
+- `docs/examples/*.nix`, because users copy these recipes onto deployed hosts,
+  and they set the unit's user, `PATH` and hwmon grants. A change to their
+  comments alone is the first row of the table and needs no review
 - `.claude/review/review.yaml`

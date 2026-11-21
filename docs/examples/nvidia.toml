@@ -1,0 +1,42 @@
+# coolerd example: the fans of an NVIDIA GPU.
+#
+# coolerd reads the GPU temperature with nvidia-smi and drives the GPU's own
+# fan through NVML, the management library of the NVIDIA driver. It opens no
+# IPMI session. coolerd must run as root to set a GPU fan speed. Copy this
+# file, change each value under a REPLACE comment, and start coolerd with
+# `coolerd --config <file>`.
+#
+# Every key is described in docs/configuration.md. What coolerd does when a
+# source fails, and what the fans get when it stops, is in docs/failure.md.
+
+log_level = "info"
+
+[[zones]]
+fans = [
+  # REPLACE: the PCI bus id of your GPU. To list the bus ids, run
+  # `nvidia-smi --query-gpu=pci.bus_id --format=csv`. `fan` starts at 0. A GPU
+  # with two fan controllers needs a second line with `fan = 1`.
+  { type = "nvidia", gpu = "00000000:01:00.0", fan = 0 },
+]
+
+# Seconds that the zone waits after each update. Each update runs
+# nvidia-smi.
+interval = 2
+
+sources = [
+  # REPLACE: the same PCI bus id. When the temperature cannot be read, coolerd
+  # stops, and on its way out it attempts to give the fan back to the driver.
+  { type = "nvidia", gpu = "00000000:01:00.0" },
+]
+
+# REPLACE: the curve for your GPU. Below 50 °C the fan runs at 30%, above
+# 85 °C at 100%, and in between on a straight line. The driver sets a minimum
+# speed and a maximum speed for the fan; coolerd keeps the duty cycle
+# within the two.
+steps = [
+  { temp = 50, dcycle = 30 },
+  { temp = 85, dcycle = 100 },
+]
+
+# The fan slows down only after the temperature has fallen by 3 °C.
+hysteresis = 3

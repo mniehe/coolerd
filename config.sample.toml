@@ -1,7 +1,8 @@
 # Verbosity of the logging output. The valid log levels, from least verbose to
 # most verbose, are:
 #
-# * error: Fatal errors only
+# * error: Errors that stop the program, a source that starts to fail, and a
+#          fan that could not be released
 # * warn:  Includes ^^ + recoverable errors
 # * info:  Includes ^^ + fan mode change messages on startup/shutdown
 # * debug: Includes ^^ + a status message with the temperature and duty cycle
@@ -71,8 +72,10 @@ session = "default"
 # lower speed: with a minimum of 30%, a duty cycle of 20% runs the fan at 30%.
 # A duty cycle above the maximum is capped at the maximum. On exit it gives
 # the fan back to the driver's default fan policy. If that fails, it sets the
-# fan to its maximum, which leaves the fan in manual control at full speed.
-# See the NVIDIA zone example below.
+# fan to its maximum, which leaves the fan in manual control at full speed. If
+# that fails as well, the fan's state is unknown, and it may keep the last
+# speed that the program set. In both cases the program logs an error and
+# exits with status 1. See the NVIDIA zone example below.
 fans = [
   { type = "supermicro", zone = 0 },
   { type = "supermicro", zone = 1 },
@@ -238,9 +241,10 @@ sources = [
 
 # List of steps for mapping temperatures to duty cycles. The temperatures are
 # in degrees Celsius and the PWM duty cycles are fan speed percentages. At 0%
-# duty cycle, the fans are completely turned off and at 100% duty cycle, the
-# fans are at the maximum speed. Be careful using low percentages as the fans
-# may stall.
+# duty cycle, the fans are asked to stop and at 100% duty cycle, they are
+# asked for the maximum speed. A duty cycle is a request: a fan may not stop
+# at 0%, and an NVIDIA fan is kept within the limits of its driver. Be careful
+# using low percentages as the fans may stall.
 #
 # The algorithm follows the rules below:
 #
