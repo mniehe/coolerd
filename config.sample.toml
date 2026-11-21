@@ -189,8 +189,9 @@ sources = [
   # Any source can also carry `on_failure`, which decides what the zone does
   # when the source still fails after its retries:
   #
-  # * { type = "exit" }: The program exits, which sets the fans to 100% and
-  #   restores the original fan mode. This is the default.
+  # * { type = "exit" }: The program exits. As it exits, it sets the fans to
+  #   100% and restores the original fan mode; a write that fails is logged
+  #   and makes the exit status 1. This is the default.
   # * { type = "ignore" }: The source is left out until it reads again, and
   #   the other sources drive the fans. A hot device that cannot be read then
   #   no longer raises the fans, so use this only for a source that another
@@ -300,10 +301,11 @@ steps = [
 # What the zone does when a fan fails: it cannot be taken over, a supermicro or
 # hwmon fan cannot be read, or a fan refuses a duty cycle.
 #
-# `retry`, the default, releases this zone's fans (supermicro zones to 100%,
-# hwmon channels back to their saved mode, NVIDIA fans back to the driver's
-# policy), logs a line that starts with `Zone error:`, waits, and takes the
-# fans over again. The other zones keep running. The first wait is 10 seconds,
+# `retry`, the default, releases this zone's fans: it sets supermicro zones to
+# 100%, hwmon channels back to their saved mode and NVIDIA fans back to the
+# driver's policy. A release that fails is logged and stops the program with
+# exit status 1. After a clean release the zone logs a line that starts with
+# `Zone error:`, waits, and takes the fans over again. The other zones keep running. The first wait is 10 seconds,
 # and each failure in a row doubles it up to `max_delay_s`, from 10 to 3600,
 # 300 by default. The first successful update after a take-over starts the
 # waits again from 10 seconds. Before that update the zone drops the smoothed
