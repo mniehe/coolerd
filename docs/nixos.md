@@ -125,7 +125,7 @@ services.coolerd.settings = {
 };
 ```
 
-The build of the host fails when a zone has a fan of type `nvidia` and [`enableNvidiaFans`](#servicescoolerdenablenvidiafans) is off. Write a zone that has a `fans` key as an attribute set, as on this page. coolerd also reads a zone written as a list in field order, but such a list must give a value to every field before `fans`. A list that reaches `fans` therefore also sets `ipmi_zones`, and sets both `steps` and `curve`, and coolerd refuses both pairs. The check reads each fan as an attribute set or as a list in field order. It also reads the `fans` of a list zone, only as a guard.
+The build of the host fails when a zone has a fan of type `nvidia` and [`enableNvidiaFans`](#servicescoolerdenablenvidiafans) is off. Write a zone that has a `fans` key as an attribute set, as on this page. coolerd also reads a zone written as a list in field order, but such a list must give a value to every field before `fans`. A list that reaches `fans` therefore also sets `ipmi_zones`, and sets both `steps` and `curve`, and coolerd refuses both pairs. The check reads the `fans` of each zone written as an attribute set, and reads each fan as an attribute set or as a list in field order.
 
 ### `services.coolerd.enableSmartMonTools`
 
@@ -203,7 +203,7 @@ coolerd loads `libnvidia-ml.so.1` at run time, because the library must match th
 
 An `nvidia` source also needs `nvidia-smi` on the `PATH` of the unit, through [`extraPackages`](#servicescoolerdextrapackages).
 
-The NVIDIA fan backend has not yet been confirmed on a GPU. Check the fans after the first deployment, as the next section describes.
+On a host with two RTX A4000 GPUs, one fan each, and driver 595.104.02 with the open kernel module, coolerd took over both fans and set their speed from the zone curve. The release of a GPU fan when coolerd stops has not been confirmed on a GPU. Check the fans after the first deployment, as the next section describes.
 
 ## Checking NVIDIA fans on a host
 
