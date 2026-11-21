@@ -710,8 +710,8 @@ fn exit_result(run: Result<()>, releases: ReleaseOutcome, restores: RestoreOutco
     }
 }
 
-/// Each session that a zone's Supermicro fan uses, in the order of
-/// `config.sessions`, with the IPMI zones its drop sets to 100%
+/// Each session that a zone's Supermicro fan uses, in no fixed order, because
+/// `config.sessions` is a `HashMap`, with the IPMI zones its drop sets to 100%
 fn sessions_to_open(config: &Config) -> Vec<(String, Vec<u8>)> {
     let mut sessions = Vec::new();
 
