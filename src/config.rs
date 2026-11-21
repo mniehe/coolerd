@@ -1939,6 +1939,15 @@ mod tests {
     }
 
     #[test]
+    fn rejects_maximum_aggregation_array_with_a_value() {
+        for key in AGGREGATION_KEYS {
+            let message = parse_error(&zone_toml(&[(key, r#"["maximum", 3]"#)]));
+
+            assert!(message.contains("invalid length 1, expected 0 elements in sequence"), "{}: {}", key, message);
+        }
+    }
+
+    #[test]
     fn average_aggregation_loads_as_an_array() {
         let config = parse(&zone_toml(&[("aggregation", r#"["average", 3]"#)])).unwrap();
 
