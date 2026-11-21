@@ -280,13 +280,33 @@ impl<'de> Deserialize<'de> for SourceConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "lowercase", tag = "type")]
+#[serde(from = "AggregationKeys")]
 pub enum Aggregation {
     #[default]
     Maximum,
     Average {
         top: Option<usize>,
     },
+}
+
+/// The config form of [`Aggregation`]. Serde ignores extra keys on a unit
+/// variant of a tagged enum; an empty struct variant rejects them.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename = "Aggregation", rename_all = "lowercase", tag = "type")]
+enum AggregationKeys {
+    Maximum {},
+    Average {
+        top: Option<usize>,
+    },
+}
+
+impl From<AggregationKeys> for Aggregation {
+    fn from(keys: AggregationKeys) -> Self {
+        match keys {
+            AggregationKeys::Maximum {} => Self::Maximum,
+            AggregationKeys::Average { top } => Self::Average { top },
+        }
+    }
 }
 
 /// One fan that a zone drives
@@ -373,7 +393,7 @@ impl fmt::Debug for Password {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "lowercase", tag = "type")]
+#[serde(from = "SessionTypeKeys")]
 pub enum SessionType {
     #[default]
     Local,
@@ -382,6 +402,28 @@ pub enum SessionType {
         username: String,
         password: Password,
     },
+}
+
+/// The config form of [`SessionType`]. Serde ignores extra keys on a unit
+/// variant of a tagged enum; an empty struct variant rejects them.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename = "SessionType", rename_all = "lowercase", tag = "type")]
+enum SessionTypeKeys {
+    Local {},
+    Remote {
+        hostname: String,
+        username: String,
+        password: Password,
+    },
+}
+
+impl From<SessionTypeKeys> for SessionType {
+    fn from(keys: SessionTypeKeys) -> Self {
+        match keys {
+            SessionTypeKeys::Local {} => Self::Local,
+            SessionTypeKeys::Remote { hostname, username, password } => Self::Remote { hostname, username, password },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Parser, ValueEnum)]
@@ -1850,6 +1892,101 @@ mod tests {
         let config = parse(&zone_toml(&[])).unwrap();
 
         assert!(matches!(config.zones[0].duty_aggregation, Aggregation::Maximum));
+    }
+
+    const AGGREGATION_KEYS: [&str; 2] = ["aggregation", "duty_aggregation"];
+
+    /// The parse error of a zone whose `key` is a `maximum` aggregation with
+    /// an unknown key `extra`
+    fn maximum_with_extra_key_error(key: &str) -> String {
+        parse_error(&zone_toml(&[(key, r#"{ type = "maximum", extra = 1 }"#)]))
+    }
+
+    #[test]
+    fn rejects_unknown_key_in_maximum_aggregation() {
+        let message = maximum_with_extra_key_error("aggregation");
+
+        assert!(message.contains("unknown field `extra`"), "{}", message);
+    }
+
+    #[test]
+    fn rejects_unknown_key_in_maximum_duty_aggregation() {
+        let message = maximum_with_extra_key_error("duty_aggregation");
+
+        assert!(message.contains("unknown field `extra`"), "{}", message);
+    }
+
+    #[test]
+    fn rejects_unknown_key_in_average_aggregation() {
+        for key in AGGREGATION_KEYS {
+            let message = parse_error(&zone_toml(&[(key, r#"{ type = "average", extra = 1 }"#)]));
+
+            assert!(message.contains("unknown field `extra`"), "{}: {}", key, message);
+        }
+    }
+
+    #[test]
+    fn maximum_aggregation_loads_as_a_table_and_as_an_array() {
+        for key in AGGREGATION_KEYS {
+            for value in [r#"{ type = "maximum" }"#, r#"["maximum"]"#] {
+                let config = parse(&zone_toml(&[(key, value)])).unwrap();
+                let zone = &config.zones[0];
+
+                assert!(matches!(zone.aggregation, Aggregation::Maximum), "{} = {}", key, value);
+                assert!(matches!(zone.duty_aggregation, Aggregation::Maximum), "{} = {}", key, value);
+            }
+        }
+    }
+
+    #[test]
+    fn average_aggregation_loads_as_an_array() {
+        let config = parse(&zone_toml(&[("aggregation", r#"["average", 3]"#)])).unwrap();
+
+        assert!(matches!(config.zones[0].aggregation, Aggregation::Average { top: Some(3) }));
+    }
+
+    #[test]
+    fn rejects_aggregation_as_a_string() {
+        let message = parse_error(&zone_toml(&[("aggregation", r#""maximum""#)]));
+
+        assert!(message.contains("invalid type: string \"maximum\", expected internally tagged enum Aggregation"),
+            "{}", message);
+    }
+
+    /// A config whose zone uses the default session, written as `session`
+    fn default_session_toml(session: &str) -> String {
+        format!("{}\n[sessions]\ndefault = {}\n", zone_toml(&[]), session)
+    }
+
+    #[test]
+    fn rejects_unknown_key_in_local_session() {
+        let message = parse_error(&default_session_toml(r#"{ type = "local", extra = 1 }"#));
+
+        assert!(message.contains("unknown field `extra`"), "{}", message);
+    }
+
+    #[test]
+    fn rejects_unknown_key_in_remote_session() {
+        let session = r#"{ type = "remote", hostname = "bmc.lan", username = "admin", password = "secret", extra = 1 }"#;
+        let message = parse_error(&default_session_toml(session));
+
+        assert!(message.contains("unknown field `extra`"), "{}", message);
+    }
+
+    #[test]
+    fn local_session_loads_as_a_table_and_as_an_empty_array() {
+        for session in [r#"{ type = "local" }"#, "[]"] {
+            let config = parse(&default_session_toml(session)).unwrap();
+
+            assert!(matches!(config.sessions.0["default"].0, SessionType::Local), "{}", session);
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_session_type() {
+        let message = parse_error(&default_session_toml(r#"{ type = "serial" }"#));
+
+        assert!(message.contains("unknown variant `serial`, expected `local` or `remote`"), "{}", message);
     }
 
     #[test]

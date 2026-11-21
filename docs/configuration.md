@@ -23,7 +23,7 @@ To start from a working file, copy one of the [examples](examples/). [`config.sa
 coolerd --config /etc/coolerd.toml
 ```
 
-`--config`, or `-c`, is required. `--help` prints the usage and starts nothing. coolerd checks the whole file before it touches a fan. When a key breaks a rule, coolerd prints the path of the file and the key, such as `zones[0].steps[1].dcycle: values are not increasing`, and exits with status 1. A key that coolerd does not know is an error, so a misspelt key does not fall back to a default without a message. Two tables are not checked in this way yet: an `aggregation` or `duty_aggregation` of type `maximum`, and a session of type `local`, ignore keys that they do not know.
+`--config`, or `-c`, is required. `--help` prints the usage and starts nothing. coolerd checks the whole file before it touches a fan. When a key breaks a rule, coolerd prints the path of the file and the key, such as `zones[0].steps[1].dcycle: values are not increasing`, and exits with status 1. A key that coolerd does not know is an error, so a misspelt key does not fall back to a default without a message.
 
 coolerd needs the rights to reach its devices: the IPMI device for a Supermicro fan, write access to the `pwmN` and `pwmN_enable` files for a hwmon fan, and root for an NVIDIA fan. The [NixOS module](nixos.md) sets these up.
 
@@ -432,10 +432,11 @@ A session can also be a list of `ipmitool` arguments, such as `["-I", "lanplus",
 
 ## Changes from earlier versions
 
-The format of the config file is the format of ipmi-fan-control. A config written for it loads in coolerd, unless two of its zones drive the same IPMI zone, as the second point says. These points behave in another way than they did in earlier versions:
+The format of the config file is the format of ipmi-fan-control. A config written for it loads in coolerd, unless two of its zones drive the same IPMI zone, as the second point says, or it has a key that coolerd does not know, as the third point says. These points behave in another way than they did in earlier versions:
 
 - **`average` with `top`.** An `average` `aggregation` divides by the number of temperatures it used; `top` only caps that number. Earlier versions divided by `top` even when the zone had fewer sources. A zone whose `top` is higher than its number of sources now gets a higher zone temperature, and its fans can run faster: readings of 80 °C and 80 °C with `top = 3` give 80 °C, where they gave 53 °C.
 - **One fan, one zone.** Two zones on one session can no longer name the same IPMI zone. Earlier versions loaded such a config, and the zones overwrote each other's duty cycle.
+- **Unknown keys.** An `aggregation` or `duty_aggregation` of type `maximum` and a session of type `local` now reject a key that they do not know, as every other table does. Earlier versions ignored such a key, so a config with one, such as `aggregation = { type = "maximum", top = 3 }`, now fails to load with an error that names the key. Remove the key, or change the type when the key was meant for it.
 - **Retries.** Only a source that fails is read again. Earlier versions read every source of the zone again when one source failed.
 - **Time limits.** `smartctl` and `hdparm` are stopped after 30 seconds. Earlier versions waited for them without a limit.
 - **Exit status.** When coolerd fails to release a fan as it stops, it exits with status 1, also when a signal stopped it. Earlier versions exited with status 0.
