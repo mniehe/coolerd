@@ -47,9 +47,9 @@ termination owner.
   back to its maximum). It logs each failed or panicking release and records
   it in `ReleaseFailures`, and `exit_result` then turns a clean run into
   `FansNotReleased`. The second sets every Supermicro zone to 100% and
-  restores the fan mode. It logs its own errors and records a failed restore
-  of the fan mode in `RestoreFailures`, which `exit_result` turns into
-  `FanModeNotRestored`; a failed write of 100% there is only logged.
+  restores the fan mode. It logs its own errors and records a failed write
+  of 100% and a failed restore of the fan mode in `RestoreFailures`, which
+  `exit_result` turns into `SessionsNotRestored`.
 - A failure that ends in a lower or unchanged fan duty with no log line is
   the disguised success that matters most here.
 

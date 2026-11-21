@@ -33,15 +33,17 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Whether every session restored the fan mode it saved
+/// Whether every session set its zones to 100% and restored the fan mode it
+/// saved
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RestoreOutcome {
     AllRestored,
     SomeFailed,
 }
 
-/// The record of failed fan-mode restores that every session shares, so that
-/// a failed restore can reach the exit status after the sessions drop
+/// The record of failed restores that every session shares, so that a failed
+/// write of 100% or of the saved fan mode can reach the exit status after the
+/// sessions drop
 #[derive(Clone, Debug, Default)]
 pub struct RestoreFailures(Arc<AtomicBool>);
 
@@ -70,7 +72,7 @@ pub struct IpmiSession {
     orig_fan_mode: FanMode,
     /// Set these zones to dcycle 100% before restoring original fan mode
     restore_zones: Vec<u8>,
-    /// Where `Drop` records a failed restore of the original fan mode
+    /// Where `Drop` records a failed write of 100% or of the original fan mode
     restore_failures: RestoreFailures,
 }
 
@@ -127,10 +129,13 @@ impl Drop for IpmiSession {
     fn drop(&mut self) {
         let mut port = lock_or_recover(&self.port);
 
+        // A signal can cancel a zone task before its fan guard exists, so
+        // this write can be the only one of 100% that the zone gets
         for z in &self.restore_zones {
             info!("[{}] Setting zone {} duty cycle to 100%", self.name, z);
             if let Err(e) = port.set_duty_cycle(*z, 100) {
-                error!("[{}] Failed to set duty cycle: {}", self.name, e);
+                error!("[{}] Failed to set zone {} duty cycle to 100%: {}", self.name, z, e);
+                self.restore_failures.record();
             }
         }
 
@@ -346,8 +351,7 @@ mod tests {
             PortCall::SetDutyCycle(1, 100),
             PortCall::SetFanMode(FanMode::Standard),
         ]);
-        // The release of each fan wrote 100% before, and records its own failure
-        assert_eq!(failures.outcome(), RestoreOutcome::AllRestored);
+        assert_eq!(failures.outcome(), RestoreOutcome::SomeFailed);
     }
 
     #[test]

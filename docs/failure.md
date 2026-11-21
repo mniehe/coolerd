@@ -89,7 +89,7 @@ flowchart TD
     A[signal, zone error or panic] --> B[every zone stops; a zone inside an update finishes it first]
     B --> C[each zone releases its fans, the last fan of its list first]
     C --> D[each board: every IPMI zone to 100%, then the saved fan mode]
-    D --> E[exit status 1 when a zone failed, a fan was not released or a fan mode was not restored, else 0]
+    D --> E[exit status 1 when a zone failed, a fan was not released, an IPMI zone did not take 100% or a fan mode was not restored, else 0]
 ```
 
 When the release of one fan fails, coolerd logs an error that names the fan, and the next fan still gets its attempt.
@@ -100,7 +100,7 @@ coolerd sets the IPMI zone of the fan to 100%. After every zone has stopped, coo
 
 When the saved mode was the full mode, coolerd restores nothing: the board stays in the full mode at 100%.
 
-When the restore of the fan mode fails, coolerd logs an error that names the session and exits with status 1. The board may then stay in the full mode. A failed write of 100% in this last step is logged and does not change the exit status, because the release of the fan wrote 100% before it, and a failed release gives status 1.
+When the restore of the fan mode fails, coolerd logs an error that names the session and exits with status 1. The board may then stay in the full mode. When a write of 100% in this last step fails, coolerd logs an error that names the session and the IPMI zone, still makes the other writes and the restore, and exits with status 1. This write can be the only one of 100% that the zone gets: a signal that arrives before a zone has started stops it before it can release its fans.
 
 When the switch to the full mode fails at the start, coolerd runs the same steps before it exits.
 
@@ -144,9 +144,9 @@ A `supermicro` or `hwmon` fan that cannot be read, and any fan that refuses a wr
 
 | Status | Meaning |
 |---|---|
-| 0 | SIGINT or SIGTERM stopped coolerd, no zone returned an error, every fan was released and every board got its saved fan mode back. Also after `--help`. |
+| 0 | SIGINT or SIGTERM stopped coolerd, no zone returned an error, every fan was released, every IPMI zone took 100% and every board got its saved fan mode back. Also after `--help`. |
 | 2 | The command line was wrong, such as a missing `--config`. |
-| 1 | Any other error: a config error, a failed start, a source failure with `on_failure = { type = "exit" }`, a fan that refused a duty cycle, a panic, a fan that could not be released, or a fan mode that could not be restored. A zone error counts also when a signal came first. |
+| 1 | Any other error: a config error, a failed start, a source failure with `on_failure = { type = "exit" }`, a fan that refused a duty cycle, a panic, a fan that could not be released, an IPMI zone that could not be set to 100% as coolerd stopped, or a fan mode that could not be restored. A zone error counts also when a signal came first. |
 
 The [NixOS module](nixos.md) restarts the service 10 seconds after an exit with status 1.
 

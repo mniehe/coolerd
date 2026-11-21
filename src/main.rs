@@ -115,7 +115,7 @@ struct MainApp {
     nvml: Arc<dyn Nvml>,
     /// The failed releases of every zone's fans
     release_failures: ReleaseFailures,
-    /// The failed fan-mode restores of every session
+    /// The failed writes of 100% and fan-mode restores of every session
     restore_failures: RestoreFailures,
 }
 
@@ -326,12 +326,12 @@ impl RunResults {
 
 /// The result of the process: an error from the zone loops is kept, and a
 /// clean run becomes an error when a fan failed to release or a session
-/// failed to restore its fan mode
+/// failed to set a zone to 100% or to restore its fan mode
 fn exit_result(run: Result<()>, releases: ReleaseOutcome, restores: RestoreOutcome) -> Result<()> {
     match (run, releases, restores) {
         (Err(e), _, _) => Err(e),
         (Ok(()), ReleaseOutcome::SomeFailed, _) => Err(Error::FansNotReleased),
-        (Ok(()), ReleaseOutcome::AllReleased, RestoreOutcome::SomeFailed) => Err(Error::FanModeNotRestored),
+        (Ok(()), ReleaseOutcome::AllReleased, RestoreOutcome::SomeFailed) => Err(Error::SessionsNotRestored),
         (Ok(()), ReleaseOutcome::AllReleased, RestoreOutcome::AllRestored) => Ok(()),
     }
 }
@@ -471,7 +471,13 @@ mod tests {
             config::{Config, FanConfig, load_config, parse_config},
             error::Error,
             fan::ReleaseOutcome,
-            session::RestoreOutcome,
+            ipmi::FanMode,
+            session::{
+                fake::{BoardLog, FakeBoard, PortCall},
+                IpmiSession,
+                RestoreFailures,
+                RestoreOutcome,
+            },
         },
     };
 
@@ -810,7 +816,28 @@ mod tests {
     fn clean_run_with_a_failed_restore_is_an_error() {
         let result = exit_result(Ok(()), ReleaseOutcome::AllReleased, RestoreOutcome::SomeFailed);
 
-        assert!(matches!(result, Err(Error::FanModeNotRestored)), "{:?}", result);
+        assert!(matches!(result, Err(Error::SessionsNotRestored)), "{:?}", result);
+    }
+
+    /// A signal can cancel a zone task before its fan guard exists, so the
+    /// session's drop then makes the only write of 100% to the zone
+    #[test]
+    fn failed_full_duty_write_without_a_fan_guard_fails_the_exit() {
+        let calls = BoardLog::default();
+        let board = FakeBoard {
+            failing: Some(PortCall::SetDutyCycle(0, 100)),
+            ..FakeBoard::new(FanMode::Full, &calls)
+        };
+        let failures = RestoreFailures::default();
+        let session = IpmiSession::with_port("test", Box::new(board), [0], failures.clone()).unwrap();
+
+        drop(session);
+
+        assert_eq!(failures.outcome(), RestoreOutcome::SomeFailed);
+
+        let result = exit_result(Ok(()), ReleaseOutcome::AllReleased, failures.outcome());
+
+        assert!(matches!(result, Err(Error::SessionsNotRestored)), "{:?}", result);
     }
 
     #[test]
