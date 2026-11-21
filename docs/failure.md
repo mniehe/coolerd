@@ -79,7 +79,7 @@ A fan fails when coolerd cannot take it over, when a `supermicro` or `hwmon` fan
 - `{ type = "retry", max_delay_s = N }`, the default with N = 300: the zone releases its own fans, logs an error, waits, and takes the fans over again. The other zones keep running.
 - `{ type = "exit" }`: the zone returns the error, and coolerd stops and releases every fan of every zone, as [What the fans get when coolerd stops](#what-the-fans-get-when-coolerd-stops) describes.
 
-A zone retries only after it has completed one update. Until then any error of the zone stops coolerd under either `recovery`, as `exit` does. So a fan that is misconfigured, or that cannot be taken over or refuses the first duty cycle, still fails the start of coolerd, and each board's IPMI zones get 100% as coolerd stops.
+A zone retries only after it has completed one update. Until then any error of the zone stops coolerd under either `recovery`, as `exit` does. So a fan that is misconfigured, or that cannot be taken over or refuses the first duty cycle, still fails the start of coolerd. As coolerd stops, it sets each board's IPMI zones to 100%; a write that fails is logged and makes the exit status 1.
 
 The first wait is 10 seconds. Each further failure in a row doubles the wait, up to `max_delay_s`, which can be from 10 to 3600. With the default the waits are 10, 20, 40, 80, 160, 300, 300 seconds and so on. The first update that succeeds after a take-over starts the waits again from 10 seconds. A zone retries without a limit, and coolerd keeps running when every zone is retrying.
 
@@ -89,7 +89,7 @@ While a zone waits, its fans stay released, as at a stop:
 - A hwmon channel gets 255, and then its saved `pwmN_enable` back when that is 2 or more.
 - An NVIDIA fan is back under the default fan policy of the driver.
 
-When the return of an NVIDIA fan to the default policy fails, its release has failed: coolerd sets the fan to its maximum under manual control and exits with status 1, so the zone does not wait. [What the fans get when coolerd stops](#what-the-fans-get-when-coolerd-stops) describes each release in full.
+When the return of an NVIDIA fan to the default policy fails, its release has failed: coolerd tries to set the fan to its maximum under manual control and exits with status 1, so the zone does not wait. That write can fail too, and the fan may then keep its last speed. [What the fans get when coolerd stops](#what-the-fans-get-when-coolerd-stops) describes each release in full.
 
 A new take-over builds every fan of the zone afresh: it finds a hwmon chip by its name again, and it reads the fan count and the speed limits of an NVIDIA fan again. The take-over and the first update after it are the test that the fans work again; coolerd writes no other test value. Before that first update the zone drops the smoothed samples of its sources, so that each source smooths only readings taken after the take-over. The zone keeps the held temperatures of its curves and the sources that failed.
 

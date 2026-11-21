@@ -73,7 +73,7 @@ session = "default"
 # lower speed: with a minimum of 30%, a duty cycle of 20% runs the fan at 30%.
 # A duty cycle above the maximum is capped at the maximum. On exit, and when
 # the zone retries a fan error (see `recovery` below), it gives the fan back to
-# the driver's default fan policy. If that fails, it sets the
+# the driver's default fan policy. If that fails, it tries to set the
 # fan to its maximum, which leaves the fan in manual control at full speed. If
 # that fails as well, the fan's state is unknown, and it may keep the last
 # speed that the program set. In both cases the program logs an error and
