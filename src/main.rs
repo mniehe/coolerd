@@ -841,6 +841,7 @@ mod tests {
     use {
         std::{
             cell::{Cell, RefCell},
+            rc::Rc,
             collections::HashMap,
             fs,
             io,
@@ -1679,16 +1680,20 @@ mod tests {
 
         fans.add(Box::new(DutyFan(duties.clone()))).unwrap();
 
-        for _ in 0..3 {
+        // The means of the readings so far are 40, 50 and 60 °C. Without the
+        // smoothing the duties would be 40, 70 and 100.
+        for (reading, smoothed) in [("40000", 40), ("60000", 55), ("80000", 70)] {
+            fs::write(&temp, reading).unwrap();
             zone.update(&mut fans).unwrap();
+
+            assert_eq!(duties.lock().unwrap().last(), Some(&smoothed), "after {}", reading);
         }
 
         ZoneSteps::clear_smoothing(&mut zone);
-        fs::write(&temp, "80000").unwrap();
         zone.update(&mut fans).unwrap();
 
-        // Without the clear, the mean of 40, 40, 40 and 80 would give 55%
-        assert_eq!(*duties.lock().unwrap(), [40, 40, 40, 100]);
+        // Without the clear, the mean of 40, 60, 80 and 80 would give 77%
+        assert_eq!(*duties.lock().unwrap(), [40, 55, 70, 100]);
     }
 
     /// A zone of one `ipmi` source with `source_keys` and no retries, with no
@@ -1778,18 +1783,22 @@ mod tests {
     /// The update interval of a fake zone
     const FAKE_INTERVAL: Duration = Duration::from_secs(5);
 
-    /// A step of [`ZoneSteps`] that a fake zone ran
+    /// A step of [`ZoneSteps`] that a fake zone ran, or a wait of its loop
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum ZoneStep {
         TakeOver,
         Update,
         Release,
         ClearSmoothing,
+        Wait(Duration),
     }
+
+    /// The steps and waits of a fake zone, in the order they came
+    type ZoneTrace = Rc<RefCell<Vec<ZoneStep>>>;
 
     /// A zone whose take-overs hand out fake fans, one list per take-over in
     /// order, and whose updates drive them at [`FAKE_DUTY`]. It records each
-    /// step it runs.
+    /// step it runs in `trace`, where its sleeps record their waits.
     struct FakeZone {
         takeovers: VecDeque<Vec<FakeFan>>,
         /// The updates, counted from 0 across take-overs, that fail with a fan
@@ -1798,17 +1807,31 @@ mod tests {
         updates: usize,
         /// What `release` reports in place of the guard's own outcome
         reported_release: Option<ReleaseOutcome>,
-        steps: Vec<ZoneStep>,
+        trace: ZoneTrace,
     }
 
     impl FakeZone {
         fn new(takeovers: Vec<Vec<FakeFan>>) -> Self {
-            Self { takeovers: takeovers.into(), failing_updates: Vec::new(), updates: 0, reported_release: None, steps: Vec::new() }
+            Self { takeovers: takeovers.into(), failing_updates: Vec::new(), updates: 0, reported_release: None, trace: ZoneTrace::default() }
         }
 
         /// A zone whose updates numbered in `failing_updates` fail
         fn failing(takeovers: Vec<Vec<FakeFan>>, failing_updates: &[usize]) -> Self {
             Self { failing_updates: failing_updates.to_vec(), ..Self::new(takeovers) }
+        }
+
+        fn record(&self, step: ZoneStep) {
+            self.trace.borrow_mut().push(step);
+        }
+
+        /// The steps the zone ran, without the waits
+        fn steps(&self) -> Vec<ZoneStep> {
+            self.trace.borrow().iter().copied().filter(|step| !matches!(step, ZoneStep::Wait(_))).collect()
+        }
+
+        /// The steps the zone ran and the waits, in the order they came
+        fn trace(&self) -> Vec<ZoneStep> {
+            self.trace.borrow().clone()
         }
     }
 
@@ -1818,7 +1841,7 @@ mod tests {
         }
 
         fn take_over(&mut self, fans: &mut FanGuard) -> super::Result<()> {
-            self.steps.push(ZoneStep::TakeOver);
+            self.record(ZoneStep::TakeOver);
 
             for fan in self.takeovers.pop_front().expect("a take-over is left") {
                 fans.add(Box::new(fan))?;
@@ -1830,7 +1853,7 @@ mod tests {
         fn update(&mut self, fans: &mut FanGuard) -> super::Result<(), ZoneFailure> {
             let number = self.updates;
 
-            self.steps.push(ZoneStep::Update);
+            self.record(ZoneStep::Update);
             self.updates += 1;
 
             if self.failing_updates.contains(&number) {
@@ -1843,7 +1866,7 @@ mod tests {
         }
 
         fn release(&mut self, fans: FanGuard) -> ReleaseOutcome {
-            self.steps.push(ZoneStep::Release);
+            self.record(ZoneStep::Release);
 
             let outcome = fans.release();
 
@@ -1851,19 +1874,20 @@ mod tests {
         }
 
         fn clear_smoothing(&mut self) {
-            self.steps.push(ZoneStep::ClearSmoothing);
+            self.record(ZoneStep::ClearSmoothing);
         }
     }
 
     type FakeSleep = Pin<Box<dyn Future<Output = ()>>>;
 
-    /// A sleep that records each wait into `waits`, returns at once for the
-    /// first `ready` waits and never returns from the next one
-    fn sleeper(waits: &RefCell<Vec<Duration>>, ready: usize) -> impl FnMut(Duration) -> FakeSleep + '_ {
+    /// A sleep that records each wait into `waits` and `trace`, returns at once
+    /// for the first `ready` waits and never returns from the next one
+    fn sleeper(waits: &RefCell<Vec<Duration>>, trace: ZoneTrace, ready: usize) -> impl FnMut(Duration) -> FakeSleep + '_ {
         move |duration| {
             let mut waits = waits.borrow_mut();
 
             waits.push(duration);
+            trace.borrow_mut().push(ZoneStep::Wait(duration));
 
             if waits.len() <= ready {
                 Box::pin(std::future::ready(()))
@@ -1895,7 +1919,8 @@ mod tests {
         let recoveries = Recoveries::default();
         let failures = ReleaseFailures::default();
         let mut health = ZoneHealth::new(recoveries.clone());
-        let result = poll_once(recover(zone, RETRY_300, FAKE_INTERVAL, &failures, &mut health, sleeper(&waits, ready)));
+        let trace = zone.trace.clone();
+        let result = poll_once(recover(zone, RETRY_300, FAKE_INTERVAL, &failures, &mut health, sleeper(&waits, trace, ready)));
 
         Polled { result, waits: waits.into_inner(), recoveries: recoveries.outcome(), releases: failures.outcome() }
     }
@@ -1947,9 +1972,10 @@ mod tests {
         ]);
         // The smoothing is cleared once, after the retry's wait and before its
         // take-over, and never before the first take-over
-        assert_eq!(zone.steps, [
-            ZoneStep::TakeOver, ZoneStep::Update, ZoneStep::Update, ZoneStep::Release,
-            ZoneStep::ClearSmoothing, ZoneStep::TakeOver, ZoneStep::Update, ZoneStep::Update,
+        assert_eq!(zone.trace(), [
+            ZoneStep::TakeOver, ZoneStep::Update, ZoneStep::Wait(FAKE_INTERVAL), ZoneStep::Update, ZoneStep::Release,
+            ZoneStep::Wait(secs(10)), ZoneStep::ClearSmoothing,
+            ZoneStep::TakeOver, ZoneStep::Update, ZoneStep::Wait(FAKE_INTERVAL), ZoneStep::Update, ZoneStep::Wait(FAKE_INTERVAL),
         ]);
         assert_eq!(polled.recoveries, RecoveryOutcome::AllRunning);
         assert_eq!(polled.releases, ReleaseOutcome::AllReleased);
@@ -1999,7 +2025,7 @@ mod tests {
         let polled = poll_recovery(&mut zone, 1);
 
         assert!(polled.result.is_pending(), "the loop returned {:?}", polled.result);
-        assert_eq!(zone.steps.iter().filter(|step| **step == ZoneStep::Release).count(), 1);
+        assert_eq!(zone.steps().iter().filter(|step| **step == ZoneStep::Release).count(), 1);
 
         // The fans release cleanly, but the step's report decides
         let calls = CallLog::default();
@@ -2012,7 +2038,7 @@ mod tests {
 
         assert!(matches!(&polled.result, Poll::Ready(Error::Fan { .. })), "{:?}", polled.result);
         assert_eq!(polled.waits, [FAKE_INTERVAL]);
-        assert_eq!(zone.steps, [ZoneStep::TakeOver, ZoneStep::Update, ZoneStep::Update, ZoneStep::Release]);
+        assert_eq!(zone.steps(), [ZoneStep::TakeOver, ZoneStep::Update, ZoneStep::Update, ZoneStep::Release]);
         assert_eq!(log_of(&calls).last(), Some(&("a", Op::Release)));
         assert_eq!(polled.releases, ReleaseOutcome::AllReleased);
     }
@@ -2044,7 +2070,7 @@ mod tests {
         // Between the update intervals the retries wait 10, 20, then 10 again
         assert_eq!(polled.waits, [FAKE_INTERVAL, secs(10), secs(20), FAKE_INTERVAL, secs(10)]);
         // One clear per retry, each before that retry's take-over
-        assert_eq!(zone.steps, [
+        assert_eq!(zone.steps(), [
             ZoneStep::TakeOver, ZoneStep::Update, ZoneStep::Update, ZoneStep::Release,
             ZoneStep::ClearSmoothing, ZoneStep::TakeOver, ZoneStep::Update, ZoneStep::Release,
             ZoneStep::ClearSmoothing, ZoneStep::TakeOver, ZoneStep::Update, ZoneStep::Update, ZoneStep::Release,
