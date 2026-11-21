@@ -110,10 +110,103 @@
           ];
         };
 
+        # The capabilities of the unit for each combination of the options that
+        # set them. ambient lists AmbientCapabilities; bounding is the value of
+        # CapabilityBoundingSet, or null when the unit sets none. Each row is
+        # written out, so a change to the module's rule must change a row.
+        capabilityCases = [
+          {
+            nvidia = false;
+            smart = false;
+            hdparm = false;
+            ambient = [];
+            bounding = null;
+          }
+          {
+            nvidia = false;
+            smart = true;
+            hdparm = false;
+            ambient = ["CAP_SYS_RAWIO" "CAP_SYS_ADMIN"];
+            bounding = null;
+          }
+          {
+            nvidia = false;
+            smart = false;
+            hdparm = true;
+            ambient = ["CAP_SYS_RAWIO"];
+            bounding = null;
+          }
+          {
+            nvidia = false;
+            smart = true;
+            hdparm = true;
+            ambient = ["CAP_SYS_RAWIO" "CAP_SYS_ADMIN"];
+            bounding = null;
+          }
+          {
+            nvidia = true;
+            smart = false;
+            hdparm = false;
+            ambient = [];
+            bounding = "CAP_SYS_ADMIN";
+          }
+          {
+            nvidia = true;
+            smart = true;
+            hdparm = false;
+            ambient = [];
+            bounding = "CAP_SYS_ADMIN CAP_SYS_RAWIO";
+          }
+          {
+            nvidia = true;
+            smart = false;
+            hdparm = true;
+            ambient = [];
+            bounding = "CAP_SYS_ADMIN CAP_SYS_RAWIO";
+          }
+          {
+            nvidia = true;
+            smart = true;
+            hdparm = true;
+            ambient = [];
+            bounding = "CAP_SYS_ADMIN CAP_SYS_RAWIO";
+          }
+        ];
+        onOff = flag:
+          if flag
+          then "on"
+          else "off";
+        # One host per row of capabilityCases
+        capabilityHosts = lib.listToAttrs (map (case: {
+            name = "capabilities: nvidia ${onOff case.nvidia}, smart ${onOff case.smart}, hdparm ${onOff case.hdparm}";
+            value =
+              {
+                nixos = evalHost {
+                  services.coolerd = {
+                    enableNvidiaFans = case.nvidia;
+                    enableSmartMonTools = case.smart;
+                    enableHdparm = case.hdparm;
+                  };
+                };
+                expected = p: [p.freeipmi] ++ lib.optional case.smart p.smartmontools ++ lib.optional case.hdparm p.hdparm;
+                inherit (case) ambient bounding;
+              }
+              // lib.optionalAttrs case.nvidia {
+                user = "root";
+                libraryPath = nvidiaLibraryPath;
+              };
+          })
+          capabilityCases);
+
         # Each host names the packages whose bin directory must be on the unit's
         # PATH. A host runs as the user and group coolerd and sets no
-        # LD_LIBRARY_PATH unless it names another user or a libraryPath.
-        hosts = {
+        # LD_LIBRARY_PATH unless it names another user or a libraryPath. Its
+        # unit has no AmbientCapabilities and no CapabilityBoundingSet unless
+        # it names an ambient list or a bounding value.
+        hosts =
+          capabilityHosts
+          // namedHosts;
+        namedHosts = {
           default = {
             nixos = evalHost {};
             expected = p: [p.freeipmi];
@@ -133,6 +226,7 @@
               };
             });
             expected = p: [p.freeipmi p.smartmontools p.hdparm p.hello];
+            ambient = ["CAP_SYS_RAWIO" "CAP_SYS_ADMIN"];
           };
           hwmon = {
             nixos = evalHost {
@@ -194,6 +288,7 @@
             expected = p: [p.freeipmi p.smartmontools p.hdparm];
             user = "root";
             libraryPath = nvidiaLibraryPath;
+            bounding = "CAP_SYS_ADMIN CAP_SYS_RAWIO";
           };
           # Old option paths, as a configuration written before the rename
           # sets them. The normal-priority new-path definitions compete with
@@ -207,6 +302,7 @@
               ({pkgs, ...}: {services.ipmi-fan-control = migrationLeaves pkgs;})
             ];
             expected = migrationExpectedPath;
+            ambient = ["CAP_SYS_RAWIO" "CAP_SYS_ADMIN"];
           };
           # The migration host's values through the new option paths
           migrationTwin = {
@@ -214,6 +310,7 @@
               services.coolerd = migrationLeaves pkgs // {settings = migrationSettings;};
             });
             expected = migrationExpectedPath;
+            ambient = ["CAP_SYS_RAWIO" "CAP_SYS_ADMIN"];
           };
           # The recipes of docs/examples. Each enables the service itself and
           # reads the TOML file beside it as its settings.
@@ -221,6 +318,7 @@
             recipe = "supermicro";
             nixos = evalModules [./docs/examples/supermicro.nix];
             expected = p: [p.freeipmi p.smartmontools];
+            ambient = ["CAP_SYS_RAWIO" "CAP_SYS_ADMIN"];
           };
           recipeHwmonDesktop = {
             recipe = "hwmon-desktop";
@@ -233,6 +331,7 @@
             expected = p: [p.freeipmi p.hello];
             user = "root";
             libraryPath = nvidiaLibraryPath;
+            bounding = "CAP_SYS_ADMIN";
           };
           recipeMixed = {
             recipe = "mixed";
@@ -240,6 +339,7 @@
             expected = p: [p.freeipmi p.hello];
             user = "root";
             libraryPath = nvidiaLibraryPath;
+            bounding = "CAP_SYS_ADMIN";
           };
         };
 
@@ -500,6 +600,13 @@
         expectedLibraryPathLines = host:
           lib.optional (hostLibraryPath host != null) "Environment=\"LD_LIBRARY_PATH=${hostLibraryPath host}\"";
 
+        # The lines of the unit file that assign key, in order
+        unitLines = key: host: lib.filter (lib.hasPrefix "${key}=") (lib.splitString "\n" (unitText host));
+        expectedAmbientLines = host: map (capability: "AmbientCapabilities=${capability}") (host.ambient or []);
+        expectedBoundingLines = host: lib.optional ((host.bounding or null) != null) "CapabilityBoundingSet=${host.bounding}";
+        # Only a root unit is kept from gaining privileges
+        expectedNoNewPrivilegesLines = host: lib.optional (hostUser host == "root") "NoNewPrivileges=true";
+
         # A value for a failure message, without its store path context, so a
         # failure that names the Rust package does not build it
         shown = value: builtins.unsafeDiscardStringContext (builtins.toJSON value);
@@ -531,6 +638,12 @@
           "${name}: /etc/coolerd.toml is not defined"
           ++ lib.optional (configFileAccess host != unitOnlyAccess host)
           "${name}: /etc/coolerd.toml is not owned by ${hostUser host}:${hostUser host} with mode 0600"
+          ++ lib.optional (unitLines "AmbientCapabilities" host != expectedAmbientLines host)
+          "${name}: the unit file's AmbientCapabilities lines are ${builtins.toJSON (unitLines "AmbientCapabilities" host)}, expected ${builtins.toJSON (expectedAmbientLines host)}"
+          ++ lib.optional (unitLines "CapabilityBoundingSet" host != expectedBoundingLines host)
+          "${name}: the unit file's CapabilityBoundingSet lines are ${builtins.toJSON (unitLines "CapabilityBoundingSet" host)}, expected ${builtins.toJSON (expectedBoundingLines host)}"
+          ++ lib.optional (unitLines "NoNewPrivileges" host != expectedNoNewPrivilegesLines host)
+          "${name}: the unit file's NoNewPrivileges lines are ${builtins.toJSON (unitLines "NoNewPrivileges" host)}, expected ${builtins.toJSON (expectedNoNewPrivilegesLines host)}"
           # The unit text omits wantedBy, so the twin comparison cannot see it
           ++ lib.optional (!lib.elem "multi-user.target" (unit host).wantedBy)
           "${name}: multi-user.target does not want the unit"
