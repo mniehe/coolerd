@@ -96,4 +96,4 @@ Do not configure a channel that you have not identified. coolerd sets every fan 
 
 coolerd needs write access to `pwmN` and `pwmN_enable`, which the kernel gives to root only. On NixOS, [`hwmon.pwmChannels`](nixos.md#servicescoolerdhwmonpwmchannels) grants it to the service.
 
-Stop coolerd before you reload a hwmon driver, and start it afterwards. coolerd keeps the device path that it found at the start.
+Stop coolerd before you reload a hwmon driver, and start it afterwards. coolerd keeps the device path that it found when the zone took the fan over. It finds the chip again only when the zone takes its fans over again after a fan error.
