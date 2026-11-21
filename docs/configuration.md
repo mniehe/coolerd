@@ -359,7 +359,7 @@ A backend does not always apply the duty cycle that the zone asks for. [Failures
 
 A `supermicro` fan is one IPMI fan zone of the board that the zone's `session` reaches. A board groups its fan headers into zones; on most boards, zone 0 holds the headers `FAN1`, `FAN2` and so on, and zone 1 the headers `FANA`, `FANB` and so on. Check the manual of your board.
 
-When coolerd starts, it saves the fan mode of each board that it uses. It then switches the board to the full fan mode, unless the board is in that mode already, and sets each IPMI zone that the config names on the board to 100%. coolerd writes no other duty cycle to a zone before the zone's first update. When the switch or one of these writes fails, the start fails; [Failures and shutdown](failure.md#supermicro-fan) describes what coolerd does to the board before it exits.
+When coolerd starts, it saves the fan mode of each board that it uses. It then switches the board to the full fan mode, unless the board is in that mode already, and writes a duty cycle of 100% to each IPMI zone that the config names on the board. coolerd writes no other duty cycle to a zone before the zone's first update. When the switch or one of these writes fails, the start fails; [Failures and shutdown](failure.md#supermicro-fan) describes what coolerd does to the board before it exits.
 
 `ipmi_zones = [0, 1]` on a zone is the older form of `fans = [{ type = "supermicro", zone = 0 }, { type = "supermicro", zone = 1 }]`, and it still loads. A zone sets `fans` or `ipmi_zones`, not both. A number that `ipmi_zones` repeats is driven once.
 
