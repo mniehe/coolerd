@@ -184,8 +184,8 @@ impl MainApp {
                 }
             };
 
-            if let Some(e) = results.add(ret) {
-                error!("{}", e);
+            if let Some(line) = results.add(ret) {
+                error!("{}", line);
             }
 
             // If tokio::select returned, then a loop exited or the program was
@@ -302,20 +302,21 @@ struct RunResults {
 }
 
 impl RunResults {
-    /// Add one result. Returns an error that is not kept, for the caller to
-    /// log.
-    fn add(&mut self, result: Result<()>) -> Option<Error> {
+    /// Add one result. Returns the log line of every error, the kept one
+    /// included, so that an error reaches the log as soon as `run` receives
+    /// it and not only when the process exits.
+    fn add(&mut self, result: Result<()>) -> Option<String> {
         let Err(e) = result else {
             return None;
         };
 
-        if self.first_error.is_some() {
-            return Some(e);
+        let line = format!("Zone error: {}", e);
+
+        if self.first_error.is_none() {
+            self.first_error = Some(e);
         }
 
-        self.first_error = Some(e);
-
-        None
+        Some(line)
     }
 
     /// The result of the run
@@ -919,7 +920,9 @@ mod tests {
         let mut run = RunResults::default();
 
         for result in results {
-            assert!(run.add(result).is_none(), "an error was handed back to be logged");
+            let failed = result.is_err();
+
+            assert_eq!(run.add(result).is_some(), failed, "only an error is handed back to be logged");
         }
 
         exit_result(run.into_result(), ReleaseOutcome::AllReleased, RestoreOutcome::AllRestored)
@@ -949,14 +952,14 @@ mod tests {
     }
 
     #[test]
-    fn error_after_the_first_error_is_handed_back_to_be_logged() {
+    fn every_zone_error_is_handed_back_to_be_logged() {
         let mut run = RunResults::default();
 
-        assert!(run.add(Err(Error::SensorsWithoutSession)).is_none());
-
+        let first = run.add(Err(Error::SensorsWithoutSession));
         let later = run.add(Err(Error::FansNotReleased));
 
-        assert!(matches!(later, Some(Error::FansNotReleased)), "{:?}", later);
+        assert_eq!(first, Some(format!("Zone error: {}", Error::SensorsWithoutSession)));
+        assert_eq!(later, Some(format!("Zone error: {}", Error::FansNotReleased)));
 
         let result = run.into_result();
 

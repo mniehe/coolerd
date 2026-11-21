@@ -82,7 +82,7 @@ coolerd runs the release in each of these cases:
 - A zone panics, which is a bug in coolerd.
 - The start fails part way. The fans and the boards that coolerd has taken over by then are released.
 
-One zone that stops with an error stops every zone. coolerd logs each error that a zone returns, also an error that a zone returns while it stops after a signal or after the error of another zone.
+One zone that stops with an error stops every zone. coolerd logs each error that a zone returns as soon as it receives it, in a line that starts with `Zone error:`, also an error that a zone returns while it stops after a signal or after the error of another zone. The first of these errors sets the exit status, and coolerd logs it once more as it exits.
 
 ```mermaid
 flowchart TD

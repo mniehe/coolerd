@@ -38,7 +38,8 @@ termination owner.
 - `src/main.rs`: `zone_loop` returns the first error that `on_failure` does
   not absorb, `run` aborts the other loops through a `JoinSet`, and
   `RunResults` keeps the first error of any loop as the result, also one
-  that comes after a signal, and hands each later error back to be logged.
+  that comes after a signal, and hands every error, the first included,
+  back to `run` to be logged as it arrives.
   `finish`, which `main_wrapper` calls, drops `MainApp` before
   `exit_result`, and `main` exits 1 on an error. `FanGuard::drop` in `src/fan.rs` and
   `IpmiSession::drop` in `src/session.rs` are the cleanup. The first
