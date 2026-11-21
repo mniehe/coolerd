@@ -241,4 +241,6 @@ the fans slow, or breaks the deployed unit:
   block the shutdown path
 - the zone loop and the shutdown path in `src/main.rs`
 - `nix/**`
+- `docs/examples/*.nix`, because users copy these recipes onto deployed hosts,
+  and they set the unit's user, `PATH` and hwmon grants
 - `.claude/review/review.yaml`
