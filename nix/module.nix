@@ -126,7 +126,7 @@ with lib; let
     else [];
   settingsZones = listOrEmpty (cfg.settings.zones or null);
   # The daemon also reads a zone written as a list in field order, as the
-  # fields of Zone in src/config.rs are declared; fans is the twelfth
+  # fields of ZoneKeys in src/config.rs are declared; fans is the twelfth
   zoneFansIndex = 11;
   zoneFans = zone:
     if isAttrs zone

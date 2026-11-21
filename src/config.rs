@@ -369,7 +369,9 @@ pub enum FanConfig {
 /// zone may also be written as a TOML array, whose values serde reads in the
 /// order the fields are declared; nix/module.nix reads `fans` at index 11.
 /// Add a new field after the existing ones, so that a config in that form
-/// keeps loading.
+/// keeps loading. An array that reaches `curve` sets `steps` as well, which
+/// `load_config` rejects, so `fans` and the fields after it can be set only
+/// in the table form.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename = "Zone")]
 struct ZoneKeys {
@@ -2720,22 +2722,22 @@ mod tests {
         assert_eq!(loaded_recovery(r#"{ type = "retry", max_delay_s = 3600 }"#), Recovery::Retry { max_delay_s: 3600 });
     }
 
-    /// A zone written as an array of twelve elements, the last one `fans`,
-    /// followed by `extra`
-    fn positional_zone(extra: &str) -> String {
-        format!(r#"zones = [["default", 1, 2, 0, [0], [{{ type = "file", path = "/dev/null" }}], {{ type = "maximum" }}, [{{ temp = 40, dcycle = 70 }}], {{ type = "maximum" }}, 0, "gpu", [{{ type = "nvidia", gpu = "00000000:01:00.0", fan = 0 }}]{}]]"#, extra)
-    }
-
+    /// An array zone loads only up to element 9, `hysteresis`: from element
+    /// 10, `curve`, it sets both `steps` and `curve`, which load_config
+    /// rejects, so such a zone cannot reach `fans` or `recovery`
     #[test]
     fn array_zone_loads_with_and_without_recovery() {
-        let fans = Some(vec![FanConfig::Nvidia { gpu: "00000000:01:00.0".to_owned(), fan: 0 }]);
-        let twelve: Config = toml::from_str(&positional_zone("")).unwrap();
-        let thirteen: Config = toml::from_str(&positional_zone(r#", { type = "exit" }"#)).unwrap();
+        let ten = parse(r#"zones = [["default", 1, 2, 0, [0], [{ type = "file", path = "/dev/null" }], { type = "maximum" }, [{ temp = 40, dcycle = 70 }], { type = "maximum" }, 0]]"#).unwrap();
 
-        assert_eq!(twelve.zones[0].fans, fans);
-        assert_eq!(twelve.zone_recovery, [Recovery::Retry { max_delay_s: 300 }]);
-        assert_eq!(thirteen.zones[0].fans, fans);
-        assert_eq!(thirteen.zone_recovery, [Recovery::Exit {}]);
+        assert_eq!(ten.zone_recovery, [Recovery::Retry { max_delay_s: 300 }]);
+
+        let thirteen = r#"
+            zones = [["default", 1, 2, 0, [0], [{ type = "file", path = "/dev/null" }], { type = "maximum" }, [{ temp = 40, dcycle = 70 }], { type = "maximum" }, 0, "gpu", [{ type = "nvidia", gpu = "00000000:01:00.0", fan = 0 }], { type = "exit" }]]
+            [curves.gpu]
+            steps = [{ temp = 40, dcycle = 70 }]
+        "#;
+
+        assert_eq!(validation_reason(thirteen), "zones[0].curve: set either steps or curve, not both");
     }
 
     #[test]
