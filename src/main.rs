@@ -121,6 +121,8 @@ struct MainApp {
     restore_failures: RestoreFailures,
     /// The zones in recovery
     recoveries: Recoveries,
+    /// Whether a zone was in recovery when `run` accepted the first stop
+    stop_recoveries: RecoveryOutcome,
 }
 
 impl MainApp {
@@ -142,6 +144,7 @@ impl MainApp {
             release_failures: ReleaseFailures::default(),
             restore_failures,
             recoveries: Recoveries::default(),
+            stop_recoveries: RecoveryOutcome::AllRunning,
         })
     }
 
@@ -164,6 +167,7 @@ impl MainApp {
         }
 
         let mut results = RunResults::default();
+        let mut at_stop = None;
 
         loop {
             let ret: Result<()> = tokio::select! {
@@ -191,6 +195,10 @@ impl MainApp {
                 }
             };
 
+            // A zone inside an update finishes it after the stop, and that
+            // update can end its recovery; the stop still found it in recovery
+            at_stop.get_or_insert_with(|| self.recoveries.outcome());
+
             if let Some(line) = results.add(ret) {
                 error!("{}", line);
             }
@@ -204,6 +212,8 @@ impl MainApp {
             // the Arcs alive.
             loops.abort_all();
         }
+
+        self.stop_recoveries = at_stop.unwrap_or(RecoveryOutcome::AllRunning);
 
         results.into_result()
     }
@@ -323,12 +333,24 @@ fn nvml_worker_failed(error: &Error) -> bool {
     }
 }
 
+/// Whether a zone has completed an update since it started
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ZoneProgress {
+    NeverUpdated,
+    /// At least one update succeeded; this never goes back
+    Updated,
+}
+
 /// Decide whether a zone retries `failure` after its fans were released with
-/// `release`. Only a fan error is retried, and only under `retry`: a source
-/// error is the source's `on_failure = exit`, a failed NVML worker never
-/// recovers in the process, and a failed release can leave a fan slow.
-fn after_failure(recovery: Recovery, failure: &ZoneFailure, release: ReleaseOutcome) -> AfterFailure {
+/// `release`. Only a fan error is retried, and only under `retry` once the
+/// zone has completed an update: before that a failure is a fan or a config
+/// that does not work, and stopping lets the session's drop set each IPMI
+/// zone to 100%. A source error is the source's `on_failure = exit`, a
+/// failed NVML worker never recovers in the process, and a failed release
+/// can leave a fan slow.
+fn after_failure(recovery: Recovery, progress: ZoneProgress, failure: &ZoneFailure, release: ReleaseOutcome) -> AfterFailure {
     let retried = matches!(recovery, Recovery::Retry { .. })
+        && progress == ZoneProgress::Updated
         && failure.step == FailedStep::Fans
         && release == ReleaseOutcome::AllReleased
         && !nvml_worker_failed(&failure.error);
@@ -377,9 +399,10 @@ fn recovery_cap(recovery: Recovery) -> u64 {
     }
 }
 
-/// The log line of a failure that a zone retries after `delay_s` seconds
-fn retry_line(error: &Error, delay_s: u64) -> String {
-    format!("Zone error: {}; released the zone's fans, taking them over again in {} seconds", error, delay_s)
+/// The log line of a failure that the zone tagged `label` retries after
+/// `delay_s` seconds
+fn retry_line(label: &str, error: &Error, delay_s: u64) -> String {
+    format!("Zone error: [{}] {}; released the zone's fans, taking them over again in {} seconds", label, error, delay_s)
 }
 
 /// Whether any zone is in recovery
@@ -403,6 +426,16 @@ impl Recoveries {
             RecoveryOutcome::SomeRecovering
         }
     }
+}
+
+/// The recovery outcome of a run: some zone counts as in recovery when one
+/// was when `run` accepted the first stop, or still is after every zone ended
+fn kept_recovery(at_stop: RecoveryOutcome, after_join: RecoveryOutcome) -> RecoveryOutcome {
+    if at_stop == RecoveryOutcome::SomeRecovering {
+        return at_stop;
+    }
+
+    after_join
 }
 
 /// One zone's count in [`Recoveries`]. An abort leaves a zone in recovery
@@ -443,10 +476,17 @@ impl ZoneHealth {
 
 /// The work of one zone that [`recover`] drives
 trait ZoneSteps {
+    /// The tag of the zone's log lines
+    fn label(&self) -> &str;
     /// Build the zone's fans and take each over, holding it in `fans`
     fn take_over(&mut self, fans: &mut FanGuard) -> Result<()>;
     /// Read the sources and drive the fans once
     fn update(&mut self, fans: &mut FanGuard) -> Result<(), ZoneFailure>;
+    /// Release every fan of `fans` and return whether each release succeeded
+    fn release(&mut self, fans: FanGuard) -> ReleaseOutcome;
+    /// Forget the smoothed readings of the sources, so that a take-over after
+    /// a failure maps only readings taken since
+    fn clear_smoothing(&mut self);
 }
 
 /// A zone of the config, on its session and NVML. The source state lasts
@@ -461,13 +501,23 @@ struct LiveZone {
     readers: ZoneReaders,
 }
 
+/// Each step that calls a fan or a source blocks on IPMI, sysfs or NVML, so it
+/// runs in `block_in_place` and leaves the worker thread to the other zones
 impl ZoneSteps for LiveZone {
-    fn take_over(&mut self, fans: &mut FanGuard) -> Result<()> {
-        for fan_config in &self.zone_config.fan_list {
-            fans.add(build_fan(fan_config, self.session.as_ref(), &self.hwmon, &self.nvml)?)?;
-        }
+    fn label(&self) -> &str {
+        zone_label(self.session.as_deref())
+    }
 
-        info!("[{}] Starting loop for fans {:?}", zone_label(self.session.as_deref()), fans.descriptions());
+    fn take_over(&mut self, fans: &mut FanGuard) -> Result<()> {
+        task::block_in_place(|| {
+            for fan_config in &self.zone_config.fan_list {
+                fans.add(build_fan(fan_config, self.session.as_ref(), &self.hwmon, &self.nvml)?)?;
+            }
+
+            Ok::<_, Error>(())
+        })?;
+
+        info!("[{}] Starting loop for fans {:?}", self.label(), fans.descriptions());
 
         Ok(())
     }
@@ -477,12 +527,21 @@ impl ZoneSteps for LiveZone {
             MainApp::update_duty_cycle(self.session.as_deref(), &self.zone_config, &mut self.state, &mut self.readers, fans)
         })
     }
+
+    fn release(&mut self, fans: FanGuard) -> ReleaseOutcome {
+        task::block_in_place(|| fans.release())
+    }
+
+    fn clear_smoothing(&mut self) {
+        self.state.clear_smoothing();
+    }
 }
 
 /// Run `zone` until a failure that `recovery` does not retry, and return its
 /// error. Each attempt takes the fans over with a fresh guard and updates
-/// them every `interval`; after a failure the guard releases them, and a
-/// retried zone waits through `sleep` before the next attempt.
+/// them every `interval`; after a failure the zone releases them, and a
+/// retried zone waits through `sleep` and forgets its smoothed readings
+/// before the next attempt.
 ///
 /// Each Supermicro fan holds an Arc of the session, so the guard releases the
 /// zone's fans before the session's own drop restores the fan mode. A panic
@@ -502,13 +561,14 @@ where
     F: Future<Output = ()>,
 {
     let mut backoff = Backoff::new(recovery_cap(recovery));
+    let mut progress = ZoneProgress::NeverUpdated;
 
     loop {
         let mut fans = FanGuard::new(release_failures.clone());
-        let failure = attempt(zone, &mut fans, interval, &mut backoff, health, &mut sleep).await;
-        let release = fans.release();
+        let failure = attempt(zone, &mut fans, interval, &mut backoff, &mut progress, health, &mut sleep).await;
+        let release = zone.release(fans);
 
-        if after_failure(recovery, &failure, release) == AfterFailure::Stop {
+        if after_failure(recovery, progress, &failure, release) == AfterFailure::Stop {
             return failure.error;
         }
 
@@ -516,18 +576,20 @@ where
 
         let delay_s = backoff.failed();
 
-        error!("{}", retry_line(&failure.error, delay_s));
+        error!("{}", retry_line(zone.label(), &failure.error, delay_s));
         sleep(Duration::from_secs(delay_s)).await;
+        zone.clear_smoothing();
     }
 }
 
 /// Take the fans of `zone` over into `fans` and update them every `interval`
-/// until a step fails
+/// until a step fails. A successful update marks `progress`.
 async fn attempt<Z, S, F>(
     zone: &mut Z,
     fans: &mut FanGuard,
     interval: Duration,
     backoff: &mut Backoff,
+    progress: &mut ZoneProgress,
     health: &mut ZoneHealth,
     sleep: &mut S,
 ) -> ZoneFailure
@@ -545,10 +607,11 @@ where
             return failure;
         }
 
+        *progress = ZoneProgress::Updated;
         backoff.reset();
 
         if health.updated() {
-            info!("Fans {:?} run again after recovery", fans.descriptions());
+            info!("[{}] Fans {:?} run again after recovery", zone.label(), fans.descriptions());
         }
 
         sleep(interval).await;
@@ -701,6 +764,7 @@ fn finish(run: Result<()>, app: MainApp) -> Result<()> {
     let releases = app.release_failures.clone();
     let restores = app.restore_failures.clone();
     let recoveries = app.recoveries.clone();
+    let at_stop = app.stop_recoveries;
 
     // Every zone task has ended, so every guard has released its fans. The app
     // holds the last handle of each session, so this drop sets each session's
@@ -708,7 +772,7 @@ fn finish(run: Result<()>, app: MainApp) -> Result<()> {
     // decided.
     drop(app);
 
-    exit_result(run, releases.outcome(), restores.outcome(), recoveries.outcome())
+    exit_result(run, releases.outcome(), restores.outcome(), kept_recovery(at_stop, recoveries.outcome()))
 }
 
 #[tokio::main]
@@ -752,6 +816,7 @@ mod tests {
             exit_result,
             FailedStep,
             finish,
+            kept_recovery,
             MainApp,
             Opt,
             query_sensors,
@@ -765,10 +830,12 @@ mod tests {
             start_up,
             ZoneFailure,
             ZoneHealth,
+            ZoneProgress,
             ZoneSteps,
         },
         crate::{
             config::{Config, FanConfig, load_config, parse_config, Recovery},
+            curve::ZoneState,
             error::Error,
             fan::{
                 fake::{CallLog, FakeFan, Op},
@@ -776,6 +843,7 @@ mod tests {
                 ReleaseFailures,
                 ReleaseOutcome,
             },
+            hwmon::HwmonRoot,
             ipmi::FanMode,
             nvml::fake::FakeNvml,
             session::{
@@ -784,6 +852,7 @@ mod tests {
                 RestoreFailures,
                 RestoreOutcome,
             },
+            source::ZoneReaders,
         },
     };
 
@@ -1164,6 +1233,7 @@ mod tests {
             release_failures: ReleaseFailures::default(),
             restore_failures,
             recoveries: Recoveries::default(),
+            stop_recoveries: RecoveryOutcome::AllRunning,
         }
     }
 
@@ -1318,10 +1388,17 @@ mod tests {
     #[test]
     fn only_a_fan_error_with_a_clean_release_is_retried() {
         let exit = Recovery::Exit {};
+        let updated = ZoneProgress::Updated;
 
-        assert_eq!(after_failure(RETRY_300, &failure(FailedStep::Fans, plain_error()), ReleaseOutcome::AllReleased), AfterFailure::Retry);
-        assert_eq!(after_failure(RETRY_300, &failure(FailedStep::Fans, fan_error(plain_error())), ReleaseOutcome::AllReleased), AfterFailure::Retry);
-        assert_eq!(after_failure(exit, &failure(FailedStep::Fans, plain_error()), ReleaseOutcome::AllReleased), AfterFailure::Stop);
+        assert_eq!(after_failure(RETRY_300, updated, &failure(FailedStep::Fans, plain_error()), ReleaseOutcome::AllReleased), AfterFailure::Retry);
+        assert_eq!(after_failure(RETRY_300, updated, &failure(FailedStep::Fans, fan_error(plain_error())), ReleaseOutcome::AllReleased), AfterFailure::Retry);
+        assert_eq!(after_failure(exit, updated, &failure(FailedStep::Fans, plain_error()), ReleaseOutcome::AllReleased), AfterFailure::Stop);
+
+        // A zone that has never completed an update stops on a fan error too
+        let never = ZoneProgress::NeverUpdated;
+
+        assert_eq!(after_failure(RETRY_300, never, &failure(FailedStep::Fans, plain_error()), ReleaseOutcome::AllReleased), AfterFailure::Stop);
+        assert_eq!(after_failure(RETRY_300, never, &failure(FailedStep::Fans, fan_error(plain_error())), ReleaseOutcome::AllReleased), AfterFailure::Stop);
 
         for recovery in [RETRY_300, exit] {
             let stops = [
@@ -1332,7 +1409,7 @@ mod tests {
             ];
 
             for (failure, release) in stops {
-                assert_eq!(after_failure(recovery, &failure, release), AfterFailure::Stop, "{:?} {:?} {:?}", recovery, failure, release);
+                assert_eq!(after_failure(recovery, updated, &failure, release), AfterFailure::Stop, "{:?} {:?} {:?}", recovery, failure, release);
             }
         }
     }
@@ -1340,11 +1417,73 @@ mod tests {
     #[test]
     fn retry_line_names_the_error_and_the_delay() {
         let error = fan_error(plain_error());
-        let line = retry_line(&error, 40);
+        let line = retry_line("bmc", &error, 40);
 
-        assert!(line.starts_with("Zone error: "), "{}", line);
+        assert!(line.starts_with("Zone error: [bmc] "), "{}", line);
         assert!(line.contains(&error.to_string()), "{}", line);
         assert!(line.contains("40 seconds"), "{}", line);
+    }
+
+    #[test]
+    fn recovery_seen_at_the_stop_is_kept() {
+        use RecoveryOutcome::{AllRunning, SomeRecovering};
+
+        // The zone was in recovery as the stop came, then finished an update
+        assert_eq!(kept_recovery(SomeRecovering, AllRunning), SomeRecovering);
+        assert_eq!(kept_recovery(AllRunning, SomeRecovering), SomeRecovering);
+        assert_eq!(kept_recovery(AllRunning, AllRunning), AllRunning);
+
+        let calls = BoardLog::default();
+        let app = MainApp { stop_recoveries: SomeRecovering, ..app_over(FakeBoard::new(FanMode::Standard, &calls)) };
+        let result = finish(Ok(()), app);
+
+        assert!(matches!(result, Err(Error::ZonesInRecovery)), "{:?}", result);
+
+        let result = finish(Ok(()), app_over(FakeBoard::new(FanMode::Standard, &calls)));
+
+        assert!(result.is_ok(), "{:?}", result);
+    }
+
+    /// A zone of one `ipmi` source with `source_keys` and no retries, with no
+    /// session to query
+    fn sessionless_zone(source_keys: &str) -> Config {
+        parse(&format!(concat!(
+            "[[zones]]\n",
+            "retries = 0\n",
+            "ipmi_zones = [0]\n",
+            "sources = [{{ type = \"ipmi\", sensor = \"CPU Temp\"{} }}]\n",
+            "steps = [{{ temp = 40, dcycle = 40 }}]\n",
+        ), source_keys))
+    }
+
+    /// Run one update of the zone of `config` with no session over `fan`
+    fn update_once(config: &Config, fan: FakeFan) -> super::Result<(), ZoneFailure> {
+        let zone = &config.zones[0];
+        let mut state = ZoneState::new(zone);
+        let mut readers = ZoneReaders::new(HwmonRoot::default());
+        let mut fans = FanGuard::new(ReleaseFailures::default());
+
+        fans.add(Box::new(fan)).unwrap();
+
+        MainApp::update_duty_cycle(None, zone, &mut state, &mut readers, &mut fans)
+    }
+
+    #[test]
+    fn update_tags_a_source_error_and_a_fan_error() {
+        let calls = CallLog::default();
+        let failing_fan = || FakeFan { failing: Some(Op::SetDuty), ..FakeFan::new("a", &calls) };
+
+        // The default `on_failure = exit` returns the failed query's error
+        let source = update_once(&sessionless_zone(""), failing_fan()).unwrap_err();
+
+        assert_eq!(source.step, FailedStep::Sources, "{:?}", source);
+        assert!(!log_of(&calls).contains(&("a", Op::SetDuty)), "a source error drives no fan");
+
+        // Under `ignore` the zone runs at 100% and the fan refuses it
+        let fan = update_once(&sessionless_zone(", on_failure = { type = \"ignore\" }"), failing_fan()).unwrap_err();
+
+        assert_eq!(fan.step, FailedStep::Fans, "{:?}", fan);
+        assert!(matches!(&fan.error, Error::Fan { fan, .. } if fan == "a"), "{:?}", fan);
     }
 
     #[test]
@@ -1392,20 +1531,48 @@ mod tests {
     /// The update interval of a fake zone
     const FAKE_INTERVAL: Duration = Duration::from_secs(5);
 
+    /// A step of [`ZoneSteps`] that a fake zone ran
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ZoneStep {
+        TakeOver,
+        Update,
+        Release,
+        ClearSmoothing,
+    }
+
     /// A zone whose take-overs hand out fake fans, one list per take-over in
-    /// order, and whose updates drive them at [`FAKE_DUTY`]
+    /// order, and whose updates drive them at [`FAKE_DUTY`]. It records each
+    /// step it runs.
     struct FakeZone {
         takeovers: VecDeque<Vec<FakeFan>>,
+        /// The updates, counted from 0 across take-overs, that fail with a fan
+        /// error before they drive the fans
+        failing_updates: Vec<usize>,
+        updates: usize,
+        /// What `release` reports in place of the guard's own outcome
+        reported_release: Option<ReleaseOutcome>,
+        steps: Vec<ZoneStep>,
     }
 
     impl FakeZone {
         fn new(takeovers: Vec<Vec<FakeFan>>) -> Self {
-            Self { takeovers: takeovers.into() }
+            Self { takeovers: takeovers.into(), failing_updates: Vec::new(), updates: 0, reported_release: None, steps: Vec::new() }
+        }
+
+        /// A zone whose updates numbered in `failing_updates` fail
+        fn failing(takeovers: Vec<Vec<FakeFan>>, failing_updates: &[usize]) -> Self {
+            Self { failing_updates: failing_updates.to_vec(), ..Self::new(takeovers) }
         }
     }
 
     impl ZoneSteps for FakeZone {
+        fn label(&self) -> &str {
+            "fake"
+        }
+
         fn take_over(&mut self, fans: &mut FanGuard) -> super::Result<()> {
+            self.steps.push(ZoneStep::TakeOver);
+
             for fan in self.takeovers.pop_front().expect("a take-over is left") {
                 fans.add(Box::new(fan))?;
             }
@@ -1414,9 +1581,30 @@ mod tests {
         }
 
         fn update(&mut self, fans: &mut FanGuard) -> super::Result<(), ZoneFailure> {
+            let number = self.updates;
+
+            self.steps.push(ZoneStep::Update);
+            self.updates += 1;
+
+            if self.failing_updates.contains(&number) {
+                return Err(ZoneFailure { step: FailedStep::Fans, error: fan_error(plain_error()) });
+            }
+
             fans.set_duty(FAKE_DUTY)
                 .map(|_| ())
                 .map_err(|error| ZoneFailure { step: FailedStep::Fans, error })
+        }
+
+        fn release(&mut self, fans: FanGuard) -> ReleaseOutcome {
+            self.steps.push(ZoneStep::Release);
+
+            let outcome = fans.release();
+
+            self.reported_release.unwrap_or(outcome)
+        }
+
+        fn clear_smoothing(&mut self) {
+            self.steps.push(ZoneStep::ClearSmoothing);
         }
     }
 
@@ -1469,23 +1657,52 @@ mod tests {
         calls.lock().unwrap().clone()
     }
 
+    /// A wait of `seconds` seconds, as a retry waits
+    fn secs(seconds: u64) -> Duration {
+        Duration::from_secs(seconds)
+    }
+
+    #[test]
+    fn failure_before_the_first_update_is_fatal() {
+        for failing in [Op::TakeControl, Op::SetDuty] {
+            let calls = CallLog::default();
+            let mut zone = FakeZone::new(vec![
+                vec![FakeFan { failing: Some(failing), ..FakeFan::new("a", &calls) }],
+                vec![FakeFan::new("b", &calls)],
+            ]);
+
+            let polled = poll_recovery(&mut zone, 3);
+
+            assert!(matches!(&polled.result, Poll::Ready(Error::Fan { fan, .. }) if fan == "a"), "{:?}: {:?}", failing, polled.result);
+            assert_eq!(polled.waits, [], "{:?}", failing);
+            assert_eq!(log_of(&calls).last(), Some(&("a", Op::Release)), "{:?}", failing);
+            assert_eq!(polled.recoveries, RecoveryOutcome::AllRunning, "{:?}", failing);
+        }
+    }
+
     #[test]
     fn failed_zone_releases_its_fans_and_takes_over_again() {
         let calls = CallLog::default();
-        let mut zone = FakeZone::new(vec![
-            vec![FakeFan { failing: Some(Op::SetDuty), ..FakeFan::new("first", &calls) }],
+        let mut zone = FakeZone::failing(vec![
+            vec![FakeFan::new("first", &calls)],
             vec![FakeFan::new("second", &calls)],
-        ]);
+        ], &[1]);
 
-        let polled = poll_recovery(&mut zone, 2);
+        let polled = poll_recovery(&mut zone, 3);
 
         assert!(polled.result.is_pending(), "the loop returned {:?}", polled.result);
-        assert_eq!(polled.waits, [Duration::from_secs(10), FAKE_INTERVAL, FAKE_INTERVAL]);
+        assert_eq!(polled.waits, [FAKE_INTERVAL, secs(10), FAKE_INTERVAL, FAKE_INTERVAL]);
         assert_eq!(log_of(&calls), [
             ("first", Op::TakeControl), ("first", Op::SetDuty), ("first", Op::Release),
             ("second", Op::TakeControl), ("second", Op::SetDuty), ("second", Op::SetDuty),
             // Dropping the waiting loop, as an abort does, releases the fans
             ("second", Op::Release),
+        ]);
+        // The smoothing is cleared once, after the retry's wait and before its
+        // take-over, and never before the first take-over
+        assert_eq!(zone.steps, [
+            ZoneStep::TakeOver, ZoneStep::Update, ZoneStep::Update, ZoneStep::Release,
+            ZoneStep::ClearSmoothing, ZoneStep::TakeOver, ZoneStep::Update, ZoneStep::Update,
         ]);
         assert_eq!(polled.recoveries, RecoveryOutcome::AllRunning);
         assert_eq!(polled.releases, ReleaseOutcome::AllReleased);
@@ -1494,34 +1711,96 @@ mod tests {
     #[test]
     fn failed_takeover_is_retried_and_failed_release_is_fatal() {
         let calls = CallLog::default();
-        let mut zone = FakeZone::new(vec![
-            vec![FakeFan { failing: Some(Op::TakeControl), ..FakeFan::new("first", &calls) }],
-            vec![FakeFan::new("second", &calls)],
+        let mut zone = FakeZone::failing(vec![
+            vec![FakeFan::new("first", &calls)],
+            vec![FakeFan { failing: Some(Op::TakeControl), ..FakeFan::new("second", &calls) }],
+            vec![FakeFan::new("third", &calls)],
+        ], &[1]);
+
+        let polled = poll_recovery(&mut zone, 3);
+
+        assert!(polled.result.is_pending(), "the loop returned {:?}", polled.result);
+        assert_eq!(polled.waits, [FAKE_INTERVAL, secs(10), secs(20), FAKE_INTERVAL]);
+        assert_eq!(log_of(&calls), [
+            ("first", Op::TakeControl), ("first", Op::SetDuty), ("first", Op::Release),
+            ("second", Op::TakeControl), ("second", Op::Release),
+            ("third", Op::TakeControl), ("third", Op::SetDuty), ("third", Op::Release),
         ]);
+
+        let calls = CallLog::default();
+        let mut zone = FakeZone::failing(vec![vec![
+            FakeFan::new("a", &calls),
+            FakeFan { failing: Some(Op::Release), ..FakeFan::new("b", &calls) },
+        ]], &[1]);
+
+        let polled = poll_recovery(&mut zone, 3);
+
+        assert!(matches!(&polled.result, Poll::Ready(Error::Fan { .. })), "{:?}", polled.result);
+        assert_eq!(polled.waits, [FAKE_INTERVAL]);
+        assert_eq!(polled.releases, ReleaseOutcome::SomeFailed);
+        assert_eq!(log_of(&calls), [
+            ("a", Op::TakeControl), ("b", Op::TakeControl), ("a", Op::SetDuty), ("b", Op::SetDuty),
+            ("b", Op::Release), ("a", Op::Release),
+        ]);
+    }
+
+    #[test]
+    fn recover_releases_through_the_zone_step() {
+        let calls = CallLog::default();
+        let mut zone = FakeZone::failing(vec![vec![FakeFan::new("a", &calls)], vec![FakeFan::new("b", &calls)]], &[1]);
 
         let polled = poll_recovery(&mut zone, 1);
 
         assert!(polled.result.is_pending(), "the loop returned {:?}", polled.result);
-        assert_eq!(polled.waits, [Duration::from_secs(10), FAKE_INTERVAL]);
-        assert_eq!(log_of(&calls), [
-            ("first", Op::TakeControl), ("first", Op::Release),
-            ("second", Op::TakeControl), ("second", Op::SetDuty), ("second", Op::Release),
-        ]);
+        assert_eq!(zone.steps.iter().filter(|step| **step == ZoneStep::Release).count(), 1);
 
+        // The fans release cleanly, but the step's report decides
         let calls = CallLog::default();
-        let mut zone = FakeZone::new(vec![vec![
-            FakeFan { failing: Some(Op::SetDuty), ..FakeFan::new("a", &calls) },
-            FakeFan { failing: Some(Op::Release), ..FakeFan::new("b", &calls) },
-        ]]);
+        let mut zone = FakeZone {
+            reported_release: Some(ReleaseOutcome::SomeFailed),
+            ..FakeZone::failing(vec![vec![FakeFan::new("a", &calls)], vec![FakeFan::new("b", &calls)]], &[1])
+        };
 
-        let polled = poll_recovery(&mut zone, usize::MAX);
+        let polled = poll_recovery(&mut zone, 3);
 
-        assert!(matches!(&polled.result, Poll::Ready(Error::Fan { fan, .. }) if fan == "a"), "{:?}", polled.result);
-        assert_eq!(polled.waits, []);
-        assert_eq!(polled.releases, ReleaseOutcome::SomeFailed);
-        assert_eq!(log_of(&calls), [
-            ("a", Op::TakeControl), ("b", Op::TakeControl), ("a", Op::SetDuty),
-            ("b", Op::Release), ("a", Op::Release),
+        assert!(matches!(&polled.result, Poll::Ready(Error::Fan { .. })), "{:?}", polled.result);
+        assert_eq!(polled.waits, [FAKE_INTERVAL]);
+        assert_eq!(zone.steps, [ZoneStep::TakeOver, ZoneStep::Update, ZoneStep::Update, ZoneStep::Release]);
+        assert_eq!(log_of(&calls).last(), Some(&("a", Op::Release)));
+        assert_eq!(polled.releases, ReleaseOutcome::AllReleased);
+    }
+
+    #[test]
+    fn zone_waiting_to_retry_counts_as_recovering() {
+        let calls = CallLog::default();
+        let mut zone = FakeZone::failing(vec![vec![FakeFan::new("a", &calls)], vec![FakeFan::new("b", &calls)]], &[1]);
+
+        let polled = poll_recovery(&mut zone, 1);
+
+        assert!(polled.result.is_pending(), "the loop returned {:?}", polled.result);
+        assert_eq!(polled.waits, [FAKE_INTERVAL, secs(10)]);
+        assert_eq!(polled.recoveries, RecoveryOutcome::SomeRecovering);
+    }
+
+    #[test]
+    fn recover_doubles_the_wait_and_resets_after_an_update() {
+        let calls = CallLog::default();
+        let mut zone = FakeZone::failing(vec![
+            vec![FakeFan::new("a", &calls)],
+            vec![FakeFan::new("b", &calls)],
+            vec![FakeFan::new("c", &calls)],
+        ], &[1, 2, 4]);
+
+        let polled = poll_recovery(&mut zone, 4);
+
+        assert!(polled.result.is_pending(), "the loop returned {:?}", polled.result);
+        // Between the update intervals the retries wait 10, 20, then 10 again
+        assert_eq!(polled.waits, [FAKE_INTERVAL, secs(10), secs(20), FAKE_INTERVAL, secs(10)]);
+        // One clear per retry, each before that retry's take-over
+        assert_eq!(zone.steps, [
+            ZoneStep::TakeOver, ZoneStep::Update, ZoneStep::Update, ZoneStep::Release,
+            ZoneStep::ClearSmoothing, ZoneStep::TakeOver, ZoneStep::Update, ZoneStep::Release,
+            ZoneStep::ClearSmoothing, ZoneStep::TakeOver, ZoneStep::Update, ZoneStep::Update, ZoneStep::Release,
         ]);
     }
 }
