@@ -103,7 +103,7 @@ These errors stop coolerd with status 1 under either `recovery`, after the zone 
 - The release of one of the zone's fans failed or panicked. The fan may then run slower than the zone asked for, so coolerd does not take it over again in the same process.
 - The zone panicked, which is a bug in coolerd.
 
-A stop while a zone is in recovery exits with status 1. A zone is in recovery from a retried failure until its first successful update after the next take-over. A zone that is inside that update when the stop comes still counts, although it finishes the update. A stop after the zone has recovered does not count. This holds whether a signal or the error of another zone stops coolerd.
+A stop while a zone is in recovery exits with status 1. A zone counts as in recovery if it was in recovery at the moment coolerd accepted the stop, or if it still is after every zone has stopped. A zone is in recovery from a retried failure until its first successful update after the next take-over. So a zone that is inside that update when coolerd accepts the stop still counts, although it finishes the update. A stop after the zone has recovered does not count. This holds whether a signal or the error of another zone stops coolerd.
 
 In this zone no wait is longer than one minute:
 
@@ -140,11 +140,11 @@ When the release of one fan fails, coolerd logs an error that names the fan, and
 
 ### Supermicro fan
 
-coolerd sets the IPMI zone of the fan to 100%. After every zone has stopped, coolerd sets each IPMI zone that the config names on the board to 100%, for most zones a second time, and then restores the fan mode that it saved at the start.
+coolerd tries to set the IPMI zone of the fan to 100%. After every zone has stopped, coolerd tries to set each IPMI zone that the config names on the board to 100%, for most zones a second time, and then tries to restore the fan mode that it saved at the start.
 
-When the saved mode was the full mode, coolerd restores nothing: the board stays in the full mode at 100%.
+When the saved mode was the full mode, coolerd restores nothing: the board stays in the full mode, at 100% when the writes succeeded.
 
-When the restore of the fan mode fails, coolerd logs an error that names the session and exits with status 1. The board may then stay in the full mode. When a write of 100% in this last step fails, coolerd logs an error that names the session and the IPMI zone, still makes the other writes and the restore, and exits with status 1. This write can be the only one of 100% that the zone gets: a signal that arrives before a zone has started stops it before it can release its fans.
+When the restore of the fan mode fails, coolerd logs an error that names the session and exits with status 1. The board may then stay in the full mode. When a write of 100% in this last step fails, coolerd logs an error that names the session and the IPMI zone, still attempts the other writes and the restore, and exits with status 1. This write can be the only one of 100% that the zone gets: a signal that arrives before a zone has started stops it before it can release its fans.
 
 When the switch to the full mode fails at the start, coolerd runs the same steps before it exits.
 
@@ -188,13 +188,13 @@ A `supermicro` or `hwmon` fan that cannot be read, and any fan that refuses a wr
 
 | Status | Meaning |
 |---|---|
-| 0 | SIGINT or SIGTERM stopped coolerd, no zone returned an error, no zone was in recovery, every fan was released, every IPMI zone took 100% and every board got its saved fan mode back. Also after `--help`. |
+| 0 | SIGINT or SIGTERM stopped coolerd, no zone returned an error, no zone was in recovery when coolerd accepted the stop or after every zone had stopped, every fan was released, every IPMI zone took 100% and every board got its saved fan mode back. Also after `--help`. |
 | 2 | The command line was wrong, such as a missing `--config`. |
-| 1 | Any other error: a config error, a failed start, a source failure with `on_failure = { type = "exit" }`, a fan error in a zone with `recovery = { type = "exit" }`, any error of a zone that had not yet completed an update, a failed NVML call that stops all NVML work, a panic, a fan that could not be released, an IPMI zone that could not be set to 100% as coolerd stopped, a fan mode that could not be restored, or a stop while a zone was in [recovery](#when-a-fan-fails). A zone error counts also when a signal came first. |
+| 1 | Any other error: a config error, a failed start, a source failure with `on_failure = { type = "exit" }`, a fan error in a zone with `recovery = { type = "exit" }`, any error of a zone that had not yet completed an update, a failed NVML call that stops all NVML work, a panic, a fan that could not be released, an IPMI zone that could not be set to 100% as coolerd stopped, a fan mode that could not be restored, or a zone in [recovery](#when-a-fan-fails) when coolerd accepted the stop or after every zone had stopped. A zone error counts also when a signal came first. |
 
 When several of these apply, the zone error is the one that coolerd reports as it exits; after it come a fan that was not released, then a board that was not restored, then a zone in recovery.
 
-The [NixOS module](nixos.md) restarts the service 10 seconds after an exit with status 1. A fan error that a zone retries does not end coolerd, so it causes no restart.
+The [NixOS module](nixos.md) restarts the service 10 seconds after an exit with status 1, through systemd's `Restart=on-failure`. systemd does not restart a service that an explicit `systemctl stop` stopped, so after a release that fails during such a stop, nothing starts coolerd again until you start it. A fan error that a zone retries does not end coolerd, so it causes no restart.
 
 ## Limits
 

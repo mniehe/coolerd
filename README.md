@@ -17,7 +17,7 @@ coolerd is a fork of [chenxiaolong/ipmi-fan-control](https://github.com/chenxiao
 
 The upstream project was tested mainly on a 6028U-TR4T+, which uses the X10DRU-i+ motherboard. Its author reported that the fan control IPMI commands did not change across five generations of Supermicro motherboards. This is a record of what was tested. It does not promise that coolerd works on your board.
 
-If you come from ipmi-fan-control, read [Migrating from ipmi-fan-control](docs/nixos.md#migrating-from-ipmi-fan-control). Existing config files still load.
+If you come from ipmi-fan-control, read [Migrating from ipmi-fan-control](docs/nixos.md#migrating-from-ipmi-fan-control). Config files from ipmi-fan-control load, with the exceptions that [Changes from earlier versions](docs/configuration.md#changes-from-earlier-versions) lists.
 
 What coolerd supports
 ---------------------

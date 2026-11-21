@@ -367,10 +367,10 @@ pub enum FanConfig {
 
 /// The config form of one zone: the keys of [`Zone`] and its [`Recovery`]. A
 /// zone may also be written as a TOML array, whose values serde reads in the
-/// order the fields are declared. Add a new field after the existing ones, so that a config in that form
-/// keeps loading. An array that reaches `curve` sets `steps` as well, which
-/// `load_config` rejects, so `fans` and the fields after it can be set only
-/// in the table form.
+/// order the fields are declared. Add a new field after the existing ones, so
+/// that a config in that form keeps loading. An array that reaches `curve`
+/// sets `steps` as well, which `load_config` rejects, so `fans` and the
+/// fields after it can be set only in the table form.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename = "Zone")]
 struct ZoneKeys {
