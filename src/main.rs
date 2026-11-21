@@ -167,18 +167,23 @@ impl MainApp {
         }
 
         let mut results = RunResults::default();
-        let mut at_stop = None;
 
         loop {
-            let ret: Result<()> = tokio::select! {
+            // A zone inside an update finishes it after the stop, and that
+            // update can end its recovery; the stop still found it in recovery.
+            // The boundary is the moment `run` accepts the stop, so each branch
+            // reads the recovery outcome before it does anything else.
+            let (ret, recovery): (Result<()>, RecoveryOutcome) = tokio::select! {
                 // Explicitly interrupted by ^C or signal handler
                 _ = signals.recv() => {
+                    let recovery = self.recoveries.outcome();
                     info!("Interrupted");
-                    Ok(())
+                    (Ok(()), recovery)
                 }
                 // Oh boy, this is an Option<Result<Result<()>, JoinError>>
                 r = loops.join_next() => {
-                    match r {
+                    let recovery = self.recoveries.outcome();
+                    let ret = match r {
                         // No tasks left
                         None => break,
                         // The task panicked or was aborted
@@ -191,15 +196,12 @@ impl MainApp {
                         },
                         // zone_loop's actual error return value
                         Some(Ok(r)) => r,
-                    }
+                    };
+                    (ret, recovery)
                 }
             };
 
-            // A zone inside an update finishes it after the stop, and that
-            // update can end its recovery; the stop still found it in recovery
-            at_stop.get_or_insert_with(|| self.recoveries.outcome());
-
-            if let Some(line) = results.add(ret) {
+            if let Some(line) = results.receive(ret, recovery) {
                 error!("{}", line);
             }
 
@@ -213,7 +215,7 @@ impl MainApp {
             loops.abort_all();
         }
 
-        self.stop_recoveries = at_stop.unwrap_or(RecoveryOutcome::AllRunning);
+        self.stop_recoveries = results.stop_recovery();
 
         results.into_result()
     }
@@ -624,9 +626,25 @@ where
 #[derive(Debug, Default)]
 struct RunResults {
     first_error: Option<Error>,
+    /// Whether a zone was in recovery when `run` accepted the first stop
+    at_stop: Option<RecoveryOutcome>,
 }
 
 impl RunResults {
+    /// Add one result with the recovery outcome read as `run` received it,
+    /// and keep the outcome of the first result: that one is the stop.
+    /// Returns the log line as [`RunResults::add`] does.
+    fn receive(&mut self, result: Result<()>, recovery: RecoveryOutcome) -> Option<String> {
+        self.at_stop.get_or_insert(recovery);
+
+        self.add(result)
+    }
+
+    /// Whether a zone was in recovery at the stop
+    fn stop_recovery(&self) -> RecoveryOutcome {
+        self.at_stop.unwrap_or(RecoveryOutcome::AllRunning)
+    }
+
     /// Add one result. Returns the log line of every error, the kept one
     /// included, so that an error reaches the log as soon as `run` receives
     /// it and not only when the process exits.
@@ -803,7 +821,7 @@ mod tests {
             future::Future,
             pin::{pin, Pin},
             process,
-            sync::Arc,
+            sync::{Arc, Mutex},
             task::{Context, Poll, Waker},
             time::Duration,
         },
@@ -817,6 +835,7 @@ mod tests {
             FailedStep,
             finish,
             kept_recovery,
+            LiveZone,
             MainApp,
             Opt,
             query_sensors,
@@ -834,11 +853,14 @@ mod tests {
             ZoneSteps,
         },
         crate::{
+            command::testing::TempDir,
             config::{Config, FanConfig, load_config, parse_config, Recovery},
             curve::ZoneState,
             error::Error,
             fan::{
                 fake::{CallLog, FakeFan, Op},
+                Applied,
+                Fan,
                 FanGuard,
                 ReleaseFailures,
                 ReleaseOutcome,
@@ -1442,6 +1464,98 @@ mod tests {
         let result = finish(Ok(()), app_over(FakeBoard::new(FanMode::Standard, &calls)));
 
         assert!(result.is_ok(), "{:?}", result);
+    }
+
+    #[test]
+    fn stop_snapshot_is_the_recovery_state_at_the_first_result() {
+        use RecoveryOutcome::{AllRunning, SomeRecovering};
+
+        // The signal found a zone in recovery, which then finished an update
+        // before the cancelled loops came back
+        let mut run = RunResults::default();
+
+        assert_eq!(run.receive(Ok(()), SomeRecovering), None);
+        assert_eq!(run.receive(Ok(()), AllRunning), None);
+        assert_eq!(run.stop_recovery(), SomeRecovering);
+
+        // The stop found every zone running, and a later result found one in
+        // recovery: the stop keeps its own outcome, and the outcome after the
+        // join still reports the later recovery
+        let mut run = RunResults::default();
+        let line = run.receive(Ok(()), AllRunning);
+        let later = run.receive(Err(Error::SensorsWithoutSession), SomeRecovering);
+
+        assert_eq!(line, None);
+        assert_eq!(later, Some(format!("Zone error: {}", Error::SensorsWithoutSession)));
+        assert_eq!(run.stop_recovery(), AllRunning);
+        assert_eq!(kept_recovery(run.stop_recovery(), SomeRecovering), SomeRecovering);
+
+        let result = run.into_result();
+
+        assert!(matches!(result, Err(Error::SensorsWithoutSession)), "{:?}", result);
+        assert_eq!(RunResults::default().stop_recovery(), AllRunning, "a run with no result found no zone in recovery");
+    }
+
+    /// A fan that records each duty it is driven at
+    struct DutyFan(Arc<Mutex<Vec<u8>>>);
+
+    impl Fan for DutyFan {
+        fn describe(&self) -> String {
+            "duty".to_owned()
+        }
+
+        fn take_control(&mut self) -> super::Result<()> {
+            Ok(())
+        }
+
+        fn set_duty(&mut self, duty: u8) -> super::Result<Applied> {
+            self.0.lock().unwrap().push(duty);
+
+            Ok(Applied { before: None, sent: Some(duty) })
+        }
+
+        fn release(&mut self) -> super::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `LiveZone::update` runs in `block_in_place`, which needs a multi-thread
+    /// runtime
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_zone_clear_drops_its_smoothing_samples() {
+        let dir = TempDir::new();
+        let temp = dir.write("temp", "40000");
+        let config = parse(&format!(concat!(
+            "[[zones]]\n",
+            "ipmi_zones = [0]\n",
+            "sources = [{{ type = \"file\", path = {:?}, smoothing_samples = 4 }}]\n",
+            "steps = [{{ temp = 40, dcycle = 40 }}, {{ temp = 80, dcycle = 100 }}]\n",
+        ), temp));
+        let zone_config = Arc::new(config.zones[0].clone());
+        let hwmon = HwmonRoot::default();
+        let mut zone = LiveZone {
+            session: None,
+            nvml: Arc::new(FakeNvml::default()),
+            state: ZoneState::new(&zone_config),
+            readers: ZoneReaders::new(hwmon.clone()),
+            hwmon,
+            zone_config,
+        };
+        let duties = Arc::new(Mutex::new(Vec::new()));
+        let mut fans = FanGuard::new(ReleaseFailures::default());
+
+        fans.add(Box::new(DutyFan(duties.clone()))).unwrap();
+
+        for _ in 0..3 {
+            zone.update(&mut fans).unwrap();
+        }
+
+        ZoneSteps::clear_smoothing(&mut zone);
+        fs::write(&temp, "80000").unwrap();
+        zone.update(&mut fans).unwrap();
+
+        // Without the clear, the mean of 40, 40, 40 and 80 would give 55%
+        assert_eq!(*duties.lock().unwrap(), [40, 40, 40, 100]);
     }
 
     /// A zone of one `ipmi` source with `source_keys` and no retries, with no
