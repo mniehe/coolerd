@@ -153,6 +153,41 @@ impl Default for OnFailure {
     }
 }
 
+/// The first wait of a zone's recovery, in seconds, and the lowest cap
+pub const RECOVERY_FIRST_DELAY_S: u64 = 10;
+
+/// The default cap of a zone's recovery wait, in seconds
+pub const RECOVERY_DEFAULT_MAX_DELAY_S: u64 = 300;
+
+/// The highest cap of a zone's recovery wait, in seconds
+pub const RECOVERY_MAX_DELAY_LIMIT_S: u64 = 3600;
+
+fn default_recovery_max_delay_s() -> u64 {
+    RECOVERY_DEFAULT_MAX_DELAY_S
+}
+
+/// What a zone does when a fan fails
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "lowercase", tag = "type")]
+pub enum Recovery {
+    /// Release the zone's fans, wait, and take them over again. The wait
+    /// doubles from [`RECOVERY_FIRST_DELAY_S`] up to `max_delay_s`.
+    Retry {
+        #[serde(default = "default_recovery_max_delay_s")]
+        max_delay_s: u64,
+    },
+    /// Stop the daemon, which releases every fan of every zone
+    // Serde ignores extra keys on a unit variant of a tagged enum; an empty
+    // struct variant rejects them
+    Exit {},
+}
+
+impl Default for Recovery {
+    fn default() -> Self {
+        Self::Retry { max_delay_s: RECOVERY_DEFAULT_MAX_DELAY_S }
+    }
+}
+
 /// A source with an optional curve of its own. A source with `steps` maps its
 /// reading through them; a source without feeds the zone's curve.
 #[derive(Clone, Debug)]
@@ -330,49 +365,92 @@ pub enum FanConfig {
     },
 }
 
-/// A zone may also be written as a TOML array, whose values serde reads in the
+/// The config form of one zone: the keys of [`Zone`] and its [`Recovery`]. A
+/// zone may also be written as a TOML array, whose values serde reads in the
 /// order the fields are declared. Add a new field after the existing ones, so
-/// that a config in that form keeps loading.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// that a config in that form keeps loading. An array that reaches `curve`
+/// sets `steps` as well, which `load_config` rejects, so `fans` and the
+/// fields after it can be set only in the table form.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename = "Zone")]
+struct ZoneKeys {
+    #[serde(default)]
+    session: SessionName,
+    #[serde(default)]
+    interval: Interval,
+    #[serde(default)]
+    retries: Retries,
+    #[serde(default)]
+    retry_delay_ms: RetryDelayMs,
+    #[serde(default)]
+    ipmi_zones: Option<Vec<u8>>,
+    sources: Vec<SourceConfig>,
+    #[serde(default)]
+    aggregation: Aggregation,
+    #[serde(default)]
+    steps: Option<Vec<Step>>,
+    #[serde(default)]
+    duty_aggregation: Aggregation,
+    #[serde(default)]
+    hysteresis: u8,
+    #[serde(default)]
+    curve: Option<String>,
+    #[serde(default)]
+    fans: Option<Vec<FanConfig>>,
+    #[serde(default)]
+    recovery: Recovery,
+}
+
+impl ZoneKeys {
+    fn split(self) -> (Zone, Recovery) {
+        let zone = Zone {
+            session: self.session,
+            interval: self.interval,
+            retries: self.retries,
+            retry_delay_ms: self.retry_delay_ms,
+            ipmi_zones: self.ipmi_zones,
+            sources: self.sources,
+            aggregation: self.aggregation,
+            steps: self.steps,
+            duty_aggregation: self.duty_aggregation,
+            hysteresis: self.hysteresis,
+            curve: self.curve,
+            curve_hysteresis: None,
+            fans: self.fans,
+            fan_list: Vec::new(),
+        };
+
+        (zone, self.recovery)
+    }
+}
+
+/// One zone, as [`ZoneKeys`] reads it without its recovery
+#[derive(Clone, Debug)]
 pub struct Zone {
-    #[serde(default)]
     pub session: SessionName,
-    #[serde(default)]
     pub interval: Interval,
-    #[serde(default)]
     pub retries: Retries,
-    #[serde(default)]
     pub retry_delay_ms: RetryDelayMs,
     /// The legacy form of `fans`: Supermicro zone numbers
-    #[serde(default)]
     pub ipmi_zones: Option<Vec<u8>>,
     pub sources: Vec<SourceConfig>,
-    #[serde(default)]
     pub aggregation: Aggregation,
     /// The zone curve. Validation lets it be absent only when every source
     /// has `steps`, so the zone curve is never used.
-    #[serde(default)]
     pub steps: Option<Vec<Step>>,
     /// How the duties of the zone's curves combine into one
-    #[serde(default)]
     pub duty_aggregation: Aggregation,
     /// Degrees the temperature of an inline curve must fall before its duty
     /// follows
-    #[serde(default)]
     pub hysteresis: u8,
     /// The name of an entry of `curves`, which sets `steps`
-    #[serde(default)]
     pub curve: Option<String>,
     /// The hysteresis of the named curve that set `steps`; `None` means
     /// `hysteresis` applies. Not a config key.
-    #[serde(skip)]
     pub curve_hysteresis: Option<u8>,
     /// The fans the zone drives
-    #[serde(default)]
     pub fans: Option<Vec<FanConfig>>,
     /// The fans of `fans` or `ipmi_zones`, whichever is set. Not a config key.
-    #[serde(skip)]
     pub fan_list: Vec<FanConfig>,
 }
 
@@ -505,17 +583,37 @@ impl<'de> Deserialize<'de> for SessionTypeCompat {
 #[derive(Debug, Default, Deserialize)]
 pub struct Sessions(pub HashMap<String, SessionTypeCompat>);
 
+/// The config form of [`Config`]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename = "Config")]
+struct ConfigKeys {
+    #[serde(default)]
+    log_level: LogLevel,
+    #[serde(default)]
+    sessions: Sessions,
+    #[serde(default)]
+    curves: HashMap<String, CurveConfig>,
+    zones: Vec<ZoneKeys>,
+}
+
+impl From<ConfigKeys> for Config {
+    fn from(keys: ConfigKeys) -> Self {
+        let (zones, zone_recovery) = keys.zones.into_iter().map(ZoneKeys::split).unzip();
+
+        Self { log_level: keys.log_level, sessions: keys.sessions, curves: keys.curves, zones, zone_recovery }
+    }
+}
+
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "ConfigKeys")]
 pub struct Config {
-    #[serde(default)]
     pub log_level: LogLevel,
-    #[serde(default)]
     pub sessions: Sessions,
     /// Curves that a source or a zone names with `curve`
-    #[serde(default)]
     pub curves: HashMap<String, CurveConfig>,
     pub zones: Vec<Zone>,
+    /// The recovery of each zone, by index as in `zones`
+    pub zone_recovery: Vec<Recovery>,
 }
 
 /// A curve defined once and named by any number of sources and zones
@@ -601,6 +699,20 @@ fn is_pci_bus_id(gpu: &str) -> bool {
     PciBusId::parse(gpu).is_some()
 }
 
+/// Check the recovery of the zone at index `i`
+fn check_recovery(recovery: &Recovery, i: usize) -> Result<(), String> {
+    let Recovery::Retry { max_delay_s } = *recovery else {
+        return Ok(());
+    };
+
+    if !(RECOVERY_FIRST_DELAY_S..=RECOVERY_MAX_DELAY_LIMIT_S).contains(&max_delay_s) {
+        return Err(format!("zones[{}].recovery.max_delay_s: must be from {} to {} seconds: {}",
+            i, RECOVERY_FIRST_DELAY_S, RECOVERY_MAX_DELAY_LIMIT_S, max_delay_s));
+    }
+
+    Ok(())
+}
+
 pub fn load_config(path: &Path) -> Result<Config> {
     let contents = fs::read_to_string(path)
         .map_err(|e| Error::Io { path: path.to_owned(), source: e })?;
@@ -634,6 +746,11 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
     // inline steps
     resolve_curves(&mut config)
         .map_err(|reason| Error::ConfigValidation { path: path.to_owned(), reason })?;
+
+    for (i, recovery) in config.zone_recovery.iter().enumerate() {
+        check_recovery(recovery, i)
+            .map_err(|reason| Error::ConfigValidation { path: path.to_owned(), reason })?;
+    }
 
     for (i, zone_config) in config.zones.iter_mut().enumerate() {
         if zone_config.interval.0 == 0 {
@@ -999,7 +1116,7 @@ fn check_steps(steps: &[Step], key: &str) -> Result<(), String> {
 mod tests {
     use {
         std::{fs, path::{Path, PathBuf}},
-        super::{Aggregation, Config, FanConfig, load_config, LogLevel, OnFailure, parse_config, SessionType, Source, Zone},
+        super::{Aggregation, Config, FanConfig, load_config, LogLevel, OnFailure, parse_config, Recovery, SessionType, Source, Zone},
         crate::{
             curve::{SourceReading, ZoneState},
             error::{Error, Result},
@@ -2558,7 +2675,7 @@ mod tests {
         assert!(zone.curve.is_none());
     }
 
-    /// nix/module.nix reads the fans of a zone written as a list at index 11.
+    /// `fans` is element 11 of a zone written as a list in field order.
     /// load_config rejects such a zone, so this reads it without validation.
     #[test]
     fn fans_is_element_eleven_of_a_positional_zone() {
@@ -2566,6 +2683,60 @@ mod tests {
         let config: Config = toml::from_str(contents).unwrap();
 
         assert_eq!(config.zones[0].fans, Some(vec![FanConfig::Nvidia { gpu: "00000000:01:00.0".to_owned(), fan: 0 }]));
+    }
+
+    /// The recovery of the one zone of a config whose zone sets `recovery`
+    fn loaded_recovery(recovery: &str) -> Recovery {
+        parse(&zone_toml(&[("recovery", recovery)])).unwrap().zone_recovery[0]
+    }
+
+    #[test]
+    fn recovery_defaults_to_retry_with_a_300_second_cap() {
+        let config = parse(&zone_toml(&[])).unwrap();
+
+        assert_eq!(config.zone_recovery, [Recovery::Retry { max_delay_s: 300 }]);
+    }
+
+    #[test]
+    fn recovery_loads_exit_and_retry_with_a_cap() {
+        assert_eq!(loaded_recovery(r#"{ type = "exit" }"#), Recovery::Exit {});
+        assert_eq!(loaded_recovery(r#"{ type = "retry", max_delay_s = 60 }"#), Recovery::Retry { max_delay_s: 60 });
+        assert_eq!(loaded_recovery(r#"{ type = "retry" }"#), Recovery::Retry { max_delay_s: 300 });
+
+        let message = parse_error(&zone_toml(&[("recovery", r#"{ type = "exit", max_delay_s = 60 }"#)]));
+
+        assert!(message.contains("unknown field `max_delay_s`"), "{}", message);
+    }
+
+    #[test]
+    fn rejects_recovery_cap_outside_10_to_3600() {
+        for cap in ["9", "3601"] {
+            let recovery = format!(r#"{{ type = "retry", max_delay_s = {} }}"#, cap);
+            let reason = validation_reason(&zone_toml(&[("recovery", &recovery)]));
+
+            assert!(reason.starts_with("zones[0].recovery.max_delay_s:"), "{}", reason);
+        }
+
+        assert_eq!(loaded_recovery(r#"{ type = "retry", max_delay_s = 10 }"#), Recovery::Retry { max_delay_s: 10 });
+        assert_eq!(loaded_recovery(r#"{ type = "retry", max_delay_s = 3600 }"#), Recovery::Retry { max_delay_s: 3600 });
+    }
+
+    /// An array zone loads only up to element 9, `hysteresis`: from element
+    /// 10, `curve`, it sets both `steps` and `curve`, which load_config
+    /// rejects, so such a zone cannot reach `fans` or `recovery`
+    #[test]
+    fn array_zone_loads_with_and_without_recovery() {
+        let ten = parse(r#"zones = [["default", 1, 2, 0, [0], [{ type = "file", path = "/dev/null" }], { type = "maximum" }, [{ temp = 40, dcycle = 70 }], { type = "maximum" }, 0]]"#).unwrap();
+
+        assert_eq!(ten.zone_recovery, [Recovery::Retry { max_delay_s: 300 }]);
+
+        let thirteen = r#"
+            zones = [["default", 1, 2, 0, [0], [{ type = "file", path = "/dev/null" }], { type = "maximum" }, [{ temp = 40, dcycle = 70 }], { type = "maximum" }, 0, "gpu", [{ type = "nvidia", gpu = "00000000:01:00.0", fan = 0 }], { type = "exit" }]]
+            [curves.gpu]
+            steps = [{ temp = 40, dcycle = 70 }]
+        "#;
+
+        assert_eq!(validation_reason(thirteen), "zones[0].curve: set either steps or curve, not both");
     }
 
     #[test]

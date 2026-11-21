@@ -406,6 +406,15 @@ impl ZoneState {
         failed
     }
 
+    /// Forget the stored readings of every source, so that each smooths only
+    /// readings taken from now on. The held temperatures and the failed
+    /// sources stay.
+    pub fn clear_smoothing(&mut self) {
+        for source in self.states.iter_mut().flat_map(|state| &mut state.sources) {
+            source.smoother.clear();
+        }
+    }
+
     /// Compute the zone duty from one reading per source, in source order.
     /// Each binding smooths its sources' readings and maps them through its
     /// curve. The duties of the bindings are joined by `duty_aggregation`,
@@ -695,6 +704,28 @@ mod tests {
         // on the GPU curve gives 80
         assert_eq!(updates[2].curve_temps, [50, 80]);
         assert_eq!(updates[2].duty, 80);
+    }
+
+    #[test]
+    fn cleared_smoothing_uses_only_fresh_readings() {
+        let smoothed = SourceConfig { smoothing_samples: 4, ..plain() };
+        let zone = zone(&HOLD_STEPS, vec![smoothed, failing(plain(), OnFailure::Ignore {})]);
+        let mut state = ZoneState::new(&zone);
+
+        for _ in 0..3 {
+            state.next_duty(&zone, &[Temp(40), failed()]);
+        }
+
+        state.clear_smoothing();
+
+        assert_eq!(state.states[0].held.0, Some(40), "the clear keeps the held temperature");
+        assert_eq!(state.failed_sources(), [false, true], "the clear keeps the failed sources");
+
+        let update = state.next_duty(&zone, &[Temp(80), failed()]);
+
+        // Without the clear, the mean of 40, 40, 40 and 80 would give 50
+        assert_eq!(update.smoothed_temps, [Some(80), None]);
+        assert_eq!(update.duty, 100);
     }
 
     #[test]

@@ -109,23 +109,37 @@ impl FanGuard {
     pub fn descriptions(&self) -> Vec<&str> {
         self.fans.iter().map(|(description, _)| description.as_str()).collect()
     }
+
+    /// Release every fan now, as the drop would, and return whether every
+    /// release of this guard succeeded. A failure is also recorded in the
+    /// shared record.
+    pub fn release(mut self) -> ReleaseOutcome {
+        self.release_held()
+    }
+
+    /// Release and let go of every fan held, last added first, so that a
+    /// later call releases nothing
+    fn release_held(&mut self) -> ReleaseOutcome {
+        let mut outcome = ReleaseOutcome::AllReleased;
+
+        while let Some((description, mut fan)) = self.fans.pop() {
+            match catch_unwind(AssertUnwindSafe(|| fan.release())) {
+                Ok(Ok(())) => continue,
+                Ok(Err(e)) => error!("Failed to release {}: {}", description, e),
+                Err(_) => error!("Release of {} panicked", description),
+            }
+
+            self.failures.record();
+            outcome = ReleaseOutcome::SomeFailed;
+        }
+
+        outcome
+    }
 }
 
 impl Drop for FanGuard {
     fn drop(&mut self) {
-        for (description, fan) in self.fans.iter_mut().rev() {
-            match catch_unwind(AssertUnwindSafe(|| fan.release())) {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    error!("Failed to release {}: {}", description, e);
-                    self.failures.record();
-                }
-                Err(_) => {
-                    error!("Release of {} panicked", description);
-                    self.failures.record();
-                }
-            }
-        }
+        self.release_held();
     }
 }
 
@@ -650,6 +664,29 @@ mod tests {
         drop(first);
 
         assert_eq!(failures.outcome(), ReleaseOutcome::SomeFailed);
+    }
+
+    #[test]
+    fn release_reports_only_its_own_guard_and_still_records() {
+        let calls = CallLog::default();
+        let failures = ReleaseFailures::default();
+        let failing = FakeFan { failing: Some(Op::Release), ..FakeFan::new("b", &calls) };
+        let first = guard_recording(&failures, vec![FakeFan::new("a", &calls), failing]).unwrap();
+        let second = guard_recording(&failures, vec![FakeFan::new("c", &calls)]).unwrap();
+
+        assert_eq!(first.release(), ReleaseOutcome::SomeFailed);
+        assert_eq!(failures.outcome(), ReleaseOutcome::SomeFailed);
+        assert_eq!(second.release(), ReleaseOutcome::AllReleased);
+        // Each fan is released once: the drop after release has nothing left
+        assert_eq!(log_of(&calls)[3..], [("b", Op::Release), ("a", Op::Release), ("c", Op::Release)]);
+    }
+
+    #[test]
+    fn release_reports_a_panicking_release() {
+        let calls = CallLog::default();
+        let panicking = FakeFan { panicking: Some(Op::Release), ..FakeFan::new("a", &calls) };
+
+        assert_eq!(guard_over(vec![panicking]).unwrap().release(), ReleaseOutcome::SomeFailed);
     }
 
     /// The description of the fan that a [`Error::Fan`] names

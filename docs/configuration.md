@@ -101,9 +101,9 @@ steps = [{ temp = 40, dcycle = 30 }, { temp = 80, dcycle = 100 }]
 
 The log levels, from the least output to the most:
 
-- `error`: errors that stop coolerd, a source that starts to fail, and a fan that coolerd could not release.
+- `error`: errors that stop coolerd, a fan error that a zone retries, a source that starts to fail, and a fan that coolerd could not release.
 - `warn`: also an IPMI sensor entry that the board could not read, and a program that coolerd killed and that did not exit.
-- `info`: also the fan mode changes at start and stop, the start of each zone, and a source that reads again.
+- `info`: also the fan mode changes at start and stop, the start of each zone and each take-over of its fans, a zone whose fans run again after a retry, and a source that reads again.
 - `debug`: also one line for each fan after each update that succeeds, with the temperatures and the duty cycle. Use it to tune a curve.
 - `trace`: also the parsed config, each failed attempt that is followed by a retry, and the raw IPMI commands.
 
@@ -125,6 +125,7 @@ Each `[[zones]]` table is one zone.
 | `retries` | integer, 0 or more | 2 | Waits for another attempt that the sources of the zone share in one update. See [Failures and shutdown](failure.md#retries). |
 | `retry_delay_ms` | integer, 0 or more | 500 | Milliseconds of each such wait. |
 | `session` | string | `"default"` | The [session](#sessions) that reaches the board of the zone's Supermicro fans. The name must be a key of `sessions` or `default`. |
+| `recovery` | table | `{ type = "retry", max_delay_s = 300 }` | What the zone does when a fan fails. `{ type = "retry" }` or `{ type = "retry", max_delay_s = N }`, with N from 10 to 3600, releases the zone's fans and takes them over again after a wait that doubles from 10 seconds up to N; `max_delay_s` defaults to 300. `{ type = "exit" }` stops coolerd. A zone that has not yet completed an update stops coolerd on any error under either type. A zone written as an array cannot set this key. See [Failures and shutdown](failure.md#when-a-fan-fails). |
 
 ## How a zone sets its duty cycle
 
@@ -377,9 +378,9 @@ Two zones on one session cannot name the same IPMI zone. The check compares sess
 
 A `hwmon` fan is one PWM channel of a hwmon chip under `/sys/class/hwmon`. Two zones cannot drive the same chip and channel. [Finding hwmon chips and channels](hwmon.md) shows how to find the name and the channel. Do not configure a channel before you know which fan it drives.
 
-coolerd finds the chip by its name once, when the zone starts. A name that no chip has, or that more than one chip has, is an error, so coolerd cannot drive one of two chips with the same name. `pwmN` and `pwmN_enable` must be files in the chip's own hwmon directory. coolerd needs write access to both.
+coolerd finds the chip by its name at each take-over of the zone's fans: when the zone starts, and again when the zone retries after a fan error. Within one take-over the fan keeps the path that it found. A name that no chip has, or that more than one chip has, is an error, so coolerd cannot drive one of two chips with the same name. `pwmN` and `pwmN_enable` must be files in the chip's own hwmon directory. coolerd needs write access to both.
 
-When the zone starts, coolerd saves `pwmN_enable`, writes 1 to it, which is manual control, and writes 255 to `pwmN`, which is full speed. A zone with only `hwmon` fans needs no IPMI device.
+At each take-over, coolerd saves `pwmN_enable`, writes 1 to it, which is manual control, and writes 255 to `pwmN`, which is full speed. A zone with only `hwmon` fans needs no IPMI device.
 
 ### NVIDIA fan
 
@@ -398,7 +399,7 @@ The NVIDIA fan backend is tested against a stand-in for NVML. It has not yet bee
 
 coolerd drives the fan through NVML, the management library of the NVIDIA driver. It loads `libnvidia-ml.so.1` at run time, when a zone with an `nvidia` fan starts, because the library must match the driver that the kernel has loaded. A config without an `nvidia` fan never loads it. The dynamic linker must be able to find the library. coolerd must run as root to set a GPU fan speed.
 
-When the zone starts, coolerd reads the number of fans of the GPU and the speed limits of the fan, and logs the limits in a line with `speed limits`. It fails when the fan does not exist or when the limits are not a range within 0 to 100%. It changes nothing at this point. The first update sets the fan speed, which switches the fan to manual control.
+At each take-over, when the zone starts and when it retries after a fan error, coolerd reads the number of fans of the GPU and the speed limits of the fan, and logs the limits in a line with `speed limits`. It fails when the fan does not exist or when the limits are not a range within 0 to 100%. It changes nothing at this point. The first update sets the fan speed, which switches the fan to manual control.
 
 ## Sessions
 
@@ -441,5 +442,6 @@ The format of the config file is the format of ipmi-fan-control. A config writte
 - **Time limits.** `smartctl` and `hdparm` are stopped after 30 seconds. Earlier versions waited for them without a limit.
 - **Exit status.** When coolerd fails to release a fan, to set an IPMI zone to 100% or to restore the fan mode of a board as it stops, it exits with status 1, also when a signal stopped it. So does an error that a zone returns while it stops after a signal, and coolerd now logs that error. Earlier versions exited with status 0 in these cases, and they did not log a zone error that came after a signal.
 - **Signals.** coolerd listens for SIGINT and SIGTERM before it opens an IPMI session. Earlier versions started to listen only after the zones had started.
+- **Fan errors.** A fan error no longer stops coolerd by default. The zone releases its own fans, waits, and takes them over again, while the other zones keep running; see [When a fan fails](failure.md#when-a-fan-fails). Earlier versions stopped every zone and exited with status 1 on any fan error. To keep that behaviour, set `recovery = { type = "exit" }` in each zone. A source with `on_failure = { type = "exit" }` still stops coolerd, and so does any error of a zone before its first completed update. A config that sets `recovery` does not load in an earlier version. A zone written as an array cannot set `recovery`: rewrite it as a table to set the key.
 
 [Migrating from ipmi-fan-control](nixos.md#migrating-from-ipmi-fan-control) lists the names that the rename changed.

@@ -66,12 +66,14 @@ session = "default"
 #
 # The program drives the fan through NVML. It loads libnvidia-ml.so.1 of the
 # host's NVIDIA driver when the zone starts, and it must run as root to set a
-# GPU fan speed. On startup it reads the fan's speed limits and changes
-# nothing; its first update switches the fan to manual control. A duty cycle
+# GPU fan speed. On startup, and when the zone takes its fans over again after
+# a fan error, it reads the fan's speed limits and changes nothing; its first
+# update switches the fan to manual control. A duty cycle
 # below the fan's minimum is raised to the minimum, because NVML refuses a
 # lower speed: with a minimum of 30%, a duty cycle of 20% runs the fan at 30%.
-# A duty cycle above the maximum is capped at the maximum. On exit it gives
-# the fan back to the driver's default fan policy. If that fails, it sets the
+# A duty cycle above the maximum is capped at the maximum. On exit, and when
+# the zone retries a fan error (see `recovery` below), it gives the fan back to
+# the driver's default fan policy. If that fails, it tries to set the
 # fan to its maximum, which leaves the fan in manual control at full speed. If
 # that fails as well, the fan's state is unknown, and it may keep the last
 # speed that the program set. In both cases the program logs an error and
@@ -187,8 +189,10 @@ sources = [
   # Any source can also carry `on_failure`, which decides what the zone does
   # when the source still fails after its retries:
   #
-  # * { type = "exit" }: The program exits, which sets the fans to 100% and
-  #   restores the original fan mode. This is the default.
+  # * { type = "exit" }: The program exits. As it exits, it releases every
+  #   fan, as docs/failure.md describes under "What the fans get when coolerd
+  #   stops"; a release that fails is logged and gives exit status 1. This is
+  #   the default.
   # * { type = "ignore" }: The source is left out until it reads again, and
   #   the other sources drive the fans. A hot device that cannot be read then
   #   no longer raises the fans, so use this only for a source that another
@@ -294,6 +298,34 @@ steps = [
 # This applies only to inline `steps`: the zone's and those of each source. A
 # named curve uses the `hysteresis` of its entry in `curves`.
 #hysteresis = 3
+
+# What the zone does when a fan fails: it cannot be taken over, a supermicro or
+# hwmon fan cannot be read, or a fan refuses a duty cycle.
+#
+# `retry`, the default, releases this zone's fans, as docs/failure.md
+# describes under "What the fans get when coolerd stops". A release that fails
+# is logged and stops the program with exit status 1. After a clean release
+# the zone logs a line that starts with `Zone error:`, waits, and takes the
+# fans over again. The other zones keep running. The first wait is 10 seconds,
+# and each failure in a row doubles it up to `max_delay_s`, from 10 to 3600,
+# 300 by default. The first successful update after a take-over starts the
+# waits again from 10 seconds. Before that update the zone drops the smoothed
+# samples of its sources; it keeps the held temperatures and the failed
+# sources.
+#
+# `exit` stops the program, which releases every fan of every zone, as earlier
+# versions did on any fan error.
+#
+# Under either type the program still stops on any error of a zone that has
+# not yet completed an update, so a fan that does not work still fails the
+# start. It also stops on a source failure with
+# `on_failure = { type = "exit" }`, on an NVML call that timed out or found
+# the NVML thread stopped, and on a fan that could not be released. A stop while a zone waits to retry, or before
+# it has updated its fans again, exits with status 1.
+#
+# A zone written as an array cannot set `recovery`; write it as a table.
+#recovery = { type = "retry", max_delay_s = 300 }
+#recovery = { type = "exit" }
 
 # More fan zones can be added. Each drives fans that no other zone drives, so
 # to enable this example, remove zone 1 from the first zone's `fans`.

@@ -59,7 +59,7 @@ With `services.coolerd.enable = true`, the module does this:
 - It runs `coolerd --config /etc/coolerd.toml` as the systemd unit `coolerd.service`, which starts at boot.
 - It runs the unit as the system user and group `coolerd`. With [`enableNvidiaFans`](#servicescoolerdenablenvidiafans), the unit runs as root.
 - It restarts the unit when `settings` changes.
-- It restarts the unit 10 seconds after coolerd exits with a failure.
+- It restarts the unit 10 seconds after coolerd exits with a failure, through systemd's `Restart=on-failure`. systemd does not restart the unit after an explicit `systemctl stop`, also when coolerd then exits with status 1.
 - It puts freeipmi on the `PATH` of the unit, plus the packages that the options below add.
 - It adds the package to the system packages.
 
@@ -125,7 +125,7 @@ services.coolerd.settings = {
 };
 ```
 
-The build of the host fails when a zone has a fan of type `nvidia` and [`enableNvidiaFans`](#servicescoolerdenablenvidiafans) is off. Write a zone that has a `fans` key as an attribute set, as on this page. coolerd also reads a zone written as a list in field order, but such a list must give a value to every field before `fans`. A list that reaches `fans` therefore also sets `ipmi_zones`, and sets both `steps` and `curve`, and coolerd refuses both pairs. The check reads each fan as an attribute set or as a list in field order. It also reads the `fans` of a list zone, only as a guard.
+The build of the host fails when a zone has a fan of type `nvidia` and [`enableNvidiaFans`](#servicescoolerdenablenvidiafans) is off. Write a zone that has a `fans` key as an attribute set, as on this page. coolerd also reads a zone written as a list in field order, but such a list must give a value to every field before `fans`. A list that reaches `fans` therefore also sets `ipmi_zones`, and sets both `steps` and `curve`, and coolerd refuses both pairs. The check reads the `fans` of each zone written as an attribute set, and reads each fan as an attribute set or as a list in field order.
 
 ### `services.coolerd.enableSmartMonTools`
 
@@ -191,7 +191,7 @@ The access has these limits:
 
 - `pwmN` and `pwmN_enable` must be files in the chip's own hwmon directory. Neither coolerd nor the helper looks under `device/`.
 - A grant lasts until the kernel removes the file. When you remove a channel from `hwmon.pwmChannels`, the service group keeps write access to it until a reboot or a reload of the driver.
-- A reload of the hwmon driver removes the old files and the access to them. The next read or write of the channel can then fail, which stops coolerd, and systemd starts the service again after 10 seconds, which runs the helper again. Until then the fan is under whatever control the reloaded driver sets. The path that coolerd keeps can also name another device after the reload, and coolerd then writes to that device, also when it stops. Stop the service before you reload or rebind a hwmon driver, and start it afterwards. Do not rely on the automatic restart.
+- A reload of the hwmon driver removes the old files and the access to them. The next read or write of the channel can then fail. Such a failure may stop coolerd, after which systemd starts the service again after 10 seconds and the helper runs again. When the zone had already released its fans and was waiting to retry, the zone instead keeps retrying, and the helper does not run again, because it runs only when the service starts. Until coolerd takes the fan over again, the fan is under whatever control the reloaded driver sets. The path that coolerd keeps can also name another device after the reload, and coolerd then writes to that device, also when it stops. Stop the service before you reload or rebind a hwmon driver, and start it afterwards. Do not rely on the automatic restart.
 
 ## NVIDIA fans and root
 
@@ -203,7 +203,7 @@ coolerd loads `libnvidia-ml.so.1` at run time, because the library must match th
 
 An `nvidia` source also needs `nvidia-smi` on the `PATH` of the unit, through [`extraPackages`](#servicescoolerdextrapackages).
 
-The NVIDIA fan backend has not yet been confirmed on a GPU. Check the fans after the first deployment, as the next section describes.
+On a host with two RTX A4000 GPUs, one fan each, and driver 595.104.02 with the open kernel module, coolerd took over both fans and set their speed from the zone curve. The release of a GPU fan when coolerd stops has not been confirmed on a GPU. Check the fans after the first deployment, as the next section describes.
 
 ## Checking NVIDIA fans on a host
 
@@ -218,9 +218,10 @@ Run this check on the host itself, after a deployment that adds or changes an `n
    ```
 
    The speed is the duty cycle of the zone, or the fan's minimum when the duty cycle is lower, or its maximum when the duty cycle is higher. The unit logs the limits at the start in a line with `speed limits`. Read it with `journalctl -u coolerd.service`.
-2. Stop the unit with `sudo systemctl stop coolerd.service`, and read the speed again with the same command. The speed follows the GPU temperature again.
+2. Stop the unit with `sudo systemctl stop coolerd.service`. Read the result of the stop with `systemctl status coolerd.service`, and read the journal with `journalctl -u coolerd.service` for a line that starts with `Failed to give fan`. A release that fails makes coolerd exit with status 1.
+3. Read the speed again with the same command. After a release that succeeded, the speed follows the GPU temperature again. One reading after the stop does not prove that the driver's policy is active, because the last speed that coolerd set can match the speed that the driver would set. Read the speed again after the GPU temperature has changed.
 
-If the journal shows a line that starts with `Failed to give fan`, the default policy was not restored. When that line ends with `under manual control`, the fan stays in manual control at its maximum. When it ends with `the fan's state is unknown`, the fan may keep the last speed that coolerd set, so start and stop the unit again or reload the driver.
+If the journal shows a line that starts with `Failed to give fan`, the default policy was not restored. When that line ends with `under manual control`, the fan stays in manual control at its maximum. When it ends with `the fan's state is unknown`, the fan may keep the last speed that coolerd set. Nothing starts coolerd again, because systemd does not restart a unit that `systemctl stop` stopped. Start the service again with `sudo systemctl start coolerd.service`, so that coolerd controls the fan, or reduce the load on the GPU. A reload of the driver also ends the manual control.
 
 ## Migrating from ipmi-fan-control
 
@@ -237,7 +238,7 @@ The rename from ipmi-fan-control to coolerd changes these names:
 | Log target in `RUST_LOG` | `ipmi_fan_control` | `coolerd` |
 | Variable that turns off log timestamps | `IPMI_FAN_CONTROL_LOG_TIMESTAMPS` | `COOLERD_LOG_TIMESTAMPS` |
 
-The format of the config file does not change, so an existing config loads with the same result. [Changes from earlier versions](configuration.md#changes-from-earlier-versions) lists the behaviour that differs.
+Config files from ipmi-fan-control load in coolerd, with the exceptions that [Changes from earlier versions](configuration.md#changes-from-earlier-versions) lists. That section also lists the behaviour that differs.
 
 The old option path still works. Each option under `services.ipmi-fan-control` is an alias of the same option under `services.coolerd`, and a priority such as `lib.mkForce` carries over. NixOS prints a warning for each old option that a configuration sets. `enableNvidiaFans` is new and exists only under `services.coolerd`. The Nix package `ipmi-fan-control` is the same package as `coolerd`. Move the configuration to `services.coolerd` to remove the warnings.
 
