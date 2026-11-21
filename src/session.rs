@@ -85,9 +85,9 @@ impl IpmiSession {
         Self::with_port(name, Box::new(Ipmi::new(st)?), restore_zones, restore_failures)
     }
 
-    /// Take over the board behind `port`. The session exists before the
-    /// switch to full fan mode, so a failed switch drops it, and its `Drop`
-    /// restores the saved mode.
+    /// Take over the board behind `port`: switch it to full fan mode, then
+    /// set each of `restore_zones` to 100%. The session exists before these
+    /// writes, so a failed write drops it, and its `Drop` restores the board.
     pub fn with_port<N, R>(name: N, mut port: Box<dyn IpmiPort>, restore_zones: R, restore_failures: RestoreFailures) -> Result<Self>
     where
         N: AsRef<str>,
@@ -112,6 +112,13 @@ impl IpmiSession {
             switched?;
         }
 
+        for z in &session.restore_zones {
+            info!("[{}] Setting zone {} duty cycle to 100%", session.name, z);
+            // Bound first, so the lock is released before `Drop` takes it
+            let written = session.lock().set_duty_cycle(*z, 100);
+            written?;
+        }
+
         Ok(session)
     }
 
@@ -130,7 +137,8 @@ impl Drop for IpmiSession {
         let mut port = lock_or_recover(&self.port);
 
         // A signal can cancel a zone task before its fan guard exists, so
-        // this write can be the only one of 100% that the zone gets
+        // this write can be the only one of 100% that the zone gets as
+        // coolerd stops
         for z in &self.restore_zones {
             info!("[{}] Setting zone {} duty cycle to 100%", self.name, z);
             if let Err(e) = port.set_duty_cycle(*z, 100) {
@@ -184,17 +192,25 @@ pub mod fake {
         pub fan_mode: FanMode,
         pub duties: HashMap<u8, u8>,
         pub failing: Option<PortCall>,
+        /// How many times `failing` succeeds before it starts to fail
+        pub failing_after: usize,
     }
 
     impl FakeBoard {
         pub fn new(fan_mode: FanMode, calls: &BoardLog) -> Self {
-            Self { calls: calls.clone(), fan_mode, duties: HashMap::new(), failing: None }
+            Self { calls: calls.clone(), fan_mode, duties: HashMap::new(), failing: None, failing_after: 0 }
         }
 
         fn record(&self, call: PortCall) -> Result<()> {
-            self.calls.lock().unwrap().push(call);
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(call);
 
-            if self.failing == Some(call) {
+            if self.failing != Some(call) {
+                return Ok(());
+            }
+
+            let made = calls.iter().filter(|c| **c == call).count();
+            if made > self.failing_after {
                 return Err(Error::Ipmi(ipmi::Error::BadResponseSize { expected: 0, actual: 1 }));
             }
 
@@ -303,6 +319,10 @@ mod tests {
         assert_eq!(log_of(&calls), [
             PortCall::GetFanMode,
             PortCall::SetFanMode(FanMode::Full),
+            // The writes at open
+            PortCall::SetDutyCycle(0, 100),
+            PortCall::SetDutyCycle(1, 100),
+            // The session's drop
             PortCall::SetDutyCycle(0, 100),
             PortCall::SetDutyCycle(1, 100),
             PortCall::SetFanMode(FanMode::Standard),
@@ -335,8 +355,10 @@ mod tests {
     #[test]
     fn drop_sets_later_zones_and_the_mode_after_a_failed_zone_write() {
         let calls = BoardLog::default();
+        // The write at open succeeds, and the write at drop fails
         let board = FakeBoard {
             failing: Some(PortCall::SetDutyCycle(0, 100)),
+            failing_after: 1,
             ..FakeBoard::new(FanMode::Standard, &calls)
         };
         let failures = RestoreFailures::default();
@@ -347,6 +369,10 @@ mod tests {
         assert_eq!(log_of(&calls), [
             PortCall::GetFanMode,
             PortCall::SetFanMode(FanMode::Full),
+            // The writes at open
+            PortCall::SetDutyCycle(0, 100),
+            PortCall::SetDutyCycle(1, 100),
+            // The session's drop
             PortCall::SetDutyCycle(0, 100),
             PortCall::SetDutyCycle(1, 100),
             PortCall::SetFanMode(FanMode::Standard),
@@ -370,6 +396,7 @@ mod tests {
             PortCall::GetFanMode,
             PortCall::SetFanMode(FanMode::Full),
             PortCall::SetDutyCycle(0, 100),
+            PortCall::SetDutyCycle(0, 100),
             PortCall::SetFanMode(FanMode::Standard),
         ]);
         assert_eq!(failures.outcome(), RestoreOutcome::SomeFailed);
@@ -391,8 +418,51 @@ mod tests {
         let calls = BoardLog::default();
         let session = IpmiSession::with_port("test", Box::new(FakeBoard::new(FanMode::Full, &calls)), [0], RestoreFailures::default()).unwrap();
 
+        assert_eq!(log_of(&calls), [PortCall::GetFanMode, PortCall::SetDutyCycle(0, 100)]);
+
         drop(session);
 
-        assert_eq!(log_of(&calls), [PortCall::GetFanMode, PortCall::SetDutyCycle(0, 100)]);
+        assert_eq!(log_of(&calls), [
+            PortCall::GetFanMode,
+            PortCall::SetDutyCycle(0, 100),
+            PortCall::SetDutyCycle(0, 100),
+        ]);
+    }
+
+    #[test]
+    fn open_sets_every_zone_to_full_duty_after_the_mode() {
+        let calls = BoardLog::default();
+        let session = IpmiSession::with_port("test", Box::new(FakeBoard::new(FanMode::Standard, &calls)), [0, 1], RestoreFailures::default()).unwrap();
+
+        assert_eq!(log_of(&calls), [
+            PortCall::GetFanMode,
+            PortCall::SetFanMode(FanMode::Full),
+            PortCall::SetDutyCycle(0, 100),
+            PortCall::SetDutyCycle(1, 100),
+        ]);
+
+        drop(session);
+    }
+
+    #[test]
+    fn failed_full_duty_at_open_fails_the_start_and_restores_the_board() {
+        let calls = BoardLog::default();
+        let board = FakeBoard {
+            failing: Some(PortCall::SetDutyCycle(0, 100)),
+            ..FakeBoard::new(FanMode::Standard, &calls)
+        };
+
+        let result = IpmiSession::with_port("test", Box::new(board), [0, 1], RestoreFailures::default());
+
+        assert!(matches!(result, Err(Error::Ipmi(_))), "expected the duty write error");
+        assert_eq!(log_of(&calls), [
+            PortCall::GetFanMode,
+            PortCall::SetFanMode(FanMode::Full),
+            // The write at open that fails, then the session's drop
+            PortCall::SetDutyCycle(0, 100),
+            PortCall::SetDutyCycle(0, 100),
+            PortCall::SetDutyCycle(1, 100),
+            PortCall::SetFanMode(FanMode::Standard),
+        ]);
     }
 }

@@ -1256,12 +1256,15 @@ mod tests {
     }
 
     /// A signal can cancel a zone task before its fan guard exists, so the
-    /// session's drop then makes the only write of 100% to the zone
+    /// session's drop then makes the only write of 100% to the zone as
+    /// coolerd stops
     #[test]
     fn failed_full_duty_write_without_a_fan_guard_fails_the_exit() {
         let calls = BoardLog::default();
+        // The write at open succeeds, and the write at drop fails
         let board = FakeBoard {
             failing: Some(PortCall::SetDutyCycle(0, 100)),
+            failing_after: 1,
             ..FakeBoard::new(FanMode::Full, &calls)
         };
         let failures = RestoreFailures::default();
@@ -1315,8 +1318,10 @@ mod tests {
     #[test]
     fn finish_fails_on_a_full_duty_write_that_fails_as_the_app_drops() {
         let calls = BoardLog::default();
+        // The write at open succeeds, and the write at drop fails
         let board = FakeBoard {
             failing: Some(PortCall::SetDutyCycle(0, 100)),
+            failing_after: 1,
             ..FakeBoard::new(FanMode::Full, &calls)
         };
 
