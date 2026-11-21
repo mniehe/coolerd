@@ -1213,10 +1213,13 @@ mod tests {
     async fn signal_before_the_first_wait_is_delivered() {
         let mut signals = Signals::listen().unwrap();
 
-        let status = process::Command::new("kill")
-            .args(["-INT", &process::id().to_string()])
-            .status()
-            .unwrap();
+        let status = {
+            let _guard = crate::command::testing::script_lock();
+            process::Command::new("kill")
+                .args(["-INT", &process::id().to_string()])
+                .status()
+                .unwrap()
+        };
         let delivered = timeout(Duration::from_secs(2), signals.recv()).await;
 
         assert!(status.success(), "{:?}", status);

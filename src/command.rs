@@ -237,7 +237,9 @@ pub mod testing {
 
     // Serialises the tests that spawn a process. A fork in another test
     // thread can inherit a script's write descriptor for a moment, and exec
-    // of the script then fails with ETXTBSY.
+    // of the script then fails with ETXTBSY. Every test that starts a
+    // process holds this lock while it does, whether or not it writes a
+    // script, because its fork is what inherits the descriptor.
     static SCRIPT_LOCK: Mutex<()> = Mutex::new(());
 
     pub fn script_lock() -> MutexGuard<'static, ()> {
@@ -575,6 +577,7 @@ mod tests {
     #[test]
     fn still_running_error_names_the_program_and_its_arguments() {
         let gpu = "00000000:81:00.0";
+        let _guard = script_lock();
         let mut runner = CommandRunner::default();
 
         let result = blocking(move || {

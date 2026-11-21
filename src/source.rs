@@ -1155,6 +1155,7 @@ mod tests {
     /// program that [`ZoneReaders::read`] runs for `source`, and give the
     /// results of reading `source` at index 0 and then at index 1
     fn reads_beside_kept_child(program: &str, source: &Source) -> (Result<u8, Error>, Result<u8, Error>) {
+        let _guard = script_lock();
         let mut readers = ZoneReaders::default();
 
         // Dropped inside the runtime, so the kept child is killed and reaped there
@@ -1282,6 +1283,7 @@ mod tests {
     #[test]
     fn runner_of_a_source_persists_between_reads() {
         let source = Source::Nvidia { gpu: GPU.into() };
+        let _guard = script_lock();
         let mut readers = ZoneReaders::default();
 
         let (first, second) = blocking(move || {
