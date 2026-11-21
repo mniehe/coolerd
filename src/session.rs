@@ -191,6 +191,11 @@ pub mod fake {
     /// The calls made on a fake board, in order
     pub type BoardLog = Arc<Mutex<Vec<PortCall>>>;
 
+    /// The error of a failing call to a fake board
+    pub fn port_error() -> Error {
+        Error::Ipmi(ipmi::Error::BadResponseSize { expected: 0, actual: 1 })
+    }
+
     /// A board that records every call. Its duty cycles start at 0 unless set
     /// in `duties`, and one call can fail.
     pub struct FakeBoard {
@@ -217,7 +222,7 @@ pub mod fake {
 
             let made = calls.iter().filter(|c| **c == call).count();
             if made > self.failing_after {
-                return Err(Error::Ipmi(ipmi::Error::BadResponseSize { expected: 0, actual: 1 }));
+                return Err(port_error());
             }
 
             Ok(())
@@ -262,20 +267,39 @@ mod tests {
             thread,
         },
         super::{
-            fake::{BoardLog, FakeBoard, PortCall},
+            fake::{port_error, BoardLog, FakeBoard, PortCall},
             lock_or_recover,
             IpmiSession,
             RestoreFailures,
             RestoreOutcome,
         },
         crate::{
-            error::Error,
+            error::{Error, Result},
             ipmi::FanMode,
         },
     };
 
     fn log_of(calls: &BoardLog) -> Vec<PortCall> {
         calls.lock().unwrap().clone()
+    }
+
+    /// Assert that `result` is the failure of `step` on session "bmc0", and
+    /// that it keeps the fake board's error as its cause and in its message
+    fn assert_start_failure<T>(result: Result<T>, step: &str) {
+        let Err(error) = result else {
+            panic!("expected the failure to {}", step);
+        };
+        let message = error.to_string();
+        let Error::SessionStart { source, .. } = error else {
+            panic!("expected a SessionStart error: {}", message);
+        };
+        let cause = port_error().to_string();
+
+        assert!(matches!(*source, Error::Ipmi(_)), "{}", message);
+        assert_eq!(source.to_string(), cause);
+        assert!(message.contains("[bmc0]"), "{}", message);
+        assert!(message.contains(step), "{}", message);
+        assert!(message.contains(&cause), "{}", message);
     }
 
     #[test]
@@ -325,9 +349,7 @@ mod tests {
 
         let result = IpmiSession::with_port("bmc0", Box::new(board), [0], RestoreFailures::default());
 
-        let message = result.err().expect("expected the switch error").to_string();
-        assert!(message.contains("[bmc0]"), "{}", message);
-        assert!(message.contains("fan mode to Full"), "{}", message);
+        assert_start_failure(result, "set fan mode to Full");
     }
 
     #[test]
@@ -340,9 +362,7 @@ mod tests {
 
         let result = IpmiSession::with_port("bmc0", Box::new(board), [0], RestoreFailures::default());
 
-        let message = result.err().expect("expected the read error").to_string();
-        assert!(message.contains("[bmc0]"), "{}", message);
-        assert!(message.contains("fan mode"), "{}", message);
+        assert_start_failure(result, "read the fan mode");
         assert_eq!(log_of(&calls), [PortCall::GetFanMode]);
     }
 
@@ -356,9 +376,7 @@ mod tests {
 
         let result = IpmiSession::with_port("bmc0", Box::new(board), [0, 1], RestoreFailures::default());
 
-        let message = result.err().expect("expected the duty write error").to_string();
-        assert!(message.contains("[bmc0]"), "{}", message);
-        assert!(message.contains("zone 1"), "{}", message);
+        assert_start_failure(result, "set zone 1 duty cycle to 100%");
     }
 
     #[test]
