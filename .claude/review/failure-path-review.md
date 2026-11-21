@@ -27,14 +27,24 @@ termination owner.
 - `src/command.rs`: `CommandRunner` returns `CommandTimeout` when a program
   passes its limit and `CommandStillRunning` while a killed program has not
   exited.
+- `src/nvml.rs`: `RealNvml` returns `NvmlTimeout` when a call passes its
+  limit and `NvmlStalled` or `NvmlNoReply` for every call after that, and
+  `NvmlThread` when the worker cannot start.
+  `NvidiaFan::set_duty` in `src/fan.rs` returns those from its speed read;
+  any other failed speed read is logged and the write goes ahead.
 - `src/curve.rs`: a failed source that did not end the read is dropped from
   the duty (`ignore`) or sets a duty floor (`dcycle`). `ZoneState::next_duty`
   reports each change as a `Transition`, which the zone loop logs.
 - `src/main.rs`: `zone_loop` returns the first error that `on_failure` does
   not absorb, `run` aborts the other loops through a `JoinSet`, and
-  `main` exits 1 after `MainApp` drops. `IpmiSession::drop` is the cleanup:
-  it sets every zone to 100% and restores the fan mode, logging and not
-  returning its own errors.
+  `main` exits 1 after `MainApp` drops. `FanGuard::drop` in `src/fan.rs` and
+  `IpmiSession::drop` in `src/session.rs` are the cleanup. The first
+  releases each of its fans (a hwmon fan writes 255, then restores a saved
+  automatic mode; an NVIDIA fan asks for the default policy, then falls
+  back to its maximum). It logs each failed or panicking release and records
+  it in `ReleaseFailures`, and `exit_result` then turns a clean run into
+  `FansNotReleased`. The second sets every Supermicro zone to 100% and
+  restores the fan mode. It logs its own errors and does not record them.
 - A failure that ends in a lower or unchanged fan duty with no log line is
   the disguised success that matters most here.
 

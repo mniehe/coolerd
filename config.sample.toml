@@ -11,15 +11,78 @@
 # (Note: This option is ignored if the RUST_LOG environment variable is set)
 log_level = "debug"
 
+# Named curves. Define a curve once here and name it with `curve` on any
+# number of sources and zones, in place of their own `steps`. The key after
+# `curves.` is the name. `steps` follows the rules of a zone's `steps` below.
+# A source or zone that names a curve gets the curve's steps, so the rules of
+# its own `steps` apply too: a source cannot name a curve with no steps.
+#
+# `hysteresis` is the number of degrees Celsius the curve's temperature must
+# fall before its duty cycle follows, as the zone's `hysteresis` does for
+# inline `steps`. A named curve always uses its own `hysteresis`, never the
+# zone's. The default is 0, which follows every reading. Each source or zone
+# that names the curve holds its own temperature. A curve that nothing names
+# is still validated.
+[curves.gpu]
+steps = [
+  { temp = 60, dcycle = 40 },
+  { temp = 90, dcycle = 100 }
+]
+hysteresis = 3
+
 # Definition of a logical fan zone.
 [[zones]]
 # IPMI session. If unspecified, the `default` session is used, which uses the
 # local in-band IPMI device (eg. /dev/ipmi0). Sessions are defined below in the
-# `sessions` section.
+# `sessions` section. A session opens only when a zone on it has a
+# `supermicro` fan, so a config with only `hwmon` and `nvidia` fans needs no
+# IPMI device.
 session = "default"
 
-# List of IPMI zones to be included in this logical zone.
-ipmi_zones = [0, 1]
+# Fans driven by this logical zone, each set to the zone's duty cycle. A
+# `supermicro` fan is one IPMI fan zone of the board that `session` reaches.
+# Each fan may be listed once, and two zones on one session cannot drive the
+# same IPMI zone. Two session names that reach the same board are not
+# detected, so do not drive one board through two sessions.
+#
+# A `hwmon` fan, `{ type = "hwmon", chip = "nct6798", pwm = 2 }`, is the PWM
+# channel `pwm2` of the hwmon chip whose `name` file holds `chip`. `pwm`
+# starts at 1. On startup the program saves `pwm2_enable` and switches the
+# channel to manual control at full speed. On exit it sets the channel to full
+# speed and writes the saved `pwm2_enable` back when it is 2 or more, a mode
+# the driver defines and on most chips an automatic one. After a saved 0 or 1
+# the channel stays manual at full speed, because the kernel's pwm-fan driver
+# reads 0 as fan off.
+# Two zones cannot drive the same chip and channel. See the hwmon zone example
+# below.
+#
+# An `nvidia` fan, `{ type = "nvidia", gpu = "00000000:01:00.0", fan = 0 }`,
+# is fan `fan` of the NVIDIA GPU at PCI bus id `gpu`. `fan` starts at 0. The
+# GPU is selected by PCI bus id only; a GPU UUID is rejected. The domain may
+# have four or eight hex digits, so `0000:01:00.0` names the same GPU, and two
+# zones cannot drive the same fan of one GPU. To list the bus ids, run
+# `nvidia-smi --query-gpu=pci.bus_id --format=csv`.
+#
+# The program drives the fan through NVML. It loads libnvidia-ml.so.1 of the
+# host's NVIDIA driver when the zone starts, and it must run as root to set a
+# GPU fan speed. On startup it reads the fan's speed limits and changes
+# nothing; its first update switches the fan to manual control. A duty cycle
+# below the fan's minimum is raised to the minimum, because NVML refuses a
+# lower speed: with a minimum of 30%, a duty cycle of 20% runs the fan at 30%.
+# A duty cycle above the maximum is capped at the maximum. On exit it gives
+# the fan back to the driver's default fan policy. If that fails, it sets the
+# fan to its maximum, which leaves the fan in manual control at full speed.
+# See the NVIDIA zone example below.
+fans = [
+  { type = "supermicro", zone = 0 },
+  { type = "supermicro", zone = 1 },
+]
+
+# The older form of `fans`, which lists the IPMI zone numbers of `supermicro`
+# fans. `ipmi_zones = [0, 1]` drives the same fans as `fans` above. A zone sets
+# either `fans` or `ipmi_zones`, not both. A number repeated in this list is
+# driven once.
+#ipmi_zones = [0, 1]
 
 # Number of seconds to wait between fan update interations. If unspecified, the
 # default interval is 1 second.
@@ -48,7 +111,8 @@ interval = 1
 
 # Temperature sources to use for measurement.
 sources = [
-  # IPMI sensor source. The sensor's units must be `degrees C`.
+  # IPMI sensor source. The sensor's units must be `degrees C`. The zone must
+  # have a `supermicro` fan, because only such a zone opens an IPMI session.
   { type = "ipmi", sensor = "CPU Temp" },
 
   # Local file source. File formatting rules:
@@ -62,6 +126,21 @@ sources = [
   #
   # The thermal_zone sysfs paths on Linux satisfy these conditions.
   # { type = "file", path = "/sys/class/thermal/thermal_zone1/temp" },
+
+  # hwmon source. This reads `temp<input>_input` of the hwmon chip whose
+  # `name` file holds `chip`, in milli-degrees Celsius, and rounds up to whole
+  # degrees. A reading above 255 °C gives 255. A reading below 0 °C fails the
+  # source, because an open probe reports a negative value; a real sub-zero
+  # temperature then fails the source as well. When the chip has a
+  # `temp<input>_fault` file and it holds a value other than 0, or it cannot
+  # be read or parsed, the source fails. `input` starts at 1.
+  #
+  # The chip is found by name on every read, never by its hwmonN number,
+  # which can change between boots. A name that no chip or more than one chip
+  # has fails the source. To list the names, run:
+  #
+  #   grep . /sys/class/hwmon/*/name
+  # { type = "hwmon", chip = "k10temp", input = 1 },
 
   # HDD S.M.A.R.T. source. Disks that are spun down may not report a
   # temperature reading, leading to an error. This internally runs:
@@ -118,6 +197,12 @@ sources = [
   # A zone in which no source has a reading runs at 100%. A failing source is
   # still tried once in every update.
   # { type = "nvidia", gpu = "00000000:81:00.0", steps = [{ temp = 60, dcycle = 40 }, { temp = 90, dcycle = 100 }], on_failure = { type = "dcycle", dcycle = 80 } },
+
+  # In place of `steps`, a source can name a curve from the `curves` section
+  # above with `curve`. A source cannot have both. Several sources can name
+  # one curve; each maps its own temperature through it. Such a source counts
+  # as a source with its own `steps` everywhere in this file.
+  # { type = "nvidia", gpu = "00000000:82:00.0", curve = "gpu", on_failure = { type = "dcycle", dcycle = 80 } },
 
   # Any source can also carry `smoothing_samples`, a number from 1 to 255. The
   # source then feeds the mean of its last `smoothing_samples` readings,
@@ -181,6 +266,12 @@ steps = [
   { temp = 70, dcycle = 70 }
 ]
 
+# In place of `steps`, the zone can name a curve from the `curves` section
+# with `curve`, here the `gpu` curve defined above. The zone cannot have both,
+# so remove `steps` when you set `curve`. The rules above for the zone's
+# `steps` apply to the named curve's steps.
+#curve = "gpu"
+
 # Method of combining the duty cycles of the zone's curves: the zone curve and
 # the curve of each source with `steps`. The default, maximum, uses the highest
 # duty cycle of any curve. Average takes the mean, rounded up, and `top` limits
@@ -195,11 +286,15 @@ steps = [
 # A rise is always followed at once, so the fans speed up without delay but do
 # not slow down for a fall of less than this. Each curve holds its own
 # temperature. The default is 0, which follows every reading.
+#
+# This applies only to inline `steps`: the zone's and those of each source. A
+# named curve uses the `hysteresis` of its entry in `curves`.
 #hysteresis = 3
 
-# More fan zones can be added
+# More fan zones can be added. Each drives fans that no other zone drives, so
+# to enable this example, remove zone 1 from the first zone's `fans`.
 #[[zones]]
-#ipmi_zones = [1]
+#fans = [{ type = "supermicro", zone = 1 }]
 #interval = 5
 #sources = [
 #    { type = "smart", block_dev = "/dev/disk/by-id/..." },
@@ -209,6 +304,28 @@ steps = [
 #steps = [
 #    { temp = 30, dcycle = 30 },
 #    { temp = 70, dcycle = 70 },
+#]
+
+# A zone with only hwmon fans and sources needs no IPMI device. It cannot
+# read `ipmi` sources: an `ipmi` source needs a `supermicro` fan in the same
+# zone. To list the chip names, run `grep . /sys/class/hwmon/*/name`.
+#[[zones]]
+#fans = [{ type = "hwmon", chip = "nct6798", pwm = 2 }]
+#sources = [{ type = "hwmon", chip = "k10temp", input = 1 }]
+#steps = [
+#    { temp = 40, dcycle = 30 },
+#    { temp = 80, dcycle = 100 },
+#]
+
+# A zone that drives the fan of an NVIDIA GPU from the GPU's own temperature.
+# It needs no IPMI device, but the program must run as root. The `nvidia`
+# source runs nvidia-smi, as described with the sources above.
+#[[zones]]
+#fans = [{ type = "nvidia", gpu = "00000000:01:00.0", fan = 0 }]
+#sources = [{ type = "nvidia", gpu = "00000000:01:00.0" }]
+#steps = [
+#    { temp = 50, dcycle = 30 },
+#    { temp = 85, dcycle = 100 },
 #]
 
 # Optional section for defining other IPMI sessions. This is not needed when

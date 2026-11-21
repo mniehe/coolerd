@@ -5,7 +5,7 @@ tools:
 
 tags:
   ipmi: [src/ipmi.rs, src/freeipmi.rs, src/bindings.rs, build.rs, wrapper.h]
-  duty: [src/main.rs, src/curve.rs]
+  duty: [src/main.rs, src/curve.rs, src/fan.rs, src/session.rs, src/hwmon.rs, src/nvml.rs]
   sources: [src/source.rs, src/command.rs]
   config: [src/config.rs, config.sample.toml]
   nix: [nix/**, flake.nix, flake.lock]
@@ -37,4 +37,5 @@ verify_notes: |
   BMC: the daemon takes over fan control on start. Never run `cargo fmt`; the
   tree is not rustfmt output. Do not change flake.lock or Cargo.lock. Tests
   of external commands use fake scripts, never the real smartctl, hdparm or
-  nvidia-smi.
+  nvidia-smi. Tests of NVIDIA fans use the fake NVML; never load the real
+  libnvidia-ml.

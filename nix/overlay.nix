@@ -1,7 +1,7 @@
 final: prev: {
-  ipmi-fan-control = final.rustPlatform.buildRustPackage {
-    pname = "ipmi-fan-control";
-    version = "0.1.0"; # Update with your actual version
+  coolerd = final.rustPlatform.buildRustPackage {
+    pname = "coolerd";
+    version = (final.lib.importTOML ../Cargo.toml).package.version;
 
     src = ../.;
 
@@ -40,5 +40,22 @@ final: prev: {
     postFixup = ''
       patchelf --set-rpath "${final.lib.makeLibraryPath [final.freeipmi]}" $out/bin/*
     '';
+
+    # The NixOS module runs bin/coolerd. The check does not run it, because the
+    # daemon would take over the fans of the build machine.
+    doInstallCheck = true;
+    installCheckPhase = ''
+      runHook preInstallCheck
+      if [ ! -f "$out/bin/coolerd" ] || [ ! -x "$out/bin/coolerd" ]; then
+        echo "$out/bin/coolerd is not an executable regular file" >&2
+        exit 1
+      fi
+      runHook postInstallCheck
+    '';
+
+    meta.mainProgram = "coolerd";
   };
+
+  # The name before the rename to coolerd
+  ipmi-fan-control = final.coolerd;
 }

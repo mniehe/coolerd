@@ -1,11 +1,15 @@
 # Project Context
 
-ipmi-fan-control is a Rust daemon that sets the case-fan duty cycle on
-Supermicro motherboards over IPMI. It reads temperatures from IPMI sensors,
-files, `smartctl`, `hdparm` and `nvidia-smi`, maps them through a curve, and writes
-the duty with Supermicro OEM raw commands through libfreeipmi. This repository
-is a fork of the archived `chenxiaolong/ipmi-fan-control`, so nothing goes
-upstream. It runs on a real server through the NixOS module in `nix/`.
+coolerd is a Rust daemon that controls fan duty on Linux. It reads
+temperatures from IPMI sensors, files, hwmon, `smartctl`, `hdparm` and
+`nvidia-smi`, maps them through curves, and writes the duty to a fan backend:
+Supermicro zones, with OEM raw commands through libfreeipmi, hwmon PWM
+files, or NVIDIA GPU fans through the host's NVML library. This repository
+is a fork of the archived
+`chenxiaolong/ipmi-fan-control`, so nothing goes upstream. It was named
+ipmi-fan-control until the rename; the NixOS module and the overlay keep that
+name as option and package aliases. It runs on a real server through the NixOS module in
+`nix/`.
 
 A wrong duty value can overheat hardware, and nothing on a development machine
 will show it. When a choice is unclear, choose the one that leaves the fans
@@ -41,9 +45,15 @@ Before you start, say in a line what you're about to do; brief updates while you
 
 Ask first, naming the exact action, before:
 
-- running the built binary, `ipmitool`, or any other command that can reach a
-  BMC. On start the daemon switches the board to full fan mode and takes over
-  the duty cycle, and `testing.md` holds raw commands aimed at a live machine;
+- running the built binary with any config, `ipmitool`, or any other command
+  that can reach a BMC or write under `/sys`. On start the daemon takes over
+  the fans: a Supermicro fan switches the board to full fan mode, and a hwmon
+  fan switches `pwm<N>_enable` of this machine's own chip to manual. An
+  NVIDIA fan is set to a manual speed through NVML. A killed process leaves
+  them that way. Ask as well before running `nvidia-smi` or any other
+  program that loads `libnvidia-ml`, because it reaches a GPU's fans through
+  the same driver. `testing.md` holds raw commands aimed at a
+  live machine;
 - any command on a deployed host, and any `nixos-rebuild` or other activation;
 - pushing, merging, or anything that lands on `master`. The server's
   configuration pins this repository as a flake input, so `master` is what
@@ -64,10 +74,14 @@ worktree other than `flake.lock` and the dependency tables of `Cargo.toml`.
 
 ```
 /src
-  main.rs       # CLI, IPMI session, zone loops, shutdown path
+  main.rs       # CLI, zone loops, shutdown path
+  fan.rs        # The Fan trait, its Supermicro, hwmon and NVIDIA backends, FanGuard, build_fan
+  nvml.rs       # The Nvml trait and RealNvml: NVML calls on one worker thread, each under a time limit
+  session.rs    # IpmiSession: the shared BMC connection and its restore on drop
+  hwmon.rs      # HwmonRoot: finds a hwmon chip by name under /sys/class/hwmon
   curve.rs      # Pure duty logic: curve, aggregation, hysteresis, smoothing, failure floor
   config.rs     # TOML config types (serde) and validation in load_config
-  source.rs     # Temperature sources (ipmi, file, smartctl, hdparm, nvidia) and their retries
+  source.rs     # Temperature sources (ipmi, file, hwmon, smartctl, hdparm, nvidia) and their retries
   command.rs    # CommandRunner: runs an external program under a time and an output limit
   ipmi.rs       # Supermicro OEM commands: fan mode, duty cycle, sensor readings
   freeipmi.rs   # Safe wrappers over the libfreeipmi and libipmimonitoring FFI
@@ -77,11 +91,10 @@ build.rs        # Runs bindgen over wrapper.h at build time
 wrapper.h       # The freeipmi headers that bindgen reads
 config.sample.toml  # The documented config; the reference for every key
 /nix
-  module.nix    # NixOS module: options, service user, udev rule, systemd unit
+  module.nix    # NixOS module: options, old-name aliases, service user, udev rule, hwmon access helper, systemd unit
   overlay.nix   # The Nix package, built from Cargo.lock
-flake.nix       # Dev shell, package, module and overlay outputs
-/dist           # Upstream packaging for RPM, Debian and Arch
-/.github/workflows  # CI (clippy, build) and tagged releases
+flake.nix       # Dev shell, package, module and overlay outputs; the module-eval and hwmon-access checks
+/.github/workflows  # CI (clippy, build, flake check)
 testing.md      # The owner's notes of raw ipmitool commands; not documentation
 ```
 
@@ -100,8 +113,10 @@ The dev shell's toolchain comes from `flake.lock` and is the authority for
 lint results. CI and a system toolchain run other clippy versions and can
 report different lints.
 
-No IPMI hardware exists on a development machine, so the daemon cannot be run
-here. Behaviour is proved by tests of pure functions.
+Do not run the daemon on a development machine. No IPMI hardware exists
+here, and a hwmon fan would take over this machine's own fans. Behaviour is
+proved by tests of pure functions, of fake hwmon trees and of a fake NVML.
+No test loads the real `libnvidia-ml`.
 
 ## Rules
 
@@ -110,8 +125,9 @@ here. Behaviour is proved by tests of pure functions.
   the real change in the diff.
 - Every fallible path returns a variant of `Error` in `src/error.rs`. Do not
   panic or call `process::exit` outside `main`: a return from `main_wrapper`,
-  with `Ok` or with an `Error`, is what runs `IpmiSession::drop`, which sets
-  every zone to 100% and restores the fan mode.
+  with `Ok` or with an `Error`, is what runs `FanGuard::drop` and
+  `IpmiSession::drop`, which set every fan to full and restore a saved
+  automatic fan mode.
 - That shutdown path is the safety net. A change must keep it running on every
   exit, including a failed zone loop and a signal.
 - A duty cycle is a `u8` from 0 to 100. Validate it where it enters, in
@@ -136,6 +152,14 @@ here. Behaviour is proved by tests of pure functions.
   A program that must match the host's driver, as `nvidia-smi` must, is not
   taken from `pkgs`: the host passes its package through the `extraPackages`
   option.
+- Every NVML call goes through the `Nvml` trait in `src/nvml.rs`. `RealNvml`
+  runs it on its worker thread under a named time limit, because a call into
+  a hung driver never returns and a zone loop cannot be cancelled while it
+  blocks. Nothing else calls `nvml-wrapper`, and nothing calls
+  `nvmlShutdown`.
+- A fan's `release` returns an error when it could not leave the fan in a
+  safe state. `FanGuard` records that error, and the process then exits with
+  a failure status.
 - Raw IPMI bytes are named constants in `src/ipmi.rs`. A new one carries a
   comment that says where the value comes from, because no test can check it.
 - Each `unsafe` block carries a comment that says why it is sound, as the
@@ -143,8 +167,6 @@ here. Behaviour is proved by tests of pure functions.
 - Tests live in a `#[cfg(test)] mod tests` block in the file they test. Write
   the failing test first and watch it fail. A change to untested logic first
   moves that logic into a pure function.
-- Leave `/dist` alone unless a build dependency changes. It is upstream
-  packaging that nothing here exercises.
 
 ## Verification
 
@@ -192,6 +214,10 @@ the fans slow, or breaks the deployed unit:
 - `build.rs` and `wrapper.h`
 - `src/curve.rs`, which holds the duty calculation
 - `src/command.rs`
+- `src/fan.rs` and `src/session.rs`, which write the duty and restore the
+  fans on exit, and `src/hwmon.rs`, which picks the chip they write to
+- `src/nvml.rs`, which bounds every NVML call so that a hung driver cannot
+  block the shutdown path
 - the zone loop and the shutdown path in `src/main.rs`
 - `nix/**`
 - `.claude/review/review.yaml`

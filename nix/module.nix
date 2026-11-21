@@ -6,15 +6,25 @@
   ...
 }:
 with lib; let
-  cfg = config.services.ipmi-fan-control;
+  cfg = config.services.coolerd;
 
   # Service user and group
-  serviceUser = "ipmi-fan-control";
-  serviceGroup = "ipmi-fan-control";
+  serviceUser = "coolerd";
+  serviceGroup = "coolerd";
+
+  # The user and group the daemon runs as; NVML fan commands need root
+  unitUser =
+    if cfg.enableNvidiaFans
+    then "root"
+    else serviceUser;
+  unitGroup =
+    if cfg.enableNvidiaFans
+    then "root"
+    else serviceGroup;
 
   # Use pkgs.formats.toml to handle the conversion
   format = pkgs.formats.toml {};
-  configFile = format.generate "ipmi-fan-control-config.toml" cfg.settings;
+  configFile = format.generate "coolerd-config.toml" cfg.settings;
 
   # Runtime dependencies
   runtimeDeps = with pkgs;
@@ -24,28 +34,169 @@ with lib; let
     ++ optional cfg.enableSmartMonTools smartmontools
     ++ optional cfg.enableHdparm hdparm
     ++ cfg.extraPackages;
+
+  # The helper grants group write rather than world write, so only the
+  # service user can drive the fans. It runs before every start, so access is
+  # set whenever the unit starts, whatever the order in which the device
+  # appeared. Every check runs before the first grant, so a failed check stops
+  # the unit with a message that names the chip or path and grants nothing. An
+  # error from chgrp or chmod while granting also stops the unit, but can leave
+  # some of the listed files already granted. A driver reload removes the
+  # access, so the service must be restarted after one.
+  accessPreamble = ''
+    set -eu
+
+    if [ "$#" -ne 2 ]; then
+      echo "usage: $0 HWMON_ROOT GROUP" >&2
+      exit 2
+    fi
+    hwmon_root="$1"
+    group="$2"
+    # Every file to grant; none is granted until all of them have passed
+    targets=()
+
+    # Set device to the one hwmon directory whose trimmed name is the chip,
+    # the rule the daemon uses to find a chip
+    find_chip() {
+      chip="$1"
+      device=""
+      count=0
+      for dir in "$hwmon_root"/*; do
+        if [ ! -e "$dir/name" ]; then
+          continue
+        fi
+        if ! name="$(${pkgs.coreutils}/bin/cat -- "$dir/name")"; then
+          echo "$dir/name: cannot read the hwmon chip name" >&2
+          exit 1
+        fi
+        # Trim surrounding whitespace, as the daemon does; a name of more
+        # than one line keeps its inner newline and matches no chip
+        name="''${name#"''${name%%[![:space:]]*}"}"
+        name="''${name%"''${name##*[![:space:]]}"}"
+        if [ "$name" = "$chip" ]; then
+          device="$dir"
+          count=$((count + 1))
+        fi
+      done
+      if [ "$count" -ne 1 ]; then
+        echo "hwmon chip $chip: expected one $hwmon_root entry with this name, found $count" >&2
+        exit 1
+      fi
+    }
+
+    add_target() {
+      if [ -L "$1" ]; then
+        echo "$1: is a symbolic link, not a regular file" >&2
+        exit 1
+      fi
+      if [ ! -f "$1" ]; then
+        echo "$1: does not exist or is not a regular file" >&2
+        exit 1
+      fi
+      targets+=("$1")
+    }
+  '';
+
+  grantChannel = n: ''
+    add_target "$device/pwm${toString n}"
+    add_target "$device/pwm${toString n}_enable"
+  '';
+  grantChip = chip: channels:
+    ''
+      find_chip ${escapeShellArg chip}
+    ''
+    + concatMapStrings grantChannel channels;
+
+  accessGrants = ''
+    for target in "''${targets[@]}"; do
+      ${pkgs.coreutils}/bin/chgrp -- "$group" "$target"
+      ${pkgs.coreutils}/bin/chmod g+w -- "$target"
+    done
+  '';
+
+  accessHelper = pkgs.writeShellScript "coolerd-hwmon-access" cfg.hwmon.accessScript;
+
+  validChipName = chip: builtins.match "[A-Za-z0-9_-]+" chip != null;
+
+  # Every fan that settings lists. settings is not checked by type, so a value
+  # of the wrong shape is skipped here; the daemon rejects it when it starts.
+  listOrEmpty = value:
+    if isList value
+    then value
+    else [];
+  settingsZones = listOrEmpty (cfg.settings.zones or null);
+  zoneFans = zone:
+    if isAttrs zone
+    then listOrEmpty (zone.fans or null)
+    else [];
+  # The daemon also reads a fan written as a list in field order, such as
+  # [ "nvidia" "00000000:01:00.0" 0 ], whose first element is the type
+  fanType = fan:
+    if isAttrs fan
+    then fan.type or null
+    else if isList fan && fan != []
+    then head fan
+    else null;
+  listsNvidiaFan = any (fan: fanType fan == "nvidia") (concatMap zoneFans settingsZones);
+
+  # Fails the system build when the package lacks the program that ExecStart
+  # runs, so a switch never stops the running unit for one that cannot start.
+  # The package is an attribute rather than part of the script, so a test can
+  # run the script against another package.
+  packageCheck = pkgs.runCommand "coolerd-package-check" {inherit (cfg) package;} ''
+    if [ ! -f "$package/bin/coolerd" ] || [ ! -x "$package/bin/coolerd" ]; then
+      echo "services.coolerd.package: $package/bin/coolerd is not an executable regular file; the package must provide bin/coolerd" >&2
+      exit 1
+    fi
+    touch "$out"
+  '';
 in {
-  options.services.ipmi-fan-control = {
-    enable = mkEnableOption "IPMI fan control service";
+  # One alias per option leaf: an alias of the whole subtree breaks
+  # lib.mkForce on an old path. hwmon.accessScript is internal and has none,
+  # and so does enableNvidiaFans, which came after the rename.
+  imports = map (leaf: mkRenamedOptionModule (["services" "ipmi-fan-control"] ++ leaf) (["services" "coolerd"] ++ leaf)) [
+    ["enable"]
+    ["package"]
+    ["settings"]
+    ["enableSmartMonTools"]
+    ["enableHdparm"]
+    ["extraPackages"]
+    ["enableIpmi"]
+    ["hwmon" "kernelModules"]
+    ["hwmon" "pwmChannels"]
+  ];
+
+  options.services.coolerd = {
+    enable = mkEnableOption "the coolerd fan control service";
 
     package = mkOption {
       type = types.package;
-      default = pkgs.ipmi-fan-control;
-      defaultText = literalExpression "pkgs.ipmi-fan-control";
-      description = "The ipmi-fan-control package to use";
+      default = pkgs.coolerd;
+      defaultText = literalExpression "pkgs.coolerd";
+      description = "The coolerd package to use. It must provide bin/coolerd, or the system build fails";
     };
 
     settings = mkOption {
       type = types.attrs;
       default = {};
-      description = "Configuration for IPMI fan control";
+      description = "Configuration for coolerd";
       example = literalExpression ''
         {
           log_level = "info";
           zones = [
             {
               session = "default";
-              ipmi_zones = [0 1];
+              fans = [
+                {
+                  type = "supermicro";
+                  zone = 0;
+                }
+                {
+                  type = "supermicro";
+                  zone = 1;
+                }
+              ];
+              # The older form of the same fans: ipmi_zones = [0 1];
               interval = 10;
               sources = [
                 {
@@ -92,13 +243,77 @@ in {
       example = literalExpression "[(lib.getBin config.hardware.nvidia.package)]";
       description = "Extra packages to put on the service's PATH, such as the package that provides nvidia-smi";
     };
+
+    enableIpmi = mkOption {
+      type = types.bool;
+      default = true;
+      description = "Load the IPMI kernel modules and give the service access to the IPMI device. Turn it off on a host with no IPMI and only hwmon or NVIDIA fans";
+    };
+
+    enableNvidiaFans = mkOption {
+      type = types.bool;
+      default = false;
+      description = ''
+        Run the service as root so that it can drive NVIDIA GPU fans through
+        NVML. NVML fan commands were shown to work only as root, on driver
+        595.104.02, so the service runs as the user and group root with no
+        ambient capabilities, and /etc/coolerd.toml belongs to root. The
+        service loads libnvidia-ml.so.1 from the host's driver at run time,
+        so the library is not a package input: the service's LD_LIBRARY_PATH
+        is /run/opengl-driver/lib, which exists only when the host enables its
+        graphics driver packages, as hardware.graphics.enable does
+      '';
+    };
+
+    hwmon = {
+      kernelModules = mkOption {
+        type = types.listOf types.str;
+        default = [];
+        example = ["nct6775"];
+        description = "Kernel modules that provide the hwmon chips the service reads or drives";
+      };
+
+      pwmChannels = mkOption {
+        type = types.attrsOf (types.listOf types.ints.positive);
+        default = {};
+        example = literalExpression "{nct6798 = [2 3];}";
+        description = "PWM channels, by hwmon chip name, that the service may write. Before the service starts, its group gets write access to pwmN and pwmN_enable of each channel. The service fails to start when a chip is absent";
+      };
+
+      accessScript = mkOption {
+        type = types.lines;
+        internal = true;
+        readOnly = true;
+        description = "Text of the root helper that grants the service group write access to the pwmChannels files";
+      };
+    };
   };
 
   config = mkIf cfg.enable {
+    assertions =
+      [
+        {
+          assertion = cfg.enableNvidiaFans || !listsNvidiaFan;
+          message = "services.coolerd.settings: a zone has a fan of type \"nvidia\", which needs services.coolerd.enableNvidiaFans = true";
+        }
+      ]
+      ++ map (chip: {
+        assertion = validChipName chip;
+        message = "services.coolerd.hwmon.pwmChannels: chip name ${builtins.toJSON chip} must match [A-Za-z0-9_-]+";
+      })
+      (attrNames cfg.hwmon.pwmChannels);
+
+    services.coolerd.hwmon.accessScript =
+      accessPreamble
+      + concatStrings (mapAttrsToList grantChip (filterAttrs (chip: _: validChipName chip) cfg.hwmon.pwmChannels))
+      + accessGrants;
+
     environment.systemPackages = [cfg.package];
 
+    system.checks = [packageCheck];
+
     # Ensure the IPMI kernel modules are loaded
-    boot.kernelModules = ["ipmi_devintf" "ipmi_si" "ipmi_msghandler"];
+    boot.kernelModules = optionals cfg.enableIpmi ["ipmi_devintf" "ipmi_si" "ipmi_msghandler"] ++ cfg.hwmon.kernelModules;
 
     # Create the necessary groups
     users.groups = {
@@ -106,7 +321,7 @@ in {
       "${serviceGroup}" = {};
 
       # Ensure ipmi group exists
-      "ipmi" = {};
+      "ipmi" = mkIf cfg.enableIpmi {};
 
       # Ensure disk group exists when drive access is needed
       "disk" = mkIf (cfg.enableSmartMonTools || cfg.enableHdparm) {};
@@ -116,50 +331,56 @@ in {
     users.users."${serviceUser}" = {
       isSystemUser = true;
       group = serviceGroup;
-      description = "IPMI Fan Control service user";
+      description = "coolerd service user";
       home = "/var/empty";
       extraGroups =
-        [
-          "ipmi"
-        ]
+        optional cfg.enableIpmi "ipmi"
         ++ optional cfg.enableSmartMonTools "disk"
         ++ optional cfg.enableHdparm "disk";
     };
 
     # Set up udev rules to ensure correct permissions for IPMI devices
-    services.udev.extraRules = ''
+    services.udev.extraRules = mkIf cfg.enableIpmi ''
       # Give the ipmi group access to the IPMI device
       KERNEL=="ipmi*", GROUP="ipmi", MODE="0660"
       KERNEL=="ipmidev/*", GROUP="ipmi", MODE="0660"
     '';
 
-    environment.etc."ipmi-fan-control.toml" = {
+    environment.etc."coolerd.toml" = {
       source = configFile;
       mode = "0600"; # Restrict access as it might contain credentials
-      user = serviceUser;
-      group = serviceGroup;
+      user = unitUser;
+      group = unitGroup;
     };
 
-    systemd.services.ipmi-fan-control = {
-      description = "IPMI Fan Control Service";
+    systemd.services.coolerd = {
+      description = "coolerd fan control service";
       wantedBy = ["multi-user.target"];
       after = ["network.target"];
       restartTriggers = [configFile];
 
       path = runtimeDeps;
 
+      environment.LD_LIBRARY_PATH = mkIf cfg.enableNvidiaFans "/run/opengl-driver/lib";
+
       serviceConfig = {
         Type = "simple";
-        User = serviceUser;
-        Group = serviceGroup;
-        ExecStart = "${cfg.package}/bin/ipmi-fan-control --config /etc/ipmi-fan-control.toml";
+        User = unitUser;
+        Group = unitGroup;
+        # The + prefix runs the helper as root; the daemon keeps its user. A
+        # root unit needs no grant, but the helper still stops the start when
+        # a listed chip or file is missing.
+        ExecStartPre = mkIf (cfg.hwmon.pwmChannels != {}) "+${accessHelper} /sys/class/hwmon ${escapeShellArg unitGroup}";
+        ExecStart = "${cfg.package}/bin/coolerd --config /etc/coolerd.toml";
         Restart = "on-failure";
         RestartSec = "10s";
         # CAP_SYS_RAWIO: required for SATA SMART (SCSI passthrough) and hdparm
         # CAP_SYS_ADMIN: required for NVMe SMART (admin ioctl)
-        AmbientCapabilities =
+        # A root unit holds both already.
+        AmbientCapabilities = mkIf (!cfg.enableNvidiaFans) (
           lib.optionals (cfg.enableSmartMonTools || cfg.enableHdparm) ["CAP_SYS_RAWIO"]
-          ++ lib.optionals cfg.enableSmartMonTools ["CAP_SYS_ADMIN"];
+          ++ lib.optionals cfg.enableSmartMonTools ["CAP_SYS_ADMIN"]
+        );
       };
     };
   };

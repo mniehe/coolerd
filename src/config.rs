@@ -122,6 +122,12 @@ pub enum Source {
         // PCI bus id or GPU UUID, as nvidia-smi -i accepts
         gpu: String,
     },
+    Hwmon {
+        // The text of the chip's hwmon `name` file
+        chip: String,
+        // N of the chip's tempN_input; the kernel numbers inputs from 1
+        input: u8,
+    },
 }
 
 /// What a zone does when a source has failed every attempt of a poll
@@ -155,18 +161,30 @@ pub struct SourceConfig {
     pub steps: Option<Vec<Step>>,
     pub on_failure: OnFailure,
     pub smoothing_samples: u8,
+    /// The name of an entry of `curves`, which sets `steps`
+    pub curve: Option<String>,
+    /// The hysteresis of the named curve that set `steps`; `None` means the
+    /// zone's `hysteresis` applies. Not a config key.
+    pub curve_hysteresis: Option<u8>,
 }
 
 impl SourceConfig {
     /// A source of `kind` with every other key at its default
     pub fn new(kind: Source) -> Self {
-        Self { kind, steps: None, on_failure: OnFailure::default(), smoothing_samples: 1 }
+        Self {
+            kind,
+            steps: None,
+            on_failure: OnFailure::default(),
+            smoothing_samples: 1,
+            curve: None,
+            curve_hysteresis: None,
+        }
     }
 }
 
 /// Serde cannot combine `flatten` with `deny_unknown_fields`, so `steps`,
-/// `on_failure` and `smoothing_samples` are taken out of the table by hand and
-/// the rest goes to [`Source`], which still rejects an unknown key or type. A
+/// `curve`, `on_failure` and `smoothing_samples` are taken out of the table by
+/// hand and the rest goes to [`Source`], which still rejects an unknown key or type. A
 /// sequence, the positional form that [`Source`] accepts, goes to it unchanged
 /// and has every other key at its default.
 impl<'de> Deserialize<'de> for SourceConfig {
@@ -200,12 +218,14 @@ impl<'de> Deserialize<'de> for SourceConfig {
             {
                 let mut table = toml::value::Table::new();
                 let mut steps = None;
+                let mut curve = None;
                 let mut on_failure = None;
                 let mut smoothing_samples = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     let repeated = match key.as_str() {
                         "steps" => steps.is_some(),
+                        "curve" => curve.is_some(),
                         "on_failure" => on_failure.is_some(),
                         "smoothing_samples" => smoothing_samples.is_some(),
                         _ => table.contains_key(&key),
@@ -221,6 +241,10 @@ impl<'de> Deserialize<'de> for SourceConfig {
                         "steps" => {
                             steps = Some(Vec::<Step>::deserialize(value)
                                 .map_err(|e| de::Error::custom(format!("steps: {}", e)))?);
+                        }
+                        "curve" => {
+                            curve = Some(String::deserialize(value)
+                                .map_err(|e| de::Error::custom(format!("curve: {}", e)))?);
                         }
                         "on_failure" => {
                             on_failure = Some(OnFailure::deserialize(value)
@@ -243,6 +267,7 @@ impl<'de> Deserialize<'de> for SourceConfig {
 
                 Ok(SourceConfig {
                     steps,
+                    curve,
                     on_failure: on_failure.unwrap_or(defaults.on_failure),
                     smoothing_samples: smoothing_samples.unwrap_or(defaults.smoothing_samples),
                     ..defaults
@@ -264,6 +289,30 @@ pub enum Aggregation {
     },
 }
 
+/// One fan that a zone drives
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "lowercase", tag = "type")]
+pub enum FanConfig {
+    /// A Supermicro IPMI fan zone on the zone's `session`
+    Supermicro {
+        zone: u8,
+    },
+    /// PWM channel `pwm` of the hwmon chip whose `name` file holds `chip`
+    Hwmon {
+        chip: String,
+        pwm: u8,
+    },
+    /// Fan `fan` of the NVIDIA GPU at PCI bus id `gpu`. Validation rewrites
+    /// `gpu` to the canonical form of its PCI bus id.
+    Nvidia {
+        gpu: String,
+        fan: u32,
+    },
+}
+
+/// A zone may also be written as a TOML array, whose values serde reads in the
+/// order the fields are declared. Add a new field after the existing ones, so
+/// that a config in that form keeps loading.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Zone {
@@ -275,7 +324,9 @@ pub struct Zone {
     pub retries: Retries,
     #[serde(default)]
     pub retry_delay_ms: RetryDelayMs,
-    pub ipmi_zones: Vec<u8>,
+    /// The legacy form of `fans`: Supermicro zone numbers
+    #[serde(default)]
+    pub ipmi_zones: Option<Vec<u8>>,
     pub sources: Vec<SourceConfig>,
     #[serde(default)]
     pub aggregation: Aggregation,
@@ -286,9 +337,23 @@ pub struct Zone {
     /// How the duties of the zone's curves combine into one
     #[serde(default)]
     pub duty_aggregation: Aggregation,
-    /// Degrees a curve's temperature must fall before its duty follows
+    /// Degrees the temperature of an inline curve must fall before its duty
+    /// follows
     #[serde(default)]
     pub hysteresis: u8,
+    /// The name of an entry of `curves`, which sets `steps`
+    #[serde(default)]
+    pub curve: Option<String>,
+    /// The hysteresis of the named curve that set `steps`; `None` means
+    /// `hysteresis` applies. Not a config key.
+    #[serde(skip)]
+    pub curve_hysteresis: Option<u8>,
+    /// The fans the zone drives
+    #[serde(default)]
+    pub fans: Option<Vec<FanConfig>>,
+    /// The fans of `fans` or `ipmi_zones`, whichever is set. Not a config key.
+    #[serde(skip)]
+    pub fan_list: Vec<FanConfig>,
 }
 
 impl Zone {
@@ -405,7 +470,20 @@ pub struct Config {
     pub log_level: LogLevel,
     #[serde(default)]
     pub sessions: Sessions,
+    /// Curves that a source or a zone names with `curve`
+    #[serde(default)]
+    pub curves: HashMap<String, CurveConfig>,
     pub zones: Vec<Zone>,
+}
+
+/// A curve defined once and named by any number of sources and zones
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurveConfig {
+    pub steps: Vec<Step>,
+    /// Degrees the curve's temperature must fall before its duty follows
+    #[serde(default)]
+    pub hysteresis: u8,
 }
 
 /// Whether `value` is exactly `len` hex digits, in either case
@@ -433,21 +511,52 @@ fn is_pci_device(device: &str) -> bool {
     is_hex_digits(device, 2) && matches!(device.as_bytes()[0], b'0' | b'1')
 }
 
-/// Whether `gpu` is a full PCI bus id, `DDDD:BB:DD.F` or `DDDDDDDD:BB:DD.F`,
-/// with hex domain and bus, a device from 00 to 1f and a function from 0 to 7.
-fn is_pci_bus_id(gpu: &str) -> bool {
-    let parts: Vec<&str> = gpu.split(':').collect();
-    let [domain, bus, device_function] = parts[..] else {
-        return false;
-    };
-    let Some((device, function)) = device_function.split_once('.') else {
-        return false;
-    };
+/// A full PCI bus id. Its canonical form, which `Display` writes, has an
+/// eight-digit domain and lower-case hex: `00000000:01:00.0`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PciBusId {
+    domain: u32,
+    bus: u8,
+    device: u8,
+    function: u8,
+}
 
-    (is_hex_digits(domain, 4) || is_hex_digits(domain, 8))
-        && is_hex_digits(bus, 2)
-        && is_pci_device(device)
-        && matches!(function, "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7")
+impl PciBusId {
+    /// Parse `DDDD:BB:DD.F` or `DDDDDDDD:BB:DD.F`, with hex domain and bus in
+    /// either case, a device from 00 to 1f and a function from 0 to 7
+    fn parse(id: &str) -> Option<Self> {
+        let parts: Vec<&str> = id.split(':').collect();
+        let [domain, bus, device_function] = parts[..] else {
+            return None;
+        };
+        let (device, function) = device_function.split_once('.')?;
+        let valid = (is_hex_digits(domain, 4) || is_hex_digits(domain, 8))
+            && is_hex_digits(bus, 2)
+            && is_pci_device(device)
+            && matches!(function, "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7");
+
+        if !valid {
+            return None;
+        }
+
+        Some(Self {
+            domain: u32::from_str_radix(domain, 16).ok()?,
+            bus: u8::from_str_radix(bus, 16).ok()?,
+            device: u8::from_str_radix(device, 16).ok()?,
+            function: function.parse().ok()?,
+        })
+    }
+}
+
+impl fmt::Display for PciBusId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:08x}:{:02x}:{:02x}.{:x}", self.domain, self.bus, self.device, self.function)
+    }
+}
+
+/// Whether `gpu` is a full PCI bus id, as [`PciBusId::parse`] accepts
+fn is_pci_bus_id(gpu: &str) -> bool {
+    PciBusId::parse(gpu).is_some()
 }
 
 pub fn load_config(path: &Path) -> Result<Config> {
@@ -479,7 +588,12 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
         });
     }
 
-    for (i, zone_config) in config.zones.iter().enumerate() {
+    // Before the zone checks, so that a named curve meets every check of
+    // inline steps
+    resolve_curves(&mut config)
+        .map_err(|reason| Error::ConfigValidation { path: path.to_owned(), reason })?;
+
+    for (i, zone_config) in config.zones.iter_mut().enumerate() {
         if zone_config.interval.0 == 0 {
             return Err(Error::ConfigValidation {
                 path: path.to_owned(),
@@ -487,19 +601,29 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
             });
         }
 
-        if zone_config.ipmi_zones.is_empty() {
-            return Err(Error::ConfigValidation {
-                path: path.to_owned(),
-                reason: format!("zones[{}].ipmi_zones: must be non-empty", i),
-            });
-        } else if zone_config.sources.is_empty() {
+        zone_config.fan_list = zone_fans(zone_config, i)
+            .map_err(|reason| Error::ConfigValidation { path: path.to_owned(), reason })?;
+
+        if zone_config.sources.is_empty() {
             return Err(Error::ConfigValidation {
                 path: path.to_owned(),
                 reason: format!("zones[{}].sources: must be non-empty", i),
             });
         }
 
+        // Only a zone with a Supermicro fan opens an IPMI session to read
+        // sensors through
+        let has_supermicro_fan = zone_config.fan_list.iter()
+            .any(|fan| matches!(fan, FanConfig::Supermicro { .. }));
+
         for (j, source) in zone_config.sources.iter().enumerate() {
+            if matches!(source.kind, Source::Ipmi { .. }) && !has_supermicro_fan {
+                return Err(Error::ConfigValidation {
+                    path: path.to_owned(),
+                    reason: format!("zones[{}].sources[{}]: an ipmi source needs a supermicro fan in the same zone", i, j),
+                });
+            }
+
             if let OnFailure::Dcycle { dcycle } = source.on_failure {
                 if dcycle > 100 {
                     return Err(Error::ConfigValidation {
@@ -514,6 +638,22 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
                     path: path.to_owned(),
                     reason: format!("zones[{}].sources[{}].smoothing_samples: must be greater than 0", i, j),
                 });
+            }
+
+            if let Source::Hwmon { input: 0, .. } = &source.kind {
+                return Err(Error::ConfigValidation {
+                    path: path.to_owned(),
+                    reason: format!("zones[{}].sources[{}].input: must be greater than 0", i, j),
+                });
+            }
+
+            if let Source::Hwmon { chip, .. } = &source.kind {
+                if let Some(reason) = chip_error(chip) {
+                    return Err(Error::ConfigValidation {
+                        path: path.to_owned(),
+                        reason: format!("zones[{}].sources[{}].chip: {}", i, j, reason),
+                    });
+                }
             }
 
             if let Source::Nvidia { gpu } = &source.kind {
@@ -556,10 +696,12 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
             if let Some(steps) = &source.steps {
                 // An empty curve gives 100%, which an average would dilute
                 if steps.is_empty() {
-                    return Err(Error::ConfigValidation {
-                        path: path.to_owned(),
-                        reason: format!("zones[{}].sources[{}].steps: must be non-empty; remove the key to use the zone's steps", i, j),
-                    });
+                    let reason = match &source.curve {
+                        Some(name) => format!("zones[{}].sources[{}].curve: curve {:?} has empty steps", i, j, name),
+                        None => format!("zones[{}].sources[{}].steps: must be non-empty; remove the key to use the zone's steps", i, j),
+                    };
+
+                    return Err(Error::ConfigValidation { path: path.to_owned(), reason });
                 }
 
                 check_steps(steps, &format!("zones[{}].sources[{}].steps", i, j))
@@ -580,14 +722,146 @@ pub fn parse_config(contents: &str, path: &Path) -> Result<Config> {
         let empty_zone_steps = matches!(&zone_config.steps, Some(steps) if steps.is_empty());
 
         if any_with_steps && any_without_steps && empty_zone_steps {
-            return Err(Error::ConfigValidation {
-                path: path.to_owned(),
-                reason: format!("zones[{}].steps: must be non-empty when a source has no steps", i),
-            });
+            let reason = match &zone_config.curve {
+                Some(name) => format!("zones[{}].curve: curve {:?} has empty steps; the zone curve must be non-empty when a source has no steps", i, name),
+                None => format!("zones[{}].steps: must be non-empty when a source has no steps", i),
+            };
+
+            return Err(Error::ConfigValidation { path: path.to_owned(), reason });
         }
     }
 
+    // After every zone's own checks, because it compares zones
+    check_fan_owners(&config.zones)
+        .map_err(|reason| Error::ConfigValidation { path: path.to_owned(), reason })?;
+
     Ok(config)
+}
+
+/// The fans of zone `i` from `fans` or `ipmi_zones`, whichever is set
+fn zone_fans(zone: &Zone, i: usize) -> Result<Vec<FanConfig>, String> {
+    Ok(keyed_fans(zone, i)?.into_iter().map(|(_, fan)| fan).collect())
+}
+
+/// The fans of zone `i` from `fans` or `ipmi_zones`, each with the key that
+/// names it in a reason
+fn keyed_fans(zone: &Zone, i: usize) -> Result<Vec<(String, FanConfig)>, String> {
+    match (&zone.ipmi_zones, &zone.fans) {
+        (Some(_), Some(_)) => Err(format!("zones[{}].fans: cannot be combined with ipmi_zones", i)),
+        (Some(numbers), None) => legacy_fans(numbers, i),
+        (None, Some(fans)) => listed_fans(fans, i),
+        (None, None) => Err(format!("zones[{}].fans: must be non-empty", i)),
+    }
+}
+
+/// The Supermicro fans of an `ipmi_zones` list. A repeated number is dropped,
+/// because such a config loaded before `fans` existed.
+fn legacy_fans(numbers: &[u8], i: usize) -> Result<Vec<(String, FanConfig)>, String> {
+    if numbers.is_empty() {
+        return Err(format!("zones[{}].ipmi_zones: must be non-empty", i));
+    }
+
+    let mut fans: Vec<(String, FanConfig)> = Vec::new();
+
+    for (k, &zone) in numbers.iter().enumerate() {
+        let fan = FanConfig::Supermicro { zone };
+
+        if fans.iter().all(|(_, listed)| *listed != fan) {
+            fans.push((format!("zones[{}].ipmi_zones[{}]", i, k), fan));
+        }
+    }
+
+    Ok(fans)
+}
+
+/// The fans of a `fans` list, which must not repeat a fan, with the `gpu` of
+/// each NVIDIA fan in canonical form
+fn listed_fans(fans: &[FanConfig], i: usize) -> Result<Vec<(String, FanConfig)>, String> {
+    if fans.is_empty() {
+        return Err(format!("zones[{}].fans: must be non-empty", i));
+    }
+
+    let mut listed: Vec<(String, FanConfig)> = Vec::new();
+
+    for (k, fan) in fans.iter().enumerate() {
+        let fan = canonical_fan(fan).map_err(|reason| format!("zones[{}].fans[{}].{}", i, k, reason))?;
+
+        if listed.iter().any(|(_, earlier)| *earlier == fan) {
+            return Err(format!("zones[{}].fans[{}]: listed twice", i, k));
+        }
+
+        // The kernel numbers PWM channels from 1
+        if let FanConfig::Hwmon { pwm: 0, .. } = fan {
+            return Err(format!("zones[{}].fans[{}].pwm: must be greater than 0", i, k));
+        }
+
+        if let FanConfig::Hwmon { chip, .. } = &fan {
+            if let Some(reason) = chip_error(chip) {
+                return Err(format!("zones[{}].fans[{}].chip: {}", i, k, reason));
+            }
+        }
+
+        listed.push((format!("zones[{}].fans[{}]", i, k), fan));
+    }
+
+    Ok(listed)
+}
+
+/// `fan` with the `gpu` of an NVIDIA fan in canonical form, so that two
+/// spellings of one bus id name one fan. The error is the reason after the
+/// fan's key.
+fn canonical_fan(fan: &FanConfig) -> Result<FanConfig, String> {
+    let FanConfig::Nvidia { gpu, fan } = fan else {
+        return Ok(fan.clone());
+    };
+    // NVML finds a GPU by bus id, so a fan does not take the UUID that a
+    // source accepts
+    let id = PciBusId::parse(gpu)
+        .ok_or_else(|| format!("gpu: select the GPU by PCI bus id, such as 00000000:01:00.0: {:?}", gpu))?;
+
+    Ok(FanConfig::Nvidia { gpu: id.to_string(), fan: *fan })
+}
+
+/// Why `chip` can never equal a hwmon `name` file, which is compared after
+/// trimming, or `None` when it can
+fn chip_error(chip: &str) -> Option<&'static str> {
+    if chip.trim().is_empty() {
+        return Some("must not be empty");
+    }
+
+    if chip.trim() != chip {
+        return Some("must not have surrounding whitespace");
+    }
+
+    None
+}
+
+/// Check that no fan is driven by two zones, which would fight over its duty.
+/// A Supermicro fan is the same fan in two zones when both name the same zone
+/// number on the same session. A hwmon fan is the same fan when both name the
+/// same chip and channel, and an NVIDIA fan when both name the same bus id, in
+/// canonical form, and fan index, whatever their sessions. The zones must
+/// have passed `zone_fans`.
+fn check_fan_owners(zones: &[Zone]) -> Result<(), String> {
+    let mut owners = HashMap::new();
+
+    for (i, zone) in zones.iter().enumerate() {
+        for (key, fan) in keyed_fans(zone, i)? {
+            let session = match fan {
+                FanConfig::Supermicro { .. } => Some(zone.session.0.clone()),
+                FanConfig::Hwmon { .. } | FanConfig::Nvidia { .. } => None,
+            };
+            let owner = (session, fan);
+
+            if let Some(first) = owners.get(&owner) {
+                return Err(format!("{}: already driven by zones[{}]", key, first));
+            }
+
+            owners.insert(owner, i);
+        }
+    }
+
+    Ok(())
 }
 
 /// Check that no setting of a remote session holds a NUL byte, which a C string
@@ -612,6 +886,50 @@ fn check_sessions(sessions: &Sessions) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Check the `curves` table and every `curve` key, then copy each named curve
+/// into the `steps` and `curve_hysteresis` of the source or zone that names
+/// it, so that the runtime needs no `curves` table. Curves are checked in name
+/// order, so the same config always gives the same reason.
+fn resolve_curves(config: &mut Config) -> Result<(), String> {
+    let mut names: Vec<&String> = config.curves.keys().collect();
+    names.sort();
+
+    for name in names {
+        check_steps(&config.curves[name].steps, &format!("curves.{}.steps", name))?;
+    }
+
+    for (i, zone) in config.zones.iter_mut().enumerate() {
+        if let Some(name) = &zone.curve {
+            let curve = named_curve(&config.curves, name, zone.steps.is_some(), &format!("zones[{}].curve", i))?;
+
+            zone.steps = Some(curve.steps.clone());
+            zone.curve_hysteresis = Some(curve.hysteresis);
+        }
+
+        for (j, source) in zone.sources.iter_mut().enumerate() {
+            if let Some(name) = &source.curve {
+                let key = format!("zones[{}].sources[{}].curve", i, j);
+                let curve = named_curve(&config.curves, name, source.steps.is_some(), &key)?;
+
+                source.steps = Some(curve.steps.clone());
+                source.curve_hysteresis = Some(curve.hysteresis);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// The curve that `key` names, which must exist and must not stand beside
+/// inline `steps`
+fn named_curve<'a>(curves: &'a HashMap<String, CurveConfig>, name: &str, has_steps: bool, key: &str) -> Result<&'a CurveConfig, String> {
+    if has_steps {
+        return Err(format!("{}: set either steps or curve, not both", key));
+    }
+
+    curves.get(name).ok_or_else(|| format!("{}: unknown curve {:?}", key, name))
 }
 
 /// Check a curve's steps. `key` names the list in the reason, such as
@@ -639,11 +957,14 @@ fn check_steps(steps: &[Step], key: &str) -> Result<(), String> {
 mod tests {
     use {
         std::path::Path,
-        super::{Aggregation, Config, LogLevel, OnFailure, parse_config, SessionType, Source},
-        crate::error::{Error, Result},
+        super::{Aggregation, Config, FanConfig, LogLevel, OnFailure, parse_config, SessionType, Source},
+        crate::{
+            curve::{SourceReading, ZoneState},
+            error::{Error, Result},
+        },
     };
 
-    const CONFIG_PATH: &str = "/etc/ipmi-fan-control.toml";
+    const CONFIG_PATH: &str = "/etc/coolerd.toml";
 
     /// Build a TOML config with one zone. Each override replaces the default
     /// value of its key or adds the key.
@@ -689,7 +1010,73 @@ mod tests {
         let config = parse(include_str!("../config.sample.toml")).unwrap();
 
         assert_eq!(config.zones.len(), 1);
-        assert_eq!(config.zones[0].ipmi_zones, [0, 1]);
+        assert_eq!(config.zones[0].fan_list, [FanConfig::Supermicro { zone: 0 }, FanConfig::Supermicro { zone: 1 }]);
+        assert!(!config.curves.is_empty());
+    }
+
+    #[test]
+    fn sample_ipmi_zones_loads_in_place_of_fans() {
+        const FANS: &str = "fans = [\n  { type = \"supermicro\", zone = 0 },\n  { type = \"supermicro\", zone = 1 },\n]\n";
+        let sample = include_str!("../config.sample.toml");
+        let line = sample.lines()
+            .find(|l| l.starts_with("#ipmi_zones = "))
+            .expect("the sample has a commented ipmi_zones");
+        assert!(sample.contains(FANS), "the sample has the zone fans");
+        let edited = sample.replacen(FANS, "", 1).replacen(line, &line[1..], 1);
+        let config = parse(&edited).unwrap();
+
+        assert_eq!(config.zones[0].fan_list, [FanConfig::Supermicro { zone: 0 }, FanConfig::Supermicro { zone: 1 }]);
+    }
+
+    #[test]
+    fn sample_second_zone_loads_when_uncommented() {
+        const FIRST_ZONE_FAN_1: &str = "  { type = \"supermicro\", zone = 1 },\n";
+        let sample = include_str!("../config.sample.toml");
+        let start = sample.find("#[[zones]]\n").expect("the sample has a commented second zone");
+        let end = start + sample[start..].find("\n\n").unwrap();
+        let block = &sample[start..end];
+        let uncommented: Vec<&str> = block.lines().map(|l| &l[1..]).collect();
+        assert!(sample.contains(FIRST_ZONE_FAN_1), "the first zone drives zone 1");
+        // The second zone takes zone 1 over, as the sample's comment says
+        let edited = sample.replacen(FIRST_ZONE_FAN_1, "", 1).replacen(block, &uncommented.join("\n"), 1);
+        let config = parse(&edited).unwrap();
+
+        assert_eq!(config.zones.len(), 2);
+        assert_eq!(config.zones[0].fan_list, [FanConfig::Supermicro { zone: 0 }]);
+        assert_eq!(config.zones[1].fan_list, [FanConfig::Supermicro { zone: 1 }]);
+    }
+
+    #[test]
+    fn sample_source_with_named_curve_loads_when_uncommented() {
+        let sample = include_str!("../config.sample.toml");
+        let line = sample.lines()
+            .find(|l| l.trim_start().starts_with("# {") && l.contains("curve = "))
+            .expect("the sample has a commented source with curve");
+        let uncommented = line.replacen("# ", "", 1);
+        let config = parse(&sample.replacen(line, &uncommented, 1)).unwrap();
+        let source = config.zones[0].sources.last().unwrap();
+        let name = source.curve.as_ref().unwrap();
+
+        assert_eq!(source.steps.as_ref().unwrap().len(), config.curves[name].steps.len());
+        assert_eq!(source.curve_hysteresis, Some(config.curves[name].hysteresis));
+    }
+
+    #[test]
+    fn sample_zone_with_named_curve_loads_when_uncommented() {
+        const ZONE_STEPS: &str = "steps = [\n  { temp = 40, dcycle = 40 },\n  { temp = 70, dcycle = 70 }\n]\n";
+        let sample = include_str!("../config.sample.toml");
+        let line = sample.lines()
+            .find(|l| l.starts_with("#curve = "))
+            .expect("the sample has a commented zone curve");
+        assert!(sample.contains(ZONE_STEPS), "the sample has the zone steps");
+        // The zone names the curve in place of its own steps
+        let edited = sample.replacen(ZONE_STEPS, "", 1).replacen(line, &line[1..], 1);
+        let config = parse(&edited).unwrap();
+        let zone = &config.zones[0];
+        let name = zone.curve.as_ref().unwrap();
+
+        assert_eq!(zone.steps.as_ref().unwrap().len(), config.curves[name].steps.len());
+        assert_eq!(zone.curve_hysteresis, Some(config.curves[name].hysteresis));
     }
 
     #[test]
@@ -705,6 +1092,58 @@ mod tests {
         assert!(matches!(sources.last().unwrap().kind, Source::Nvidia { .. }));
         assert_eq!(sources.last().unwrap().steps.as_ref().unwrap().len(), 2);
         assert_eq!(sources.last().unwrap().on_failure, OnFailure::Dcycle { dcycle: 80 });
+    }
+
+    #[test]
+    fn sample_hwmon_source_loads_when_uncommented() {
+        let sample = include_str!("../config.sample.toml");
+        let line = sample.lines()
+            .find(|l| l.trim_start().starts_with("# {") && l.contains(r#"type = "hwmon""#))
+            .expect("the sample has a commented hwmon source");
+        let uncommented = line.replacen("# ", "", 1);
+        let config = parse(&sample.replacen(line, &uncommented, 1)).unwrap();
+        let sources = &config.zones[0].sources;
+
+        assert!(matches!(&sources[1].kind, Source::Hwmon { chip, input: 1 } if chip == "k10temp"), "{:?}", sources[1].kind);
+    }
+
+    #[test]
+    fn sample_hwmon_zone_loads_when_uncommented() {
+        let sample = include_str!("../config.sample.toml");
+        let start = sample.find("#[[zones]]\n#fans = [{ type = \"hwmon\"").expect("the sample has a commented hwmon zone");
+        let end = start + sample[start..].find("\n\n").unwrap_or(sample.len() - start);
+        let block = &sample[start..end];
+        let uncommented: Vec<&str> = block.lines().map(|l| &l[1..]).collect();
+        let config = parse(&sample.replacen(block, &uncommented.join("\n"), 1)).unwrap();
+        let zone = config.zones.last().unwrap();
+
+        assert_eq!(zone.fan_list, [FanConfig::Hwmon { chip: "nct6798".into(), pwm: 2 }]);
+        assert!(matches!(&zone.sources[..], [s] if matches!(&s.kind, Source::Hwmon { chip, input: 1 } if chip == "k10temp")));
+    }
+
+    #[test]
+    fn sample_nvidia_zone_loads_when_uncommented() {
+        let sample = include_str!("../config.sample.toml");
+        let start = sample.find("#[[zones]]\n#fans = [{ type = \"nvidia\"").expect("the sample has a commented nvidia zone");
+        let end = start + sample[start..].find("\n\n").unwrap_or(sample.len() - start);
+        let block = &sample[start..end];
+        let uncommented: Vec<&str> = block.lines().map(|l| &l[1..]).collect();
+        let config = parse(&sample.replacen(block, &uncommented.join("\n"), 1)).unwrap();
+        let zone = config.zones.last().unwrap();
+
+        assert_eq!(zone.fan_list, [FanConfig::Nvidia { gpu: "00000000:01:00.0".into(), fan: 0 }]);
+        assert!(matches!(&zone.sources[..], [s] if matches!(&s.kind, Source::Nvidia { gpu } if gpu == "00000000:01:00.0")));
+    }
+
+    #[test]
+    fn readme_nvidia_fan_example_loads() {
+        let blocks = readme_toml_blocks();
+        let block = blocks.iter()
+            .find(|b| b.contains(r#"fans = [{ type = "nvidia""#))
+            .expect("the README has a TOML example of an nvidia fan");
+        let config = parse(block).unwrap();
+
+        assert_eq!(config.zones[0].fan_list, [FanConfig::Nvidia { gpu: "00000000:01:00.0".into(), fan: 0 }]);
     }
 
     #[test]
@@ -757,6 +1196,30 @@ mod tests {
         assert!(zone.sources[1].steps.is_some());
         assert!(matches!(zone.duty_aggregation, Aggregation::Maximum));
         assert_eq!(zone.hysteresis, 3);
+    }
+
+    #[test]
+    fn readme_fans_example_loads() {
+        let blocks = readme_toml_blocks();
+        let block = blocks.iter()
+            .find(|b| b.contains("fans = "))
+            .expect("the README has a TOML example with fans");
+        let config = parse(block).unwrap();
+
+        assert_eq!(config.zones[0].fan_list, [FanConfig::Supermicro { zone: 0 }, FanConfig::Supermicro { zone: 1 }]);
+    }
+
+    #[test]
+    fn readme_named_curve_example_loads() {
+        let blocks = readme_toml_blocks();
+        let block = blocks.iter()
+            .find(|b| b.contains("[curves."))
+            .expect("the README has a TOML example with a curves table");
+        let config = parse(block).unwrap();
+        let named: Vec<_> = config.zones[0].sources.iter().filter(|s| s.curve.is_some()).collect();
+
+        assert!(named.len() >= 2, "{:?}", named);
+        assert!(named.iter().all(|s| s.steps.is_some() && s.curve_hysteresis.is_some()));
     }
 
     #[test]
@@ -886,6 +1349,258 @@ mod tests {
     fn rejects_empty_ipmi_zones() {
         assert_eq!(validation_reason(&zone_toml(&[("ipmi_zones", "[]")])),
             "zones[0].ipmi_zones: must be non-empty");
+    }
+
+    fn supermicro(zones: &[u8]) -> Vec<FanConfig> {
+        zones.iter().map(|&zone| FanConfig::Supermicro { zone }).collect()
+    }
+
+    /// A one-zone config that names its fans with `fans` in place of
+    /// `ipmi_zones`
+    fn fans_toml(fans: &str) -> String {
+        omit_key(&zone_toml(&[("fans", fans)]), "ipmi_zones")
+    }
+
+    const SUPERMICRO_0_AND_1: &str = r#"[{ type = "supermicro", zone = 0 }, { type = "supermicro", zone = 1 }]"#;
+
+    #[test]
+    fn ipmi_zones_and_fans_load_to_equal_fan_lists() {
+        let legacy = parse(&zone_toml(&[("ipmi_zones", "[0, 1]")])).unwrap();
+        let listed = parse(&fans_toml(SUPERMICRO_0_AND_1)).unwrap();
+
+        assert_eq!(legacy.zones[0].fan_list, supermicro(&[0, 1]));
+        assert_eq!(listed.zones[0].fan_list, legacy.zones[0].fan_list);
+    }
+
+    #[test]
+    fn repeated_ipmi_zone_loads_as_one_fan() {
+        let config = parse(&zone_toml(&[("ipmi_zones", "[0, 0]")])).unwrap();
+
+        assert_eq!(config.zones[0].fan_list, supermicro(&[0]));
+    }
+
+    #[test]
+    fn rejects_fan_listed_twice() {
+        let fans = r#"[{ type = "supermicro", zone = 0 }, { type = "supermicro", zone = 0 }]"#;
+
+        assert_eq!(validation_reason(&fans_toml(fans)), "zones[0].fans[1]: listed twice");
+    }
+
+    #[test]
+    fn rejects_fans_beside_ipmi_zones() {
+        let contents = zone_toml(&[("fans", SUPERMICRO_0_AND_1)]);
+
+        assert_eq!(validation_reason(&contents), "zones[0].fans: cannot be combined with ipmi_zones");
+    }
+
+    #[test]
+    fn rejects_zone_without_fans() {
+        let contents = omit_key(&zone_toml(&[]), "ipmi_zones");
+
+        assert_eq!(validation_reason(&contents), "zones[0].fans: must be non-empty");
+    }
+
+    #[test]
+    fn rejects_empty_fans() {
+        assert_eq!(validation_reason(&fans_toml("[]")), "zones[0].fans: must be non-empty");
+    }
+
+    #[test]
+    fn rejects_unknown_key_in_fan() {
+        let message = parse_error(&fans_toml(r#"[{ type = "supermicro", zone = 0, speed = 1 }]"#));
+
+        assert!(message.contains("unknown field `speed`"), "{}", message);
+    }
+
+    /// Two zones that drive the IPMI zones of `first` and `second`, each a
+    /// line of keys, and a remote session named `bmc`
+    fn two_zones_toml(first: &str, second: &str) -> String {
+        let zone = |keys: &str| format!("[[zones]]\n{}\n{}{}\n",
+            keys,
+            "sources = [{ type = \"ipmi\", sensor = \"CPU Temp\" }]\n",
+            "steps = [{ temp = 40, dcycle = 40 }]");
+
+        format!("{}{}\n[sessions]\nbmc = {{ type = \"remote\", hostname = \"bmc.lan\", username = \"admin\", password = \"secret\" }}\n",
+            zone(first), zone(second))
+    }
+
+    #[test]
+    fn rejects_ipmi_zone_driven_by_two_zones_of_one_session() {
+        let contents = two_zones_toml("ipmi_zones = [1, 0]", "ipmi_zones = [2, 2, 0]");
+
+        assert_eq!(validation_reason(&contents), "zones[1].ipmi_zones[2]: already driven by zones[0]");
+    }
+
+    #[test]
+    fn rejects_supermicro_fan_driven_by_two_zones_of_one_session() {
+        let contents = two_zones_toml(
+            r#"fans = [{ type = "supermicro", zone = 0 }]"#,
+            r#"fans = [{ type = "supermicro", zone = 1 }, { type = "supermicro", zone = 0 }]"#);
+
+        assert_eq!(validation_reason(&contents), "zones[1].fans[1]: already driven by zones[0]");
+    }
+
+    #[test]
+    fn accepts_one_ipmi_zone_on_two_sessions() {
+        let config = parse(&two_zones_toml("ipmi_zones = [0]", "session = \"bmc\"\nipmi_zones = [0]")).unwrap();
+
+        assert_eq!(config.zones[0].fan_list, supermicro(&[0]));
+        assert_eq!(config.zones[1].fan_list, supermicro(&[0]));
+    }
+
+    /// A zone that reads a file and drives `fans`, on `session` when given
+    fn hwmon_zone_toml(session: Option<&str>, fans: &str) -> String {
+        let session = session.map_or_else(String::new, |s| format!("session = {:?}\n", s));
+
+        format!("[[zones]]\n{}fans = {}\nsources = [{{ type = \"file\", path = \"/sys/temp\" }}]\nsteps = [{{ temp = 40, dcycle = 40 }}]\n",
+            session, fans)
+    }
+
+    const NCT6798_PWM_2: &str = r#"[{ type = "hwmon", chip = "nct6798", pwm = 2 }]"#;
+
+    #[test]
+    fn accepts_hwmon_fan() {
+        let config = parse(&hwmon_zone_toml(None, NCT6798_PWM_2)).unwrap();
+
+        assert_eq!(config.zones[0].fan_list, [FanConfig::Hwmon { chip: "nct6798".into(), pwm: 2 }]);
+    }
+
+    #[test]
+    fn rejects_hwmon_pwm_zero() {
+        let fans = r#"[{ type = "hwmon", chip = "nct6798", pwm = 1 }, { type = "hwmon", chip = "nct6798", pwm = 0 }]"#;
+
+        assert_eq!(validation_reason(&hwmon_zone_toml(None, fans)), "zones[0].fans[1].pwm: must be greater than 0");
+    }
+
+    #[test]
+    fn rejects_hwmon_fan_with_empty_chip() {
+        let fans = r#"[{ type = "hwmon", chip = "nct6798", pwm = 1 }, { type = "hwmon", chip = "", pwm = 2 }]"#;
+
+        assert_eq!(validation_reason(&hwmon_zone_toml(None, fans)), "zones[0].fans[1].chip: must not be empty");
+    }
+
+    #[test]
+    fn rejects_hwmon_fan_chip_with_surrounding_whitespace() {
+        let fans = r#"[{ type = "hwmon", chip = "nct6798", pwm = 1 }, { type = "hwmon", chip = " k10temp", pwm = 2 }]"#;
+
+        assert_eq!(validation_reason(&hwmon_zone_toml(None, fans)),
+            "zones[0].fans[1].chip: must not have surrounding whitespace");
+    }
+
+    #[test]
+    fn rejects_hwmon_fan_driven_by_two_zones() {
+        let contents = format!("{}{}", hwmon_zone_toml(None, NCT6798_PWM_2), hwmon_zone_toml(None, NCT6798_PWM_2));
+
+        assert_eq!(validation_reason(&contents), "zones[1].fans[0]: already driven by zones[0]");
+    }
+
+    #[test]
+    fn rejects_hwmon_fan_driven_by_zones_of_two_sessions() {
+        let contents = format!("{}{}[sessions]\nbmc = {{ type = \"local\" }}\n",
+            hwmon_zone_toml(None, NCT6798_PWM_2), hwmon_zone_toml(Some("bmc"), NCT6798_PWM_2));
+
+        assert_eq!(validation_reason(&contents), "zones[1].fans[0]: already driven by zones[0]");
+    }
+
+    #[test]
+    fn rejects_ipmi_source_in_a_zone_without_a_supermicro_fan() {
+        let sources = r#"[{ type = "file", path = "/sys/temp" }, { type = "ipmi", sensor = "CPU Temp" }]"#;
+        let contents = hwmon_zone_toml(None, NCT6798_PWM_2).replace(r#"[{ type = "file", path = "/sys/temp" }]"#, sources);
+
+        assert_eq!(validation_reason(&contents),
+            "zones[0].sources[1]: an ipmi source needs a supermicro fan in the same zone");
+    }
+
+    #[test]
+    fn accepts_ipmi_source_beside_a_hwmon_fan_and_a_supermicro_fan() {
+        let fans = r#"[{ type = "hwmon", chip = "nct6798", pwm = 2 }, { type = "supermicro", zone = 0 }]"#;
+
+        assert!(parse(&fans_toml(fans)).is_ok());
+    }
+
+    #[test]
+    fn accepts_two_pwm_channels_of_one_chip_in_two_zones() {
+        let other = r#"[{ type = "hwmon", chip = "nct6798", pwm = 3 }]"#;
+
+        assert!(parse(&format!("{}{}", hwmon_zone_toml(None, NCT6798_PWM_2), hwmon_zone_toml(None, other))).is_ok());
+    }
+
+    /// A GPU UUID in the form nvidia-smi prints
+    const GPU_UUID: &str = "GPU-3c1a2b4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d";
+
+    /// A fans list with fan `fan` of the NVIDIA GPU at `gpu`
+    fn nvidia_fans(gpu: &str, fan: u32) -> String {
+        format!(r#"[{{ type = "nvidia", gpu = "{}", fan = {} }}]"#, gpu, fan)
+    }
+
+    fn nvidia_fan(gpu: &str, fan: u32) -> FanConfig {
+        FanConfig::Nvidia { gpu: gpu.into(), fan }
+    }
+
+    #[test]
+    fn nvidia_fan_gpu_loads_in_canonical_form() {
+        let config = parse(&hwmon_zone_toml(None, &nvidia_fans("00AB:81:1F.7", 1))).unwrap();
+
+        assert_eq!(config.zones[0].fan_list, [nvidia_fan("000000ab:81:1f.7", 1)]);
+    }
+
+    #[test]
+    fn nvidia_fan_with_eight_digit_domain_loads_unchanged() {
+        let config = parse(&hwmon_zone_toml(None, &nvidia_fans("00000000:01:00.0", 0))).unwrap();
+
+        assert_eq!(config.zones[0].fan_list, [nvidia_fan("00000000:01:00.0", 0)]);
+    }
+
+    #[test]
+    fn rejects_nvidia_fan_driven_by_two_zones_in_two_spellings() {
+        let contents = format!("{}{}",
+            hwmon_zone_toml(None, &nvidia_fans("0000:01:00.0", 0)),
+            hwmon_zone_toml(None, &nvidia_fans("00000000:01:00.0", 0)));
+
+        assert_eq!(validation_reason(&contents), "zones[1].fans[0]: already driven by zones[0]");
+    }
+
+    #[test]
+    fn rejects_nvidia_fan_listed_twice_in_two_spellings() {
+        let fans = r#"[{ type = "nvidia", gpu = "0000:01:00.0", fan = 0 }, { type = "nvidia", gpu = "00000000:01:00.0", fan = 0 }]"#;
+
+        assert_eq!(validation_reason(&hwmon_zone_toml(None, fans)), "zones[0].fans[1]: listed twice");
+    }
+
+    #[test]
+    fn accepts_two_fans_of_one_gpu_in_two_zones() {
+        let contents = format!("{}{}",
+            hwmon_zone_toml(None, &nvidia_fans("00000000:01:00.0", 0)),
+            hwmon_zone_toml(None, &nvidia_fans("00000000:01:00.0", 1)));
+
+        assert!(parse(&contents).is_ok());
+    }
+
+    #[test]
+    fn rejects_gpu_uuid_in_nvidia_fan() {
+        let fans = format!(r#"[{{ type = "hwmon", chip = "nct6798", pwm = 2 }}, {}]"#,
+            nvidia_fans(GPU_UUID, 0).trim_matches(['[', ']']));
+
+        let reason = validation_reason(&hwmon_zone_toml(None, &fans));
+
+        assert!(reason.starts_with("zones[0].fans[1].gpu: "), "{}", reason);
+        assert!(reason.contains(GPU_UUID), "{}", reason);
+    }
+
+    #[test]
+    fn rejects_malformed_nvidia_fan_gpu() {
+        for gpu in ["", "0", "01:00.0", "000:01:00.0", "0000:01:20.0", "0000:01:00.8", "0000:01:00.0 ", "+000:01:00.0"] {
+            let reason = validation_reason(&hwmon_zone_toml(None, &nvidia_fans(gpu, 0)));
+
+            assert!(reason.starts_with("zones[0].fans[0].gpu: "), "{:?}: {}", gpu, reason);
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_key_in_nvidia_fan() {
+        let message = parse_error(&hwmon_zone_toml(None, r#"[{ type = "nvidia", gpu = "00000000:01:00.0", fan = 0, speed = 1 }]"#));
+
+        assert!(message.contains("unknown field `speed`"), "{}", message);
     }
 
     #[test]
@@ -1397,6 +2112,224 @@ mod tests {
 
         assert_eq!(validation_reason(&zone_toml(&[("duty_aggregation", aggregation)])),
             "zones[0].duty_aggregation[type=average].top: must be greater than 0");
+    }
+
+    /// `contents` followed by a `[curves.gpu]` table with `steps` and the
+    /// extra lines in `rest`
+    fn with_gpu_curve(contents: &str, steps: &str, rest: &str) -> String {
+        format!("{}\n[curves.gpu]\nsteps = {}\n{}", contents, steps, rest)
+    }
+
+    /// A zone of two file sources, each with the extra keys in `keys`
+    fn two_sources_toml(keys: &str) -> String {
+        let sources = format!(r#"[{{ type = "file", path = "/sys/a", {} }}, {{ type = "file", path = "/sys/b", {} }}]"#, keys, keys);
+
+        omit_key(&zone_toml(&[("sources", &sources)]), "steps")
+    }
+
+    #[test]
+    fn accepts_sources_that_name_a_curve() {
+        let contents = with_gpu_curve(&two_sources_toml(r#"curve = "gpu""#), GPU_STEPS, "hysteresis = 3\n");
+        let config = parse(&contents).unwrap();
+
+        assert_eq!(config.curves["gpu"].hysteresis, 3);
+
+        for source in &config.zones[0].sources {
+            assert_eq!(source.curve.as_deref(), Some("gpu"));
+            let steps = source.steps.as_ref().unwrap();
+            assert_eq!(steps.iter().map(|s| (s.temp, s.dcycle)).collect::<Vec<_>>(), [(60, 40), (90, 100)]);
+            assert_eq!(source.curve_hysteresis, Some(3));
+        }
+    }
+
+    #[test]
+    fn accepts_zone_that_names_a_curve() {
+        let zone_keys = [("curve", r#""gpu""#), ("hysteresis", "5")];
+        let contents = with_gpu_curve(&omit_key(&zone_toml(&zone_keys), "steps"), GPU_STEPS, "hysteresis = 3\n");
+        let config = parse(&contents).unwrap();
+        let zone = &config.zones[0];
+
+        assert_eq!(zone.steps.as_ref().unwrap().len(), 2);
+        assert_eq!(zone.hysteresis, 5);
+        assert_eq!(zone.curve_hysteresis, Some(3));
+    }
+
+    #[test]
+    fn curve_hysteresis_defaults_to_zero() {
+        let zone_keys = [("curve", r#""gpu""#), ("hysteresis", "5")];
+        let contents = with_gpu_curve(&omit_key(&zone_toml(&zone_keys), "steps"), GPU_STEPS, "");
+        let config = parse(&contents).unwrap();
+
+        assert_eq!(config.zones[0].curve_hysteresis, Some(0));
+    }
+
+    #[test]
+    fn inline_steps_keep_the_zone_hysteresis() {
+        let config = parse(&source_steps_toml(GPU_STEPS)).unwrap();
+        let zone = &config.zones[0];
+
+        assert_eq!(zone.curve_hysteresis, None);
+        assert!(zone.sources.iter().all(|s| s.curve.is_none() && s.curve_hysteresis.is_none()));
+    }
+
+    /// The duties of the first zone of `contents` when both of its sources
+    /// read each of `temps` in turn
+    fn zone_duties(contents: &str, temps: &[u8]) -> Vec<u8> {
+        let config = parse(contents).unwrap();
+        let zone = &config.zones[0];
+        let mut state = ZoneState::new(zone);
+
+        temps.iter()
+            .map(|&t| state.next_duty(zone, &[SourceReading::Temp(t), SourceReading::Temp(t)]).duty)
+            .collect()
+    }
+
+    #[test]
+    fn named_curve_gives_the_duties_of_the_same_inline_steps() {
+        let named = with_gpu_curve(&two_sources_toml(r#"curve = "gpu""#), GPU_STEPS, "hysteresis = 3\n");
+        let inline = two_sources_toml(&format!("steps = {}", GPU_STEPS)) + "hysteresis = 3\n";
+        // A fall of 2 from 72 C is held; a fall of 4 is followed
+        let temps = [60, 72, 70, 68];
+
+        assert_eq!(zone_duties(&named, &temps), [40, 64, 64, 56]);
+        assert_eq!(zone_duties(&inline, &temps), [40, 64, 64, 56]);
+    }
+
+    #[test]
+    fn rejects_unknown_source_curve() {
+        let sources = r#"[{ type = "ipmi", sensor = "CPU Temp" }, { type = "file", path = "/sys/temp", curve = "x" }]"#;
+
+        assert_eq!(validation_reason(&zone_toml(&[("sources", sources)])),
+            r#"zones[0].sources[1].curve: unknown curve "x""#);
+    }
+
+    #[test]
+    fn rejects_unknown_zone_curve() {
+        let contents = omit_key(&zone_toml(&[("curve", r#""x""#)]), "steps");
+
+        assert_eq!(validation_reason(&contents), r#"zones[0].curve: unknown curve "x""#);
+    }
+
+    #[test]
+    fn rejects_source_with_steps_and_curve() {
+        let sources = format!(r#"[{{ type = "file", path = "/sys/temp", steps = {}, curve = "gpu" }}]"#, GPU_STEPS);
+        let contents = with_gpu_curve(&zone_toml(&[("sources", &sources)]), GPU_STEPS, "");
+
+        assert_eq!(validation_reason(&contents), "zones[0].sources[0].curve: set either steps or curve, not both");
+    }
+
+    #[test]
+    fn rejects_zone_with_steps_and_curve() {
+        let contents = with_gpu_curve(&zone_toml(&[("curve", r#""gpu""#)]), GPU_STEPS, "");
+
+        assert_eq!(validation_reason(&contents), "zones[0].curve: set either steps or curve, not both");
+    }
+
+    #[test]
+    fn rejects_curve_dcycle_above_100() {
+        let contents = with_gpu_curve(&zone_toml(&[]), "[{ temp = 60, dcycle = 40 }, { temp = 90, dcycle = 101 }]", "");
+
+        assert_eq!(validation_reason(&contents), "curves.gpu.steps[1].dcycle: invalid percentage: 101");
+    }
+
+    #[test]
+    fn rejects_curve_non_increasing_temp() {
+        let contents = with_gpu_curve(&zone_toml(&[]), "[{ temp = 60, dcycle = 40 }, { temp = 60, dcycle = 50 }]", "");
+
+        assert_eq!(validation_reason(&contents), "curves.gpu.steps[1].temp: values are not strictly increasing");
+    }
+
+    #[test]
+    fn rejects_empty_named_curve_on_a_source() {
+        let sources = r#"[{ type = "file", path = "/sys/temp", curve = "gpu" }]"#;
+        let contents = with_gpu_curve(&zone_toml(&[("sources", sources)]), "[]", "");
+
+        assert_eq!(validation_reason(&contents), r#"zones[0].sources[0].curve: curve "gpu" has empty steps"#);
+    }
+
+    #[test]
+    fn rejects_empty_named_zone_curve_when_a_source_has_no_steps() {
+        let sources = format!(r#"[{{ type = "ipmi", sensor = "CPU Temp" }}, {{ type = "file", path = "/sys/temp", steps = {} }}]"#, GPU_STEPS);
+        let zone = omit_key(&zone_toml(&[("sources", &sources), ("curve", r#""gpu""#)]), "steps");
+        let contents = with_gpu_curve(&zone, "[]", "");
+
+        assert_eq!(validation_reason(&contents),
+            r#"zones[0].curve: curve "gpu" has empty steps; the zone curve must be non-empty when a source has no steps"#);
+    }
+
+    #[test]
+    fn rejects_zone_without_a_curve_when_a_source_has_none() {
+        let sources = r#"[{ type = "ipmi", sensor = "CPU Temp" }, { type = "file", path = "/sys/temp", curve = "gpu" }]"#;
+        let contents = with_gpu_curve(&omit_key(&zone_toml(&[("sources", sources)]), "steps"), GPU_STEPS, "");
+
+        assert_eq!(validation_reason(&contents), "zones[0].steps: must be set when a source has no steps");
+    }
+
+    #[test]
+    fn rejects_unknown_key_in_curve() {
+        let message = parse_error(&with_gpu_curve(&zone_toml(&[]), GPU_STEPS, "slope = 1\n"));
+
+        assert!(message.contains("unknown field `slope`"), "{}", message);
+    }
+
+    #[test]
+    fn rejects_repeated_curve_in_source() {
+        let sources = r#"[{ type = "file", path = "/sys/temp", curve = "gpu", curve = "gpu" }]"#;
+        let message = parse_error(&with_gpu_curve(&zone_toml(&[("sources", sources)]), GPU_STEPS, ""));
+
+        assert!(message.contains("duplicate field `curve`"), "{}", message);
+    }
+
+    #[test]
+    fn accepts_positional_zone() {
+        let contents = r#"zones = [["default", 1, 2, 0, [0], [{ type = "file", path = "/dev/null" }], { type = "maximum" }, [{ temp = 40, dcycle = 70 }], { type = "maximum" }, 0]]"#;
+        let config = parse(contents).unwrap();
+        let zone = &config.zones[0];
+
+        assert!(matches!(zone.duty_aggregation, Aggregation::Maximum));
+        assert_eq!(zone.hysteresis, 0);
+        assert!(zone.curve.is_none());
+    }
+
+    #[test]
+    fn positional_source_has_no_curve() {
+        let config = parse(&zone_toml(&[("sources", r#"[["file", "/dev/null"]]"#)])).unwrap();
+
+        assert!(config.zones[0].sources[0].curve.is_none());
+    }
+
+    #[test]
+    fn accepts_hwmon_source() {
+        let sources = r#"[{ type = "hwmon", chip = "k10temp", input = 1 }, ["hwmon", "nvme", 2]]"#;
+        let config = parse(&zone_toml(&[("sources", sources)])).unwrap();
+        let sources = &config.zones[0].sources;
+
+        assert!(matches!(&sources[0].kind, Source::Hwmon { chip, input: 1 } if chip == "k10temp"));
+        assert!(matches!(&sources[1].kind, Source::Hwmon { chip, input: 2 } if chip == "nvme"));
+    }
+
+    #[test]
+    fn rejects_hwmon_input_zero() {
+        let sources = r#"[{ type = "ipmi", sensor = "CPU Temp" }, { type = "hwmon", chip = "k10temp", input = 0 }]"#;
+
+        assert_eq!(validation_reason(&zone_toml(&[("sources", sources)])),
+            "zones[0].sources[1].input: must be greater than 0");
+    }
+
+    #[test]
+    fn rejects_hwmon_source_with_empty_chip() {
+        let sources = r#"[{ type = "ipmi", sensor = "CPU Temp" }, { type = "hwmon", chip = "", input = 1 }]"#;
+
+        assert_eq!(validation_reason(&zone_toml(&[("sources", sources)])),
+            "zones[0].sources[1].chip: must not be empty");
+    }
+
+    #[test]
+    fn rejects_hwmon_source_chip_with_surrounding_whitespace() {
+        let sources = r#"[{ type = "ipmi", sensor = "CPU Temp" }, { type = "hwmon", chip = " k10temp", input = 1 }]"#;
+
+        assert_eq!(validation_reason(&zone_toml(&[("sources", sources)])),
+            "zones[0].sources[1].chip: must not have surrounding whitespace");
     }
 
     /// Build a zone whose second source is an nvidia source with `gpu`

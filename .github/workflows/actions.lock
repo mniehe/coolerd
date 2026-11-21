@@ -6,26 +6,12 @@ workflows:
     '.github/workflows/ci.yml':
         - 'actions/checkout@v7.0.1'
         - 'determinatesystems/determinate-nix-action@v3.24.2'
-    '.github/workflows/release.yml':
-        - 'actions/checkout@v7.0.1'
-        - 'actions/create-release@latest'
-        - 'actions/upload-release-asset@v1.0.2'
 dependencies:
     'actions/checkout@v7.0.1':
         ref: 'v7.0.1'
         commit: 'sha1-3d3c42e5aac5ba805825da76410c181273ba90b1'
         owner_id: 44036562
         repo_id: 197814629
-    'actions/create-release@latest':
-        ref: 'latest'
-        commit: 'sha1-0cb9c9b65d5d1901c1f53e5e66eaf4afd303e70e'
-        owner_id: 44036562
-        repo_id: 208154123
-    'actions/upload-release-asset@v1.0.2':
-        ref: 'v1.0.2'
-        commit: 'sha1-e8f9f06c4b078e705bd2ea027f0926603fc9b4d5'
-        owner_id: 44036562
-        repo_id: 208154141
     'determinatesystems/determinate-nix-action@v3.24.2':
         ref: 'v3.24.2'
         commit: 'sha1-16f94ba7aae399b9f9077c254b6719ec6de7e3e3'

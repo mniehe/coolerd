@@ -5,7 +5,9 @@ use {
         path::PathBuf,
         process::ExitStatus,
         result,
+        time::Duration,
     },
+    nvml_wrapper::error::NvmlError,
     thiserror::Error,
     tokio::task::JoinError,
     crate::{
@@ -98,6 +100,89 @@ pub enum Error {
     },
     #[error("Zone monitor loop panicked: {0}")]
     LoopPanicked(#[source] JoinError),
+    #[error("{fan}: {source}")]
+    Fan {
+        fan: String,
+        source: Box<Self>,
+    },
+    #[error("{0}: needs an IPMI session")]
+    FanWithoutSession(String),
+    #[error("No hwmon chip named {chip:?} under {root:?}")]
+    HwmonChipNotFound {
+        chip: String,
+        root: PathBuf,
+    },
+    #[error("Several hwmon chips named {chip:?}: {paths:?}")]
+    HwmonChipAmbiguous {
+        chip: String,
+        paths: Vec<PathBuf>,
+    },
+    #[error("Failed to parse hwmon value: {path:?}: {value:?}: {source}")]
+    HwmonParse {
+        path: PathBuf,
+        value: String,
+        source: ParseIntError,
+    },
+    #[error("Hwmon value out of range: {path:?}: {value}")]
+    HwmonValueOutOfRange {
+        path: PathBuf,
+        value: i64,
+    },
+    #[error("Hwmon input reports a fault: {path:?}")]
+    HwmonFault {
+        path: PathBuf,
+    },
+    #[error("Failed to release every fan; the errors logged before this one name each fan")]
+    FansNotReleased,
+    #[error("{0}: not taken over")]
+    FanNotTaken(String),
+    #[error("IPMI sensors need an IPMI session, and the zone has none")]
+    SensorsWithoutSession,
+    #[error("GPU {gpu}: failed to load the NVML library {library:?}: {source}")]
+    NvmlLoad {
+        gpu: String,
+        library: String,
+        source: NvmlError,
+    },
+    #[error("GPU {gpu}: NVML: {source}")]
+    Nvml {
+        gpu: String,
+        source: NvmlError,
+    },
+    #[error("GPU {gpu}: NVML call {operation} did not return within {limit:?}; every later NVML call fails at once")]
+    NvmlTimeout {
+        gpu: String,
+        operation: &'static str,
+        limit: Duration,
+    },
+    #[error("GPU {gpu}: NVML call {operation} not made, because an earlier call has not returned since it timed out: {earlier}")]
+    NvmlStalled {
+        gpu: String,
+        operation: &'static str,
+        earlier: String,
+    },
+    #[error("GPU {gpu}: NVML call {operation} got no reply, because the NVML thread stopped")]
+    NvmlNoReply {
+        gpu: String,
+        operation: &'static str,
+    },
+    #[error("GPU {gpu}: failed to start the NVML thread: {source}")]
+    NvmlThread {
+        gpu: String,
+        source: io::Error,
+    },
+    #[error("GPU {gpu}: has {count} fan(s), so fan {fan} does not exist")]
+    NvidiaFanMissing {
+        gpu: String,
+        fan: u32,
+        count: u32,
+    },
+    #[error("GPU {gpu}: fan speed limits are not a range within 0 to 100 percent: min {min}, max {max}")]
+    NvidiaFanLimits {
+        gpu: String,
+        min: u32,
+        max: u32,
+    },
 }
 
 pub type Result<T, E = Error> = result::Result<T, E>;

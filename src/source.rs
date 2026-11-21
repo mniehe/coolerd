@@ -19,6 +19,7 @@ use {
         curve::SourceReading,
         error::{Error, Result},
         freeipmi::{SensorReading, SensorUnits, SensorValue},
+        hwmon::{HwmonRoot, read_number, read_optional_number},
     },
 };
 
@@ -279,6 +280,43 @@ fn double_to_temp(value: f64) -> Option<u8> {
     Some(value as u8)
 }
 
+/// Convert a hwmon temperature in millidegrees Celsius to whole degrees,
+/// rounding up and clamping above to the range of a reading. Returns `None`
+/// for a negative value, because an open probe reports a negative sentinel
+/// that would otherwise pass as a cool reading.
+fn millidegrees_to_celsius(raw: i64) -> Option<u8> {
+    const MILLIDEGREES_PER_DEGREE: i64 = 1000;
+
+    if raw < 0 {
+        return None;
+    }
+
+    let degrees = raw
+        .saturating_add(MILLIDEGREES_PER_DEGREE - 1)
+        .div_euclid(MILLIDEGREES_PER_DEGREE)
+        .min(u8::MAX.into());
+
+    // The bounds leave a value that fits
+    Some(u8::try_from(degrees).unwrap_or(u8::MAX))
+}
+
+/// Read input `input` of the hwmon chip named `chip`. The chip is found again
+/// on every read, so a chip that moves to another `hwmonN` keeps reading. A
+/// non-zero `temp<input>_fault` fails the read; a chip without one has none.
+fn read_hwmon_source(root: &HwmonRoot, chip: &str, input: u8) -> Result<u8> {
+    let device = root.resolve(chip)?;
+    let fault_path = device.join(format!("temp{}_fault", input));
+
+    if read_optional_number(&fault_path)?.is_some_and(|fault| fault != 0) {
+        return Err(Error::HwmonFault { path: fault_path });
+    }
+
+    let path = device.join(format!("temp{}_input", input));
+    let raw = read_number(&path)?;
+
+    millidegrees_to_celsius(raw).ok_or(Error::HwmonValueOutOfRange { path, value: raw })
+}
+
 /// The readers of one zone's sources. Each source that runs a program has
 /// its own [`CommandRunner`], so a program stuck after its kill blocks only
 /// its own source. Each zone loop owns one, so zones share no runner.
@@ -286,9 +324,15 @@ fn double_to_temp(value: f64) -> Option<u8> {
 pub struct ZoneReaders {
     /// By source index, as in [`Zone::sources`]; made on a source's first read
     runners: Vec<CommandRunner>,
+    /// Where `hwmon` sources find their chips
+    hwmon: HwmonRoot,
 }
 
 impl ZoneReaders {
+    pub fn new(hwmon: HwmonRoot) -> Self {
+        Self { runners: Vec::new(), hwmon }
+    }
+
     /// Read `source`, the source at `index` of the zone, which is not an IPMI
     /// sensor
     pub fn read(&mut self, index: usize, source: &Source) -> Result<u8> {
@@ -300,6 +344,7 @@ impl ZoneReaders {
             Source::Smart { block_dev } => parse_smart_source(self.runner(index), Path::new(block_dev)),
             Source::Hdparm { block_dev } => parse_hdparm_source(self.runner(index), Path::new(block_dev)),
             Source::Nvidia { gpu } => read_nvidia_source(self.runner(index), gpu),
+            Source::Hwmon { chip, input } => read_hwmon_source(&self.hwmon, chip, *input),
         }
     }
 
@@ -523,6 +568,7 @@ mod tests {
         std::{
             cell::RefCell,
             collections::HashMap,
+            fs,
             io,
             os::unix::{fs::symlink, process::ExitStatusExt},
             path::{Path, PathBuf},
@@ -536,6 +582,7 @@ mod tests {
             NVIDIA_OUTPUT_CAP,
             ZoneReaders,
             ipmi_sensor_temp,
+            millidegrees_to_celsius,
             parse_file_source,
             parse_hdparm_output,
             parse_nvidia_output,
@@ -584,6 +631,7 @@ mod tests {
             },
             error::Error,
             freeipmi::{SensorReading, SensorUnits, SensorValue},
+            hwmon::HwmonRoot,
         },
     };
 
@@ -1101,7 +1149,7 @@ mod tests {
 
     /// A block device that does not exist, so that a host that has the real
     /// disk tool touches no disk
-    const ABSENT_DEV: &str = "/nonexistent/ipmi-fan-control-test-disk";
+    const ABSENT_DEV: &str = "/nonexistent/coolerd-test-disk";
 
     /// Keep a child on the runner of source 0 as a run of `program`, the
     /// program that [`ZoneReaders::read`] runs for `source`, and give the
@@ -1142,6 +1190,96 @@ mod tests {
     }
 
     #[test]
+    fn millidegrees_round_up_to_whole_degrees() {
+        assert_eq!(millidegrees_to_celsius(45500), Some(46));
+        assert_eq!(millidegrees_to_celsius(45001), Some(46));
+        assert_eq!(millidegrees_to_celsius(45000), Some(45));
+        assert_eq!(millidegrees_to_celsius(0), Some(0));
+    }
+
+    #[test]
+    fn millidegrees_clamp_above_and_reject_below_zero() {
+        assert_eq!(millidegrees_to_celsius(300000), Some(255));
+        assert_eq!(millidegrees_to_celsius(i64::MAX), Some(255));
+        assert_eq!(millidegrees_to_celsius(-1), None);
+        assert_eq!(millidegrees_to_celsius(-1000), None);
+        assert_eq!(millidegrees_to_celsius(i64::MIN), None);
+    }
+
+    /// A hwmon tree with chip `k10temp` at `hwmon3`, whose `temp1_input`
+    /// holds `millidegrees`
+    fn k10temp_tree(millidegrees: &str) -> TempDir {
+        let dir = TempDir::new();
+        let chip = dir.0.join("hwmon3");
+        fs::create_dir(&chip).unwrap();
+        fs::write(chip.join("name"), "k10temp\n").unwrap();
+        fs::write(chip.join("temp1_input"), millidegrees).unwrap();
+        dir
+    }
+
+    #[test]
+    fn hwmon_source_reads_its_chip_input() {
+        let dir = k10temp_tree("45500\n");
+        let mut readers = ZoneReaders::new(HwmonRoot::new(dir.0.clone()));
+
+        let reading = readers.read(0, &Source::Hwmon { chip: "k10temp".into(), input: 1 });
+
+        assert_eq!(reading.unwrap(), 46);
+    }
+
+    #[test]
+    fn hwmon_source_fails_for_an_absent_input() {
+        let dir = k10temp_tree("45500\n");
+        let mut readers = ZoneReaders::new(HwmonRoot::new(dir.0.clone()));
+
+        let reading = readers.read(0, &Source::Hwmon { chip: "k10temp".into(), input: 2 });
+
+        assert!(matches!(&reading, Err(Error::Io { path, .. }) if path.ends_with("hwmon3/temp2_input")), "{:?}", reading);
+    }
+
+    fn k10temp_reading_with_fault(fault: &str) -> Result<u8, Error> {
+        let dir = k10temp_tree("45500\n");
+        fs::write(dir.0.join("hwmon3/temp1_fault"), fault).unwrap();
+        let mut readers = ZoneReaders::new(HwmonRoot::new(dir.0.clone()));
+
+        readers.read(0, &Source::Hwmon { chip: "k10temp".into(), input: 1 })
+    }
+
+    #[test]
+    fn hwmon_source_fails_when_its_input_reports_a_fault() {
+        let reading = k10temp_reading_with_fault("1\n");
+
+        assert!(matches!(&reading, Err(Error::HwmonFault { path }) if path.ends_with("hwmon3/temp1_fault")), "{:?}", reading);
+    }
+
+    #[test]
+    fn hwmon_source_fails_when_its_fault_file_does_not_parse() {
+        let reading = k10temp_reading_with_fault("garbage\n");
+
+        assert!(matches!(&reading, Err(Error::HwmonParse { path, .. }) if path.ends_with("hwmon3/temp1_fault")), "{:?}", reading);
+    }
+
+    #[test]
+    fn hwmon_source_reads_when_its_input_reports_no_fault() {
+        assert_eq!(k10temp_reading_with_fault("0\n").unwrap(), 46);
+    }
+
+    #[test]
+    fn hwmon_source_fails_for_a_negative_reading() {
+        // An open thermistor on nct67xx chips reads -128 °C
+        let dir = k10temp_tree("-128000\n");
+        let mut readers = ZoneReaders::new(HwmonRoot::new(dir.0.clone()));
+
+        let reading = readers.read(0, &Source::Hwmon { chip: "k10temp".into(), input: 1 });
+
+        let error = reading.err().expect("a negative reading fails");
+        assert!(matches!(&error, Error::HwmonValueOutOfRange { path, value: -128000 }
+                if path.ends_with("hwmon3/temp1_input")), "{:?}", error);
+        let text = error.to_string();
+        assert!(text.contains("temp1_input") && text.contains("-128000"), "{}", text);
+    }
+
+    #[test]
     fn runner_of_a_source_persists_between_reads() {
         let source = Source::Nvidia { gpu: GPU.into() };
         let mut readers = ZoneReaders::default();
@@ -1163,12 +1301,16 @@ mod tests {
             interval: Interval::default(),
             retries: Retries(retries),
             retry_delay_ms: RetryDelayMs(0),
-            ipmi_zones: vec![0],
+            ipmi_zones: Some(vec![0]),
             sources,
             aggregation: Aggregation::Maximum,
             steps: Some(vec![Step { temp: 45, dcycle: 45 }, Step { temp: 75, dcycle: 100 }]),
+            curve: None,
             duty_aggregation: Aggregation::Maximum,
             hysteresis: 0,
+            curve_hysteresis: None,
+            fans: None,
+            fan_list: Vec::new(),
         }
     }
 
