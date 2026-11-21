@@ -101,9 +101,9 @@ steps = [{ temp = 40, dcycle = 30 }, { temp = 80, dcycle = 100 }]
 
 The log levels, from the least output to the most:
 
-- `error`: errors that stop coolerd, a source that starts to fail, and a fan that coolerd could not release.
+- `error`: errors that stop coolerd, a fan error that a zone retries, a source that starts to fail, and a fan that coolerd could not release.
 - `warn`: also an IPMI sensor entry that the board could not read, and a program that coolerd killed and that did not exit.
-- `info`: also the fan mode changes at start and stop, the start of each zone, and a source that reads again.
+- `info`: also the fan mode changes at start and stop, the start of each zone and each take-over of its fans, a zone whose fans run again after a retry, and a source that reads again.
 - `debug`: also one line for each fan after each update that succeeds, with the temperatures and the duty cycle. Use it to tune a curve.
 - `trace`: also the parsed config, each failed attempt that is followed by a retry, and the raw IPMI commands.
 
@@ -125,6 +125,7 @@ Each `[[zones]]` table is one zone.
 | `retries` | integer, 0 or more | 2 | Waits for another attempt that the sources of the zone share in one update. See [Failures and shutdown](failure.md#retries). |
 | `retry_delay_ms` | integer, 0 or more | 500 | Milliseconds of each such wait. |
 | `session` | string | `"default"` | The [session](#sessions) that reaches the board of the zone's Supermicro fans. The name must be a key of `sessions` or `default`. |
+| `recovery` | table | `{ type = "retry", max_delay_s = 300 }` | What the zone does when a fan fails. `{ type = "retry" }` or `{ type = "retry", max_delay_s = N }`, with N from 10 to 3600, releases the zone's fans and takes them over again after a wait that doubles from 10 seconds up to N; `max_delay_s` defaults to 300. `{ type = "exit" }` stops coolerd. See [Failures and shutdown](failure.md#when-a-fan-fails). |
 
 ## How a zone sets its duty cycle
 
@@ -441,5 +442,6 @@ The format of the config file is the format of ipmi-fan-control. A config writte
 - **Time limits.** `smartctl` and `hdparm` are stopped after 30 seconds. Earlier versions waited for them without a limit.
 - **Exit status.** When coolerd fails to release a fan, to set an IPMI zone to 100% or to restore the fan mode of a board as it stops, it exits with status 1, also when a signal stopped it. So does an error that a zone returns while it stops after a signal, and coolerd now logs that error. Earlier versions exited with status 0 in these cases, and they did not log a zone error that came after a signal.
 - **Signals.** coolerd listens for SIGINT and SIGTERM before it opens an IPMI session. Earlier versions started to listen only after the zones had started.
+- **Fan errors.** A fan error no longer stops coolerd by default. The zone releases its own fans, waits, and takes them over again, while the other zones keep running; see [When a fan fails](failure.md#when-a-fan-fails). Earlier versions stopped every zone and exited with status 1 on any fan error. To keep that behaviour, set `recovery = { type = "exit" }` in each zone. A source with `on_failure = { type = "exit" }` still stops coolerd. A config that sets `recovery` does not load in an earlier version.
 
 [Migrating from ipmi-fan-control](nixos.md#migrating-from-ipmi-fan-control) lists the names that the rename changed.
