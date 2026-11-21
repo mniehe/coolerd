@@ -95,7 +95,19 @@ impl IpmiSession {
         N: AsRef<str>,
         R: IntoIterator<Item = u8>,
     {
-        let port = open_port(name.as_ref(), || Ok(Ipmi::new(st)?))?;
+        Self::open_with(name, || Ok(Ipmi::new(st)?), restore_zones, restore_failures)
+    }
+
+    /// Open the connection of the session through `open`, then take over its
+    /// board as `with_port` does
+    fn open_with<N, R, P, F>(name: N, open: F, restore_zones: R, restore_failures: RestoreFailures) -> Result<Self>
+    where
+        N: AsRef<str>,
+        R: IntoIterator<Item = u8>,
+        P: IpmiPort + 'static,
+        F: FnOnce() -> Result<P>,
+    {
+        let port = open_port(name.as_ref(), open)?;
 
         Self::with_port(name, Box::new(port), restore_zones, restore_failures)
     }
@@ -279,14 +291,14 @@ mod tests {
         super::{
             fake::{port_error, BoardLog, FakeBoard, PortCall},
             lock_or_recover,
-            open_port,
             IpmiSession,
             RestoreFailures,
             RestoreOutcome,
         },
         crate::{
             error::{Error, Result},
-            ipmi::FanMode,
+            freeipmi,
+            ipmi::{self, FanMode},
         },
     };
 
@@ -294,23 +306,23 @@ mod tests {
         calls.lock().unwrap().clone()
     }
 
-    /// Assert that `result` is the failure of `step` on session "bmc0", and
-    /// that it keeps the fake board's error as its cause and in its message
-    fn assert_start_failure<T>(result: Result<T>, step: &str) {
+    /// Assert that `result` is the failure of `step` on `session`, and that it
+    /// keeps `cause` as its cause and in its message
+    fn assert_start_failure<T>(result: Result<T>, session: &str, step: &str, cause: Error) {
         let Err(error) = result else {
             panic!("expected the failure to {}", step);
         };
         let message = error.to_string();
-        let Error::SessionStart { source, .. } = error else {
+        let Error::SessionStart { session: named, action, source } = error else {
             panic!("expected a SessionStart error: {}", message);
         };
-        let cause = port_error().to_string();
+        let cause = cause.to_string();
 
+        assert_eq!(named, session);
+        assert_eq!(action, step);
         assert!(matches!(*source, Error::Ipmi(_)), "{}", message);
         assert_eq!(source.to_string(), cause);
-        assert!(message.contains("[bmc0]"), "{}", message);
-        assert!(message.contains(step), "{}", message);
-        assert!(message.contains(&cause), "{}", message);
+        assert_eq!(message, format!("[{}] Failed to {} at start: {}", session, step, cause));
     }
 
     #[test]
@@ -360,14 +372,39 @@ mod tests {
 
         let result = IpmiSession::with_port("bmc0", Box::new(board), [0], RestoreFailures::default());
 
-        assert_start_failure(result, "set fan mode to Full");
+        assert_start_failure(result, "bmc0", "set fan mode to Full", port_error());
+    }
+
+    fn no_device_error() -> Error {
+        Error::Ipmi(ipmi::Error::FreeIpmi(freeipmi::Error::InBandDeviceNotFound))
     }
 
     #[test]
     fn failed_connection_names_the_session() {
-        let result = open_port("bmc0", || Err::<FakeBoard, _>(port_error()));
+        let calls = BoardLog::default();
 
-        assert_start_failure(result, "open the IPMI connection");
+        let result = IpmiSession::open_with("rear-bmc", || Err::<FakeBoard, _>(no_device_error()), [0], RestoreFailures::default());
+
+        assert_start_failure(result, "rear-bmc", "open the IPMI connection", no_device_error());
+        assert!(log_of(&calls).is_empty(), "{:?}", log_of(&calls));
+    }
+
+    #[test]
+    fn open_with_a_working_port_takes_over_the_board() {
+        let calls = BoardLog::default();
+        let board = FakeBoard::new(FanMode::Standard, &calls);
+
+        let session = IpmiSession::open_with("rear-bmc", || Ok(board), [0, 1], RestoreFailures::default()).unwrap();
+
+        assert_eq!(session.name(), "rear-bmc");
+        assert_eq!(log_of(&calls), [
+            PortCall::GetFanMode,
+            PortCall::SetFanMode(FanMode::Full),
+            PortCall::SetDutyCycle(0, 100),
+            PortCall::SetDutyCycle(1, 100),
+        ]);
+
+        drop(session);
     }
 
     #[test]
@@ -380,7 +417,7 @@ mod tests {
 
         let result = IpmiSession::with_port("bmc0", Box::new(board), [0], RestoreFailures::default());
 
-        assert_start_failure(result, "read the fan mode");
+        assert_start_failure(result, "bmc0", "read the fan mode", port_error());
         assert_eq!(log_of(&calls), [PortCall::GetFanMode]);
     }
 
@@ -394,7 +431,7 @@ mod tests {
 
         let result = IpmiSession::with_port("bmc0", Box::new(board), [0, 1], RestoreFailures::default());
 
-        assert_start_failure(result, "set zone 1 duty cycle to 100%");
+        assert_start_failure(result, "bmc0", "set zone 1 duty cycle to 100%", port_error());
     }
 
     #[test]
