@@ -125,7 +125,7 @@ services.coolerd.settings = {
 };
 ```
 
-The build of the host fails when a zone has a fan of type `nvidia` and [`enableNvidiaFans`](#servicescoolerdenablenvidiafans) is off. The check reads each zone and each fan in both forms that coolerd reads: an attribute set, as on this page, and a list in field order.
+The build of the host fails when a zone has a fan of type `nvidia` and [`enableNvidiaFans`](#servicescoolerdenablenvidiafans) is off. Write a zone that has a `fans` key as an attribute set, as on this page. coolerd also reads a zone written as a list in field order, but such a list must give a value to every field before `fans`. A list that reaches `fans` therefore also sets `ipmi_zones`, and sets both `steps` and `curve`, and coolerd refuses both pairs. The check reads each fan as an attribute set or as a list in field order. It also reads the `fans` of a list zone, only as a guard.
 
 ### `services.coolerd.enableSmartMonTools`
 
