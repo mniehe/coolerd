@@ -125,7 +125,7 @@ services.coolerd.settings = {
 };
 ```
 
-The build of the host fails when a zone has a fan of type `nvidia` and [`enableNvidiaFans`](#servicescoolerdenablenvidiafans) is off. The check reads zones that are written as attribute sets, as on this page.
+The build of the host fails when a zone has a fan of type `nvidia` and [`enableNvidiaFans`](#servicescoolerdenablenvidiafans) is off. The check reads each zone and each fan in both forms that coolerd reads: an attribute set, as on this page, and a list in field order.
 
 ### `services.coolerd.enableSmartMonTools`
 

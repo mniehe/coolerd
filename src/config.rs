@@ -2549,6 +2549,16 @@ mod tests {
         assert!(zone.curve.is_none());
     }
 
+    /// nix/module.nix reads the fans of a zone written as a list at index 11.
+    /// load_config rejects such a zone, so this reads it without validation.
+    #[test]
+    fn fans_is_element_eleven_of_a_positional_zone() {
+        let contents = r#"zones = [["default", 1, 2, 500, [0], [{ type = "file", path = "/dev/null" }], { type = "maximum" }, [{ temp = 40, dcycle = 70 }], { type = "maximum" }, 0, "gpu", [{ type = "nvidia", gpu = "00000000:01:00.0", fan = 0 }]]]"#;
+        let config: Config = toml::from_str(contents).unwrap();
+
+        assert_eq!(config.zones[0].fans, Some(vec![FanConfig::Nvidia { gpu: "00000000:01:00.0".to_owned(), fan: 0 }]));
+    }
+
     #[test]
     fn positional_source_has_no_curve() {
         let config = parse(&zone_toml(&[("sources", r#"[["file", "/dev/null"]]"#)])).unwrap();

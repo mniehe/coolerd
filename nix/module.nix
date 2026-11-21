@@ -125,9 +125,14 @@ with lib; let
     then value
     else [];
   settingsZones = listOrEmpty (cfg.settings.zones or null);
+  # The daemon also reads a zone written as a list in field order, as the
+  # fields of Zone in src/config.rs are declared; fans is the twelfth
+  zoneFansIndex = 11;
   zoneFans = zone:
     if isAttrs zone
     then listOrEmpty (zone.fans or null)
+    else if isList zone && length zone > zoneFansIndex
+    then listOrEmpty (elemAt zone zoneFansIndex)
     else [];
   # The daemon also reads a fan written as a list in field order, such as
   # [ "nvidia" "00000000:01:00.0" 0 ], whose first element is the type
