@@ -73,7 +73,7 @@ Quick start
    sudo coolerd --config config.toml
    ```
 
-When coolerd starts, it takes over the fans that the config names. On a start without an error, coolerd switches a Supermicro board to its full fan mode and writes a duty cycle of 100% to each IPMI zone of the board that the config names. A hwmon channel is switched to manual control at full speed. When coolerd stops, it attempts to set these fans to full speed and to give back the control that it took. A process that is killed gives nothing back.
+When coolerd starts, it takes over the fans that the config names. On a start without an error, coolerd switches a Supermicro board to its full fan mode, unless the board is in that mode already, and writes a duty cycle of 100% to each IPMI zone of the board that the config names. A hwmon channel is switched to manual control at full speed. When coolerd stops, it attempts to set these fans to full speed and to give back the control that it took. A process that is killed gives nothing back.
 
 A wrong curve or a wrong fan can overheat hardware. Watch the temperatures after the first start. `log_level = "debug"` logs the temperatures and the duty cycle after each update.
 

@@ -381,12 +381,9 @@ mod tests {
 
     #[test]
     fn failed_connection_names_the_session() {
-        let calls = BoardLog::default();
-
         let result = IpmiSession::open_with("rear-bmc", || Err::<FakeBoard, _>(no_device_error()), [0], RestoreFailures::default());
 
         assert_start_failure(result, "rear-bmc", "open the IPMI connection", no_device_error());
-        assert!(log_of(&calls).is_empty(), "{:?}", log_of(&calls));
     }
 
     #[test]
