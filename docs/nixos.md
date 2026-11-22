@@ -218,7 +218,7 @@ coolerd loads `libnvidia-ml.so.1` at run time, because the library must match th
 
 An `nvidia` source also needs `nvidia-smi` on the `PATH` of the unit, through [`extraPackages`](#servicescoolerdextrapackages).
 
-The NVIDIA fan backend is confirmed on a GPU for two cases, both on driver 595.104.02 with the open kernel module. In a root unit limited to `CAP_SYS_ADMIN`, one fan of one RTX A4000 followed a duty cycle of 100% and returned to the policy of the driver when the unit stopped. On a host with two RTX A4000 GPUs, one fan each, coolerd took over both fans and set their speed from the zone curve. The release of two GPU fans in one run and a long run are not yet confirmed. Check the fans after the first deployment, as the next section describes.
+The NVIDIA fan backend is confirmed on a GPU for two cases, both on driver 595.104.02 with the open kernel module. In a root unit limited to `CAP_SYS_ADMIN`, one fan of one RTX A4000 followed a duty cycle of 100% and returned to the policy of the driver when the unit stopped. In a root unit with `CAP_SYS_ADMIN`, `CAP_SYS_RAWIO` and `NoNewPrivileges`, coolerd took over one fan on each of two RTX A4000 beside two Supermicro zones, set their speed from the zone curve for two minutes without an error, and gave both fans back when the unit stopped. A long run is not yet confirmed. Check the fans after the first deployment, as the next section describes.
 
 ## Checking NVIDIA fans on a host
 
