@@ -710,8 +710,8 @@ fn exit_result(run: Result<()>, releases: ReleaseOutcome, restores: RestoreOutco
     }
 }
 
-/// Each session that a zone's Supermicro fan uses, in the order of
-/// `config.sessions`, with the IPMI zones its drop sets to 100%
+/// Each session that a zone's Supermicro fan uses, in no fixed order, because
+/// `config.sessions` is a `HashMap`, with the IPMI zones its drop sets to 100%
 fn sessions_to_open(config: &Config) -> Vec<(String, Vec<u8>)> {
     let mut sessions = Vec::new();
 
@@ -1213,10 +1213,13 @@ mod tests {
     async fn signal_before_the_first_wait_is_delivered() {
         let mut signals = Signals::listen().unwrap();
 
-        let status = process::Command::new("kill")
-            .args(["-INT", &process::id().to_string()])
-            .status()
-            .unwrap();
+        let status = {
+            let _guard = crate::command::testing::script_lock();
+            process::Command::new("kill")
+                .args(["-INT", &process::id().to_string()])
+                .status()
+                .unwrap()
+        };
         let delivered = timeout(Duration::from_secs(2), signals.recv()).await;
 
         assert!(status.success(), "{:?}", status);
@@ -1256,12 +1259,15 @@ mod tests {
     }
 
     /// A signal can cancel a zone task before its fan guard exists, so the
-    /// session's drop then makes the only write of 100% to the zone
+    /// session's drop then makes the only write of 100% to the zone as
+    /// coolerd stops
     #[test]
     fn failed_full_duty_write_without_a_fan_guard_fails_the_exit() {
         let calls = BoardLog::default();
+        // The write at open succeeds, and the write at drop fails
         let board = FakeBoard {
             failing: Some(PortCall::SetDutyCycle(0, 100)),
+            failing_after: 1,
             ..FakeBoard::new(FanMode::Full, &calls)
         };
         let failures = RestoreFailures::default();
@@ -1308,21 +1314,37 @@ mod tests {
 
         let result = finish(Ok(()), app_over(board));
 
-        assert!(calls.lock().unwrap().ends_with(&[PortCall::SetDutyCycle(0, 100), PortCall::SetFanMode(FanMode::Standard)]));
+        assert_eq!(*calls.lock().unwrap(), [
+            PortCall::GetFanMode,
+            PortCall::SetFanMode(FanMode::Full),
+            // The write at open
+            PortCall::SetDutyCycle(0, 100),
+            // The session's drop
+            PortCall::SetDutyCycle(0, 100),
+            PortCall::SetFanMode(FanMode::Standard),
+        ]);
         assert!(matches!(result, Err(Error::SessionsNotRestored)), "{:?}", result);
     }
 
     #[test]
     fn finish_fails_on_a_full_duty_write_that_fails_as_the_app_drops() {
         let calls = BoardLog::default();
+        // The write at open succeeds, and the write at drop fails
         let board = FakeBoard {
             failing: Some(PortCall::SetDutyCycle(0, 100)),
+            failing_after: 1,
             ..FakeBoard::new(FanMode::Full, &calls)
         };
 
         let result = finish(Ok(()), app_over(board));
 
-        assert!(calls.lock().unwrap().ends_with(&[PortCall::SetDutyCycle(0, 100)]));
+        assert_eq!(*calls.lock().unwrap(), [
+            PortCall::GetFanMode,
+            // The write at open
+            PortCall::SetDutyCycle(0, 100),
+            // The session's drop
+            PortCall::SetDutyCycle(0, 100),
+        ]);
         assert!(matches!(result, Err(Error::SessionsNotRestored)), "{:?}", result);
     }
 

@@ -762,8 +762,9 @@ mod tests {
         assert_eq!(log_of(&calls)[2..], [("a", Op::SetDuty), ("b", Op::SetDuty)]);
     }
 
-    /// The calls a session makes when it opens on a board in standard mode
-    const SESSION_OPEN: [PortCall; 2] = [PortCall::GetFanMode, PortCall::SetFanMode(FanMode::Full)];
+    /// The calls a session over zone 0 makes when it opens on a board in
+    /// standard mode
+    const SESSION_OPEN: [PortCall; 3] = [PortCall::GetFanMode, PortCall::SetFanMode(FanMode::Full), PortCall::SetDutyCycle(0, 100)];
 
     fn session_on(board: FakeBoard) -> Arc<IpmiSession> {
         Arc::new(IpmiSession::with_port("test", Box::new(board), [0], RestoreFailures::default()).unwrap())
@@ -779,7 +780,8 @@ mod tests {
         let changed = zone.set_duty(60).unwrap();
         let unchanged = zone.set_duty(60).unwrap();
 
-        assert_eq!(changed, Applied { before: Some(40), sent: Some(60) });
+        // The session's open set the zone to 100%
+        assert_eq!(changed, Applied { before: Some(100), sent: Some(60) });
         assert_eq!(unchanged, Applied { before: Some(60), sent: None });
         assert_eq!(calls.lock().unwrap()[SESSION_OPEN.len()..], [
             PortCall::GetDutyCycle(0),
