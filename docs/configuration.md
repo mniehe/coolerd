@@ -395,9 +395,9 @@ At each take-over, coolerd saves `pwmN_enable`, writes 1 to it, which is manual 
 
 An `nvidia` fan is one fan of an NVIDIA GPU. Two zones cannot drive the same fan of one GPU, in either spelling of the bus id. To list the bus ids, run `nvidia-smi --query-gpu=pci.bus_id --format=csv`.
 
-The NVIDIA fan backend is tested against a stand-in for NVML. It has not yet been confirmed on a GPU, so check the fans after the first start, as [Checking NVIDIA fans on a host](nixos.md#checking-nvidia-fans-on-a-host) describes.
+The NVIDIA fan backend is tested against a stand-in for NVML. It is confirmed on one fan of each of two GPUs in one run of two minutes, on driver 595.104.02. A long run is not yet confirmed, so check the fans after the first start, as [Checking NVIDIA fans on a host](nixos.md#checking-nvidia-fans-on-a-host) describes.
 
-coolerd drives the fan through NVML, the management library of the NVIDIA driver. It loads `libnvidia-ml.so.1` at run time, when a zone with an `nvidia` fan starts, because the library must match the driver that the kernel has loaded. A config without an `nvidia` fan never loads it. The dynamic linker must be able to find the library. coolerd must run as root to set a GPU fan speed.
+coolerd drives the fan through NVML, the management library of the NVIDIA driver. It loads `libnvidia-ml.so.1` at run time, when a zone with an `nvidia` fan starts, because the library must match the driver that the kernel has loaded. A config without an `nvidia` fan never loads it. The dynamic linker must be able to find the library. coolerd must run as root to set a GPU fan speed. On driver 595.104.02, the only driver measured, it also needs the capability `CAP_SYS_ADMIN`.
 
 At each take-over, when the zone starts and when it retries after a fan error, coolerd reads the number of fans of the GPU and the speed limits of the fan, and logs the limits in a line with `speed limits`. It fails when the fan does not exist or when the limits are not a range within 0 to 100%. It changes nothing at this point. The first update sets the fan speed, which switches the fan to manual control.
 

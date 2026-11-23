@@ -12,7 +12,10 @@ with lib; let
   serviceUser = "coolerd";
   serviceGroup = "coolerd";
 
-  # The user and group the daemon runs as; NVML fan commands need root
+  # The user and group the daemon runs as. NVML accepts a fan speed command
+  # only from uid 0 that also holds CAP_SYS_ADMIN, as measured on driver
+  # 595.104.02: root without the capability is refused, and so is another
+  # user with it.
   unitUser =
     if cfg.enableNvidiaFans
     then "root"
@@ -21,6 +24,21 @@ with lib; let
     if cfg.enableNvidiaFans
     then "root"
     else serviceGroup;
+
+  # Every limit on the root unit; a further sandbox setting belongs here. The
+  # bounding set also binds the programs the daemon spawns.
+  # CAP_SYS_ADMIN: NVML fan commands, and NVMe SMART (admin ioctl)
+  # CAP_SYS_RAWIO: SATA SMART (SCSI passthrough) and hdparm
+  # No other capability is kept, so root passes a file permission check only
+  # as an owner would. It owns /etc/coolerd.toml, the IPMI device, the drive
+  # devices and the hwmon PWM files, so it needs no CAP_DAC_OVERRIDE for them.
+  rootUnitLimits = {
+    CapabilityBoundingSet = concatStringsSep " " (
+      ["CAP_SYS_ADMIN"]
+      ++ optional (cfg.enableSmartMonTools || cfg.enableHdparm) "CAP_SYS_RAWIO"
+    );
+    NoNewPrivileges = true;
+  };
 
   # Use pkgs.formats.toml to handle the conversion
   format = pkgs.formats.toml {};
@@ -257,9 +275,12 @@ in {
       default = false;
       description = ''
         Run the service as root so that it can drive NVIDIA GPU fans through
-        NVML. NVML fan commands were shown to work only as root, on driver
-        595.104.02, so the service runs as the user and group root with no
-        ambient capabilities, and /etc/coolerd.toml belongs to root. The
+        NVML. NVML fan commands were shown to work only as root with
+        CAP_SYS_ADMIN, on driver 595.104.02, so the service runs as the user
+        and group root, and /etc/coolerd.toml belongs to root. The unit keeps
+        only CAP_SYS_ADMIN, and CAP_SYS_RAWIO when enableSmartMonTools or
+        enableHdparm is set, and it sets NoNewPrivileges. This reduces the
+        capabilities of the unit and is not a sandbox. The
         service loads libnvidia-ml.so.1 from the host's driver at run time,
         so the library is not a package input: the service's LD_LIBRARY_PATH
         is /run/opengl-driver/lib, which exists only when the host enables its
@@ -365,25 +386,28 @@ in {
 
       environment.LD_LIBRARY_PATH = mkIf cfg.enableNvidiaFans "/run/opengl-driver/lib";
 
-      serviceConfig = {
-        Type = "simple";
-        User = unitUser;
-        Group = unitGroup;
-        # The + prefix runs the helper as root; the daemon keeps its user. A
-        # root unit needs no grant, but the helper still stops the start when
-        # a listed chip or file is missing.
-        ExecStartPre = mkIf (cfg.hwmon.pwmChannels != {}) "+${accessHelper} /sys/class/hwmon ${escapeShellArg unitGroup}";
-        ExecStart = "${cfg.package}/bin/coolerd --config /etc/coolerd.toml";
-        Restart = "on-failure";
-        RestartSec = "10s";
-        # CAP_SYS_RAWIO: required for SATA SMART (SCSI passthrough) and hdparm
-        # CAP_SYS_ADMIN: required for NVMe SMART (admin ioctl)
-        # A root unit holds both already.
-        AmbientCapabilities = mkIf (!cfg.enableNvidiaFans) (
-          lib.optionals (cfg.enableSmartMonTools || cfg.enableHdparm) ["CAP_SYS_RAWIO"]
-          ++ lib.optionals cfg.enableSmartMonTools ["CAP_SYS_ADMIN"]
-        );
-      };
+      serviceConfig = mkMerge [
+        (mkIf cfg.enableNvidiaFans rootUnitLimits)
+        {
+          Type = "simple";
+          User = unitUser;
+          Group = unitGroup;
+          # The + prefix runs the helper as root and outside rootUnitLimits;
+          # the daemon keeps its user. A root unit needs no grant, but the
+          # helper still stops the start when a listed chip or file is missing.
+          ExecStartPre = mkIf (cfg.hwmon.pwmChannels != {}) "+${accessHelper} /sys/class/hwmon ${escapeShellArg unitGroup}";
+          ExecStart = "${cfg.package}/bin/coolerd --config /etc/coolerd.toml";
+          Restart = "on-failure";
+          RestartSec = "10s";
+          # CAP_SYS_RAWIO: required for SATA SMART (SCSI passthrough) and hdparm
+          # CAP_SYS_ADMIN: required for NVMe SMART (admin ioctl)
+          # A root unit gets them through the bounding set of rootUnitLimits.
+          AmbientCapabilities = mkIf (!cfg.enableNvidiaFans) (
+            lib.optionals (cfg.enableSmartMonTools || cfg.enableHdparm) ["CAP_SYS_RAWIO"]
+            ++ lib.optionals cfg.enableSmartMonTools ["CAP_SYS_ADMIN"]
+          );
+        }
+      ];
     };
   };
 }

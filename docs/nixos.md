@@ -57,7 +57,7 @@ With `services.coolerd.enable = true`, the module does this:
 
 - It writes `settings` as TOML to `/etc/coolerd.toml`, with mode 0600 and the service user as owner.
 - It runs `coolerd --config /etc/coolerd.toml` as the systemd unit `coolerd.service`, which starts at boot.
-- It runs the unit as the system user and group `coolerd`. With [`enableNvidiaFans`](#servicescoolerdenablenvidiafans), the unit runs as root.
+- It runs the unit as the system user and group `coolerd`. With [`enableNvidiaFans`](#servicescoolerdenablenvidiafans), the unit runs as root with a limited set of capabilities.
 - It restarts the unit when `settings` changes.
 - It restarts the unit 10 seconds after coolerd exits with a failure, through systemd's `Restart=on-failure`. systemd does not restart the unit after an explicit `systemctl stop`, also when coolerd then exits with status 1.
 - It puts freeipmi on the `PATH` of the unit, plus the packages that the options below add.
@@ -155,7 +155,7 @@ When it is set, the module loads the kernel modules `ipmi_devintf`, `ipmi_si` an
 
 Type: boolean. Default: `false`.
 
-Set it when `settings` has a fan of type `nvidia`. It runs the unit as the user and group root, with no added capabilities, and makes root the owner of `/etc/coolerd.toml`. It also sets the `LD_LIBRARY_PATH` of the unit to `/run/opengl-driver/lib`. See [NVIDIA fans and root](#nvidia-fans-and-root).
+Set it when `settings` has a fan of type `nvidia`. It runs the unit as the user and group root, and makes root the owner of `/etc/coolerd.toml`. It limits the unit to the capability `CAP_SYS_ADMIN`, and also `CAP_SYS_RAWIO` when `enableSmartMonTools` or `enableHdparm` is set, and it sets `NoNewPrivileges`. It also sets the `LD_LIBRARY_PATH` of the unit to `/run/opengl-driver/lib`. See [NVIDIA fans and root](#nvidia-fans-and-root).
 
 ### `services.coolerd.hwmon.kernelModules`
 
@@ -195,7 +195,22 @@ The access has these limits:
 
 ## NVIDIA fans and root
 
-coolerd sets a GPU fan speed through NVML, and the module assumes that NVML accepts such a call only from root. So with `enableNvidiaFans` the whole service runs as root, and the sources and the other fans of the config run as root with it.
+coolerd sets a GPU fan speed through NVML. NVML accepts that call only from a process that is root and also holds the capability `CAP_SYS_ADMIN`. This was measured on driver 595.104.02 with an RTX A4000: NVML refuses root without the capability, and it refuses another user with the capability. To read the speed or the limits of a fan needs no privilege. So with `enableNvidiaFans` the whole service runs as root, and the sources and the other fans of the config run as root with it.
+
+The module limits the root unit with two settings:
+
+- `CapabilityBoundingSet` keeps `CAP_SYS_ADMIN`, and also `CAP_SYS_RAWIO` when [`enableSmartMonTools`](#servicescoolerdenablesmartmontools) or [`enableHdparm`](#servicescoolerdenablehdparm) is set. `smartctl` and `hdparm` need these to query a drive. coolerd and every program it starts hold no other capability.
+- `NoNewPrivileges=true` keeps coolerd and every program it starts from gaining a privilege when they run a program, as a setuid program otherwise gives one.
+
+The two settings reduce the capabilities of the unit. They are not a sandbox, and the unit has no sandbox setting. coolerd still sees the file system, the network and the devices of the host. `CAP_SYS_ADMIN` alone permits much more than a fan command, such as mounting a file system. A process that runs as root can also ask systemd to start another unit, and that unit has none of these limits. So a fault in coolerd, in NVML or in a program that coolerd starts is not contained. The two settings do not apply to [the hwmon access helper](#the-hwmon-access-helper), which systemd runs with full privileges before coolerd starts.
+
+Root without the other capabilities cannot pass a file permission check that an ordinary owner would fail. Root owns `/etc/coolerd.toml`, the IPMI device, the drive devices and the `pwmN` and `pwmN_enable` files, so coolerd still opens them on a host that keeps their default owners and modes. Three things differ from a root unit without limits:
+
+- A `file` source fails when its file belongs to another user and neither the group root nor other users may read it, or when root may not enter a directory on its path in the same way. A device whose owner or mode a host has changed fails likewise.
+- A `local` IPMI session needs the IPMI device of the kernel, which [`enableIpmi`](#servicescoolerdenableipmi) sets up. When that device is absent, libfreeipmi can reach the BMC through I/O ports only when the unit has `CAP_SYS_RAWIO`, which a drive option adds. Do not rely on that: check that the IPMI device exists.
+- The NVIDIA kernel module must be loaded and the device files `/dev/nvidiactl` and `/dev/nvidiaN` must exist before the unit starts. NVML and `nvidia-smi` cannot load the module or create the files from this unit. The NVIDIA module of NixOS creates the files with a udev rule when the kernel module loads. The unit does not wait for them.
+
+A failure of this kind is an ordinary failure of a source, a session or a fan. [Failures and shutdown](failure.md) says what coolerd does then and what each fan gets. A restart by systemd after 10 seconds does not cool the host, and a release on exit is an attempt that can fail, so check the fans after such a failure.
 
 coolerd loads `libnvidia-ml.so.1` at run time, because the library must match the driver that the kernel has loaded. The library is therefore not an input of the package. The unit finds it through `LD_LIBRARY_PATH=/run/opengl-driver/lib`, where NixOS links the libraries of the graphics drivers.
 
@@ -203,13 +218,13 @@ coolerd loads `libnvidia-ml.so.1` at run time, because the library must match th
 
 An `nvidia` source also needs `nvidia-smi` on the `PATH` of the unit, through [`extraPackages`](#servicescoolerdextrapackages).
 
-On a host with two RTX A4000 GPUs, one fan each, and driver 595.104.02 with the open kernel module, coolerd took over both fans and set their speed from the zone curve. The release of a GPU fan when coolerd stops has not been confirmed on a GPU. Check the fans after the first deployment, as the next section describes.
+The NVIDIA fan backend is confirmed on a GPU for two cases, both on driver 595.104.02 with the open kernel module. In a root unit limited to `CAP_SYS_ADMIN`, one fan of one RTX A4000 followed a duty cycle of 100% and returned to the policy of the driver when the unit stopped. In a root unit with `CAP_SYS_ADMIN`, `CAP_SYS_RAWIO` and `NoNewPrivileges`, coolerd took over one fan on each of two RTX A4000 beside two Supermicro zones, set their speed from the zone curve for two minutes without an error, and gave both fans back when the unit stopped. A long run is not yet confirmed. Check the fans after the first deployment, as the next section describes.
 
 ## Checking NVIDIA fans on a host
 
 Run this check on the host itself, after a deployment that adds or changes an `nvidia` fan.
 
-`nvidia-smi` cannot show the fan policy, that is, whether the driver or a program sets the speed. So these steps show only the effect. They suit a host with one zone that drives an NVIDIA fan. To make the change easy to see, give the zone a fixed duty cycle for the check, such as `steps = [{ temp = 0, dcycle = 60 }]`.
+`nvidia-smi` cannot show the fan policy, that is, whether the driver or a program sets the speed. The speed it shows is the speed that the driver intends for the fan, not a measured rotation. So these steps show only the effect. They suit a host with one zone that drives an NVIDIA fan. To make the change easy to see, give the zone a fixed duty cycle for the check, such as `steps = [{ temp = 0, dcycle = 60 }]`.
 
 1. Start the unit with `sudo systemctl start coolerd.service`. Wait for a few updates, then read the speed:
 
