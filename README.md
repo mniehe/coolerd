@@ -45,7 +45,7 @@ Installation
 coolerd has no prebuilt packages. This repository is a Nix flake, and its `packages.default` output builds the program:
 
 ```sh
-nix build github:mniehe/ipmi-fan-control
+nix build github:mniehe/coolerd
 sudo ./result/bin/coolerd --config config.toml
 ```
 
