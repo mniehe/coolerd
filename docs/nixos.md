@@ -18,7 +18,7 @@ Add the flake as an input, then give the host the module and the overlay. The mo
 ```nix
 {
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-  inputs.coolerd.url = "github:mniehe/ipmi-fan-control";
+  inputs.coolerd.url = "github:mniehe/coolerd";
 
   outputs = {
     nixpkgs,
